@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+ccxt
+numpy
+pydantic
+httpx
