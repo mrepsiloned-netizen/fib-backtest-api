@@ -1,6 +1,7 @@
 # ============================================================
-# FIB PAPER TRADER v2 — Runs on Railway 24/7
-# Supports 1M, 5M, 15M, 1H, 4H, 1D timeframes
+# FIB PAPER TRADER v3 — Runs on Railway 24/7
+# Updated watchlist based on backtest results
+# Best combos: BTC 15M N=3 4R, SOL 15M N=3 4R, BTC 15M N=3 2R
 # ============================================================
 
 import ccxt
@@ -15,31 +16,25 @@ BYBIT_SECRET     = os.environ.get("BYBIT_SECRET", "")
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# Scan intervals per timeframe (seconds)
 SCAN_INTERVALS = {
-    "1m":  60,
-    "5m":  300,
-    "15m": 900,
-    "1h":  3600,
-    "4h":  14400,
-    "1d":  86400,
+    "1m":  60, "5m": 300, "15m": 900,
+    "1h":  3600, "4h": 14400, "1d": 86400,
 }
 
-# Watchlist — add/remove pairs as needed
+# ── WATCHLIST — based on backtest results ─────────────────
 WATCHLIST = [
-    # Short timeframes
-    {"symbol":"ETH/USDT", "timeframe":"5m",  "pivot_n":3, "rr":2.0},
-    {"symbol":"BTC/USDT", "timeframe":"5m",  "pivot_n":3, "rr":2.0},
-    {"symbol":"ETH/USDT", "timeframe":"15m", "pivot_n":3, "rr":2.0},
-    {"symbol":"BTC/USDT", "timeframe":"15m", "pivot_n":3, "rr":2.0},
+    # ⭐ TOP PERFORMERS — consistent across 30 days + 2025
+    {"symbol":"BTC/USDT", "timeframe":"15m", "pivot_n":3, "rr":4.0, "label":"⭐ Top Pick"},
+    {"symbol":"SOL/USDT", "timeframe":"15m", "pivot_n":3, "rr":4.0, "label":"⭐ Top Pick"},
+    {"symbol":"BTC/USDT", "timeframe":"15m", "pivot_n":3, "rr":2.0, "label":"Conservative"},
+    {"symbol":"SOL/USDT", "timeframe":"15m", "pivot_n":5, "rr":4.0, "label":"Confirmed"},
+    {"symbol":"BTC/USDT", "timeframe":"15m", "pivot_n":5, "rr":2.0, "label":"Confirmed"},
     # Medium timeframes
-    {"symbol":"ETH/USDT", "timeframe":"4h",  "pivot_n":5, "rr":2.0},
-    {"symbol":"BTC/USDT", "timeframe":"4h",  "pivot_n":5, "rr":2.0},
-    {"symbol":"INJ/USDT", "timeframe":"4h",  "pivot_n":5, "rr":2.0},
-    {"symbol":"SOL/USDT", "timeframe":"4h",  "pivot_n":5, "rr":2.0},
-    # Daily
-    {"symbol":"INJ/USDT", "timeframe":"1d",  "pivot_n":8, "rr":2.0},
-    {"symbol":"SOL/USDT", "timeframe":"1d",  "pivot_n":8, "rr":1.5},
+    {"symbol":"SOL/USDT", "timeframe":"1h",  "pivot_n":3, "rr":4.0, "label":"1H Swing"},
+    {"symbol":"ETH/USDT", "timeframe":"1h",  "pivot_n":3, "rr":4.0, "label":"1H Swing"},
+    # Daily anchors
+    {"symbol":"INJ/USDT", "timeframe":"1d",  "pivot_n":8, "rr":2.0, "label":"Daily Anchor"},
+    {"symbol":"SOL/USDT", "timeframe":"1d",  "pivot_n":8, "rr":1.5, "label":"Daily Anchor"},
 ]
 
 FIB_LEVEL = 0.618
@@ -106,13 +101,14 @@ def detect_signal(candles, pivots, rr):
         }
     return None
 
-def format_signal(symbol, timeframe, signal):
+def format_signal(symbol, timeframe, signal, label):
     emoji = "🟢" if signal["direction"]=="LONG" else "🔴"
     arrow = "📈" if signal["direction"]=="LONG" else "📉"
     sl_pct = abs(signal["entry"]-signal["sl"])/signal["entry"]*100
     tp_pct = abs(signal["tp"]-signal["entry"])/signal["entry"]*100
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return f"""{emoji} <b>FIB SIGNAL — {symbol} {timeframe.upper()}</b> {arrow}
+<b>{label}</b>
 
 <b>Direction:</b> {signal["direction"]}
 <b>Structure:</b> {"LH→LL→LH" if signal["structure"]=="bear" else "HL→HH→HL"}
@@ -127,13 +123,13 @@ def format_signal(symbol, timeframe, signal):
 📊 <i>Paper trade only</i>""".strip()
 
 def run():
-    print("🤖 Fib Paper Trader v2 starting...")
-    watchlist_str = "\n".join([f"• {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R" for w in WATCHLIST])
-    send_telegram(f"🤖 <b>Fib Paper Trader v2 LIVE</b>\n\nWatching:\n{watchlist_str}\n\n📊 Paper trading only")
+    print("🤖 Fib Paper Trader v3 starting...")
+    watchlist_str = "\n".join([f"• {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R — {w['label']}" for w in WATCHLIST])
+    send_telegram(f"🤖 <b>Fib Paper Trader v3 LIVE</b>\n\nWatchlist:\n{watchlist_str}\n\n📊 Paper trading only — no real orders")
 
     exchange = get_exchange()
-    last_signal = {}
-    last_scan   = {}
+    last_signal  = {}
+    last_scan    = {}
     open_signals = {}
 
     while True:
@@ -146,13 +142,12 @@ def run():
                 timeframe = watch["timeframe"]
                 pivot_n   = watch["pivot_n"]
                 rr        = watch["rr"]
-                key       = f"{symbol}_{timeframe}"
+                label     = watch["label"]
+                key       = f"{symbol}_{timeframe}_{pivot_n}_{rr}"
                 interval  = SCAN_INTERVALS.get(timeframe, 1800)
 
-                # Only scan at appropriate interval
                 if now - last_scan.get(key, 0) < interval:
                     continue
-
                 last_scan[key] = now
 
                 try:
@@ -163,17 +158,16 @@ def run():
                     signal = detect_signal(candles, pivots, rr)
 
                     if signal:
-                        # Don't resend same signal within one interval
                         if now - last_signal.get(key, 0) > interval:
-                            msg = format_signal(symbol, timeframe, signal)
+                            msg = format_signal(symbol, timeframe, signal, label)
                             send_telegram(msg)
                             last_signal[key] = now
                             open_signals[key] = {**signal, "symbol":symbol, "timeframe":timeframe}
-                            print(f"[{now_str}] ✅ Signal: {symbol} {timeframe} {signal['direction']}")
+                            print(f"[{now_str}] ✅ {symbol} {timeframe} {signal['direction']} {label}")
                         else:
                             print(f"[{now_str}] ⏭ Duplicate: {symbol} {timeframe}")
                     else:
-                        print(f"[{now_str}] No signal: {symbol} {timeframe}")
+                        print(f"[{now_str}] No signal: {symbol} {timeframe} N={pivot_n} {rr}R")
 
                     time.sleep(0.3)
 
@@ -181,7 +175,7 @@ def run():
                     print(f"[{now_str}] Error {symbol} {timeframe}: {e}")
                     time.sleep(2)
 
-            # Check open signals for SL/TP hits
+            # Check SL/TP on open signals
             closed = []
             for key, sig in open_signals.items():
                 try:
