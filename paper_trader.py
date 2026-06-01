@@ -255,7 +255,7 @@ def send_daily_summary():
 
 # ── EXCHANGE ──────────────────────────────────────────────
 def get_exchange():
-    return ccxt.bybit({"apiKey":BYBIT_API_KEY,"secret":BYBIT_SECRET,"enableRateLimit":True})
+    return ccxt.kucoin({"enableRateLimit":True})
 
 def fetch_candles(exchange, symbol, timeframe, limit=300):
     return exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
