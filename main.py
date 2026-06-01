@@ -54,6 +54,7 @@ class CompareRequest(BaseModel):
     pivot_ns: List[int] = [5]
     risk_methods: List[str] = ["fixed"]
     rr_ratios: List[float] = [2.0, 3.0]
+    fib_levels: List[float] = [0.618]
     period_a_start: str = "2025-01-01"
     period_a_end: str = "2026-01-01"
     period_b_start: str = "2026-01-01"
@@ -86,12 +87,13 @@ def save_candles(symbol, timeframe, candles):
         print(f"Candle save error: {e}")
 
 # ── RESULT CACHE ──────────────────────────────────────────
-def get_cached_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, end_date):
+def get_cached_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, end_date, fib_level=0.618):
     try:
         if end_date == "now": return None
         query = (f"symbol=eq.{symbol}&timeframe=eq.{timeframe}"
                  f"&pivot_n=eq.{pivot_n}&risk_method=eq.{risk_method}"
                  f"&rr=eq.{rr}&period_start=eq.{start_date}&period_end=eq.{end_date}"
+                 f"&fib_level=eq.{fib_level}"
                  f"&select=*&limit=1")
         res = httpx.get(f"{SUPABASE_URL}/rest/v1/results?{query}", headers=HEADERS, timeout=10)
         if res.status_code == 200:
@@ -105,14 +107,14 @@ def get_cached_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, e
         print(f"Result cache read error: {e}")
     return None
 
-def save_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, end_date, stats):
+def save_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, end_date, stats, fib_level=0.618):
     try:
         if end_date == "now" or not stats: return
         url = f"{SUPABASE_URL}/rest/v1/results"
         save_headers = {**HEADERS, "Prefer": "return=minimal,resolution=ignore-duplicates"}
         row = {
             "symbol":symbol,"timeframe":timeframe,"pivot_n":pivot_n,
-            "risk_method":risk_method,"rr":rr,
+            "risk_method":risk_method,"rr":rr,"fib_level":fib_level,
             "period_start":start_date,"period_end":end_date,
             **{k:stats[k] for k in ["total_trades","wins","losses","win_rate","final_equity",
                 "total_return","cagr","daily_return","max_drawdown","sharpe","profit_factor",
@@ -197,8 +199,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
         # Rule: one trade per pair at a time
         if one_per_pair and in_trade: continue
 
-        # Rule: p3 must be recent enough
-        if recency_bars > 0 and (n - p3["idx"]) > recency_bars: continue
+        # Rule: p3 must be recent enough (relative to where we'd start scanning for entry)
+        if recency_bars > 0 and (p3["idx"] + recency_bars) < n and (n - 1 - p3["idx"]) > max_bars + recency_bars: continue
 
         fh  = p1["price"] if st=="bear" else p2["price"]
         fl  = p2["price"] if st=="bear" else p1["price"]
@@ -295,7 +297,7 @@ def process_request(req: BacktestRequest):
         if SUPABASE_URL:
             cached_stats = get_cached_result(
                 req.symbol, req.timeframe, req.pivot_n,
-                req.risk_method, req.rr, req.start_date, req.end_date
+                req.risk_method, req.rr, req.start_date, req.end_date, req.fib_level
             )
             if cached_stats:
                 return {
@@ -303,8 +305,8 @@ def process_request(req: BacktestRequest):
                     "symbol":req.symbol,"timeframe":req.timeframe,
                     "period":f"{req.start_date} → {req.end_date}",
                     "risk_method":req.risk_method,"risk_pct":req.risk_pct*100,
-                    "pivot_n":req.pivot_n,"rr":req.rr,"stats":cached_stats,
-                    "equity_curve":[],"trades":[],
+                    "pivot_n":req.pivot_n,"rr":req.rr,"fib_level":req.fib_level,
+                    "stats":cached_stats,"equity_curve":[],"trades":[],
                 }
 
         candles, source = fetch_candles(req.symbol, req.timeframe, req.start_date, req.end_date)
@@ -329,7 +331,7 @@ def process_request(req: BacktestRequest):
 
         if SUPABASE_URL and stats:
             save_result(req.symbol, req.timeframe, req.pivot_n,
-                       req.risk_method, req.rr, req.start_date, req.end_date, stats)
+                       req.risk_method, req.rr, req.start_date, req.end_date, stats, req.fib_level)
 
         eq_curve=[]
         eq=100.0; ti=0
@@ -344,7 +346,7 @@ def process_request(req: BacktestRequest):
             "symbol":req.symbol,"timeframe":req.timeframe,
             "period":f"{req.start_date} → {req.end_date}",
             "risk_method":req.risk_method,"risk_pct":round(risk_pct*100,2),
-            "pivot_n":req.pivot_n,"rr":req.rr,"stats":stats,
+            "pivot_n":req.pivot_n,"rr":req.rr,"fib_level":req.fib_level,"stats":stats,
             "equity_curve":eq_curve,"trades":trades[-50:],
         }
     except Exception as e:
@@ -405,12 +407,13 @@ async def compare(req: CompareRequest):
             for pn in req.pivot_ns:
                 for risk in req.risk_methods:
                     for rr in req.rr_ratios:
-                        base={"symbol":sym,"timeframe":tf,"pivot_n":pn,
-                              "risk_method":risk,"risk_pct":0.02,"rr":rr,
-                              "fib_level":0.618,"max_bars":200,"max_hold":200,
-                              "recency_bars":50,"one_per_pair":True}
-                        configs_a.append(BacktestRequest(**{**base,"start_date":req.period_a_start,"end_date":req.period_a_end}))
-                        configs_b.append(BacktestRequest(**{**base,"start_date":req.period_b_start,"end_date":req.period_b_end}))
+                        for fib in req.fib_levels:
+                            base={"symbol":sym,"timeframe":tf,"pivot_n":pn,
+                                  "risk_method":risk,"risk_pct":0.02,"rr":rr,
+                                  "fib_level":fib,"max_bars":200,"max_hold":200,
+                                  "recency_bars":50,"one_per_pair":True}
+                            configs_a.append(BacktestRequest(**{**base,"start_date":req.period_a_start,"end_date":req.period_a_end}))
+                            configs_b.append(BacktestRequest(**{**base,"start_date":req.period_b_start,"end_date":req.period_b_end}))
 
     loop=asyncio.get_event_loop()
     results_a=list(await asyncio.gather(*[loop.run_in_executor(executor, process_request, cfg) for cfg in configs_a]))
@@ -428,6 +431,7 @@ async def compare(req: CompareRequest):
         combined.append({
             "symbol":a["symbol"],"timeframe":a["timeframe"],
             "risk":a["risk_method"],"pivot_n":a["pivot_n"],"rr":a["rr"],
+            "fib_level":a.get("fib_level", 0.618),
             "period_a_return":round(sa["total_return"],2),
             "period_b_return":round(sb["total_return"],2),
             "period_a_dd":round(sa["max_drawdown"],2),
