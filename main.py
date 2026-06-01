@@ -1,6 +1,7 @@
 # ============================================================
-# FIB BACKTEST API — FastAPI Backend v5
-# Full caching: candles + results in Supabase
+# FIB BACKTEST API — FastAPI Backend v6
+# Added rules: time expiry, structure invalidation,
+# one trade per pair, candle recency filter
 # ============================================================
 
 from fastapi import FastAPI
@@ -39,7 +40,10 @@ class BacktestRequest(BaseModel):
     risk_pct: float = 0.02
     rr: float = 2.0
     fib_level: float = 0.618
-    max_bars: int = 200
+    max_bars: int = 200          # time expiry — max candles to wait for entry
+    max_hold: int = 200          # max candles to hold trade
+    recency_bars: int = 50       # p3 must be within last N candles
+    one_per_pair: bool = True    # only one trade per pair at a time
 
 class BatchRequest(BaseModel):
     configs: List[BacktestRequest]
@@ -81,12 +85,10 @@ def save_candles(symbol, timeframe, candles):
     except Exception as e:
         print(f"Candle save error: {e}")
 
-# ── SUPABASE RESULT CACHE ─────────────────────────────────
+# ── RESULT CACHE ──────────────────────────────────────────
 def get_cached_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, end_date):
     try:
-        # Skip cache for "now" end dates as they change daily
-        if end_date == "now":
-            return None
+        if end_date == "now": return None
         query = (f"symbol=eq.{symbol}&timeframe=eq.{timeframe}"
                  f"&pivot_n=eq.{pivot_n}&risk_method=eq.{risk_method}"
                  f"&rr=eq.{rr}&period_start=eq.{start_date}&period_end=eq.{end_date}"
@@ -96,38 +98,25 @@ def get_cached_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, e
             rows = res.json()
             if rows:
                 r = rows[0]
-                return {
-                    "total_trades":r["total_trades"],"wins":r["wins"],"losses":r["losses"],
-                    "win_rate":r["win_rate"],"final_equity":r["final_equity"],
-                    "total_return":r["total_return"],"cagr":r["cagr"],
-                    "daily_return":r["daily_return"],"max_drawdown":r["max_drawdown"],
-                    "sharpe":r["sharpe"],"profit_factor":r["profit_factor"],
-                    "avg_win":r["avg_win"],"avg_loss":r["avg_loss"],
-                    "max_consec_wins":r["max_consec_wins"],"max_consec_losses":r["max_consec_losses"],
-                    "kelly_full":r["kelly_full"],"kelly_half":r["kelly_half"],
-                }
+                return {k:r[k] for k in ["total_trades","wins","losses","win_rate","final_equity",
+                    "total_return","cagr","daily_return","max_drawdown","sharpe","profit_factor",
+                    "avg_win","avg_loss","max_consec_wins","max_consec_losses","kelly_full","kelly_half"]}
     except Exception as e:
         print(f"Result cache read error: {e}")
     return None
 
 def save_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, end_date, stats):
     try:
-        if end_date == "now" or not stats:
-            return
+        if end_date == "now" or not stats: return
         url = f"{SUPABASE_URL}/rest/v1/results"
         save_headers = {**HEADERS, "Prefer": "return=minimal,resolution=ignore-duplicates"}
         row = {
             "symbol":symbol,"timeframe":timeframe,"pivot_n":pivot_n,
             "risk_method":risk_method,"rr":rr,
             "period_start":start_date,"period_end":end_date,
-            "total_trades":stats["total_trades"],"wins":stats["wins"],"losses":stats["losses"],
-            "win_rate":stats["win_rate"],"final_equity":stats["final_equity"],
-            "total_return":stats["total_return"],"cagr":stats["cagr"],
-            "daily_return":stats["daily_return"],"max_drawdown":stats["max_drawdown"],
-            "sharpe":stats["sharpe"],"profit_factor":stats["profit_factor"],
-            "avg_win":stats["avg_win"],"avg_loss":stats["avg_loss"],
-            "max_consec_wins":stats["max_consec_wins"],"max_consec_losses":stats["max_consec_losses"],
-            "kelly_full":stats["kelly_full"],"kelly_half":stats["kelly_half"],
+            **{k:stats[k] for k in ["total_trades","wins","losses","win_rate","final_equity",
+                "total_return","cagr","daily_return","max_drawdown","sharpe","profit_factor",
+                "avg_win","avg_loss","max_consec_wins","max_consec_losses","kelly_full","kelly_half"]},
             "computed_at":int(datetime.now(timezone.utc).timestamp()*1000),
         }
         httpx.post(url, json=row, headers=save_headers, timeout=10)
@@ -189,12 +178,13 @@ def find_pivots(highs, lows, N):
     return deduped
 
 # ── BACKTEST CORE ─────────────────────────────────────────
-def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars):
+def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair):
     highs = np.array([c[2] for c in candles])
     lows  = np.array([c[3] for c in candles])
     n     = len(candles)
     timestamps = [c[0] for c in candles]
     trades, equity, bias, used = [], 100.0, None, -1
+    in_trade = False  # one_per_pair flag
 
     for pi in range(2, len(pivots)):
         p1,p2,p3 = pivots[pi-2],pivots[pi-1],pivots[pi]
@@ -204,41 +194,54 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars):
         if not st or p3["idx"]<=used: continue
         if bias and bias!=st: continue
 
-        fh=p1["price"] if st=="bear" else p2["price"]
-        fl=p2["price"] if st=="bear" else p1["price"]
-        rng=fh-fl
-        if rng<=0: continue
-        f618=fl+rng*fib_level if st=="bear" else fh-rng*fib_level
-        sl=fh+rng*0.02 if st=="bear" else fl-rng*0.02
-        rpp=abs(f618-sl)
-        if rpp<=0: continue
-        tp=f618-rpp*rr if st=="bear" else f618+rpp*rr
-        pos=(equity*risk_pct)/rpp
+        # Rule: one trade per pair at a time
+        if one_per_pair and in_trade: continue
 
+        # Rule: p3 must be recent enough
+        if recency_bars > 0 and (n - p3["idx"]) > recency_bars: continue
+
+        fh  = p1["price"] if st=="bear" else p2["price"]
+        fl  = p2["price"] if st=="bear" else p1["price"]
+        rng = fh-fl
+        if rng<=0: continue
+        f618  = fl+rng*fib_level if st=="bear" else fh-rng*fib_level
+        sl    = fh+rng*0.02      if st=="bear" else fl-rng*0.02
+        rpp   = abs(f618-sl)
+        if rpp<=0: continue
+        tp    = f618-rpp*rr      if st=="bear" else f618+rpp*rr
+        pos   = (equity*risk_pct)/rpp
+
+        # Find entry — with time expiry (max_bars) and structure invalidation
         ec=None
         for ci in range(p3["idx"]+1, min(p3["idx"]+max_bars,n)):
             if st=="bear":
-                if highs[ci]>fh: break
+                if highs[ci]>fh: break          # structure invalidated
                 if highs[ci]>=f618: ec=ci; break
             else:
-                if lows[ci]<fl: break
+                if lows[ci]<fl: break           # structure invalidated
                 if lows[ci]<=f618: ec=ci; break
         if ec is None: continue
 
+        # Find exit — with max hold
+        in_trade = True
         xc=xp=xr=None
-        for ci in range(ec+1, min(ec+max_bars,n)):
+        for ci in range(ec+1, min(ec+max_hold,n)):
             if st=="bear":
                 if highs[ci]>=sl: xp=sl;xr="SL";xc=ci;break
                 if lows[ci]<=tp:  xp=tp;xr="TP";xc=ci;break
             else:
                 if lows[ci]<=sl:  xp=sl;xr="SL";xc=ci;break
                 if highs[ci]>=tp: xp=tp;xr="TP";xc=ci;break
-        if xc is None: continue
+        if xc is None:
+            in_trade = False
+            continue
 
-        pnl=(f618-xp)*pos if st=="bear" else (xp-f618)*pos
-        equity+=pnl
-        won=xr=="TP"
-        bias=None if won else ("bull" if st=="bear" else "bear")
+        pnl    = (f618-xp)*pos if st=="bear" else (xp-f618)*pos
+        equity += pnl
+        won    = xr=="TP"
+        bias   = None if won else ("bull" if st=="bear" else "bear")
+        in_trade = False
+
         trades.append({
             "id":len(trades)+1,"direction":"LONG" if st=="bull" else "SHORT",
             "entry_time":timestamps[ec],"exit_time":timestamps[xc],
@@ -246,7 +249,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars):
             "exit_price":round(xp,4),"result":xr,
             "pnl":round(pnl,4),"equity":round(equity,4),"won":won
         })
-        used=p3["idx"]
+        used = p3["idx"]
     return trades
 
 # ── STATS ─────────────────────────────────────────────────
@@ -289,14 +292,12 @@ def calc_stats(trades, days):
 # ── PROCESS ONE REQUEST ───────────────────────────────────
 def process_request(req: BacktestRequest):
     try:
-        # Check result cache first
         if SUPABASE_URL:
             cached_stats = get_cached_result(
                 req.symbol, req.timeframe, req.pivot_n,
                 req.risk_method, req.rr, req.start_date, req.end_date
             )
             if cached_stats:
-                print(f"Result cache hit: {req.symbol} {req.timeframe} {req.risk_method} {req.rr}R")
                 return {
                     "success":True,"source":"Cache (results DB)",
                     "symbol":req.symbol,"timeframe":req.timeframe,
@@ -306,15 +307,14 @@ def process_request(req: BacktestRequest):
                     "equity_curve":[],"trades":[],
                 }
 
-        # Fetch candles
         candles, source = fetch_candles(req.symbol, req.timeframe, req.start_date, req.end_date)
         highs=np.array([c[2] for c in candles])
         lows=np.array([c[3] for c in candles])
         pivots=find_pivots(highs, lows, req.pivot_n)
         days=(candles[-1][0]-candles[0][0])//(86400000)
 
-        # Get kelly values
-        trades_fixed=run_backtest_core(candles, pivots, 0.02, req.rr, req.fib_level, req.max_bars)
+        trades_fixed=run_backtest_core(candles, pivots, 0.02, req.rr, req.fib_level,
+                                        req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair)
         stats_fixed=calc_stats(trades_fixed, days)
 
         risk_pct=req.risk_pct
@@ -323,10 +323,10 @@ def process_request(req: BacktestRequest):
         elif req.risk_method=="full_kelly" and stats_fixed:
             risk_pct=max(stats_fixed["kelly_full"], 0.01)
 
-        trades=run_backtest_core(candles, pivots, risk_pct, req.rr, req.fib_level, req.max_bars)
+        trades=run_backtest_core(candles, pivots, risk_pct, req.rr, req.fib_level,
+                                  req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair)
         stats=calc_stats(trades, days)
 
-        # Save result to Supabase
         if SUPABASE_URL and stats:
             save_result(req.symbol, req.timeframe, req.pivot_n,
                        req.risk_method, req.rr, req.start_date, req.end_date, stats)
@@ -357,7 +357,7 @@ def process_request(req: BacktestRequest):
 # ── ROUTES ────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status":"Fib Backtest API v5","cache":"Supabase (candles + results)" if SUPABASE_URL else "memory only"}
+    return {"status":"Fib Backtest API v6","rules":"time_expiry+invalidation+one_per_pair+recency"}
 
 @app.get("/pairs")
 def get_pairs():
@@ -365,20 +365,15 @@ def get_pairs():
 
 @app.get("/cache-status")
 def cache_status():
-    # Count cached results
     result_count = 0
-    candle_count = 0
     try:
         r1 = httpx.get(f"{SUPABASE_URL}/rest/v1/results?select=id&limit=1000", headers=HEADERS, timeout=5)
         if r1.status_code==200: result_count=len(r1.json())
-        r2 = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?select=id&limit=1", headers=HEADERS, timeout=5)
-        if r2.status_code==200: candle_count="see Supabase"
     except: pass
     return {
         "memory_cache_keys":list(_mem_cache.keys()),
         "supabase_connected":bool(SUPABASE_URL),
         "cached_results":result_count,
-        "candle_sets":len(_mem_cache),
     }
 
 @app.get("/results-history")
@@ -390,7 +385,6 @@ def results_history():
             return {"success":True,"results":res.json(),"total":len(res.json())}
     except Exception as e:
         return {"success":False,"error":str(e)}
-    return {"success":False,"error":"Failed"}
 
 @app.post("/backtest")
 def backtest(req: BacktestRequest):
@@ -413,7 +407,8 @@ async def compare(req: CompareRequest):
                     for rr in req.rr_ratios:
                         base={"symbol":sym,"timeframe":tf,"pivot_n":pn,
                               "risk_method":risk,"risk_pct":0.02,"rr":rr,
-                              "fib_level":0.618,"max_bars":200}
+                              "fib_level":0.618,"max_bars":200,"max_hold":200,
+                              "recency_bars":50,"one_per_pair":True}
                         configs_a.append(BacktestRequest(**{**base,"start_date":req.period_a_start,"end_date":req.period_a_end}))
                         configs_b.append(BacktestRequest(**{**base,"start_date":req.period_b_start,"end_date":req.period_b_end}))
 
