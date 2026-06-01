@@ -168,12 +168,22 @@ def fetch_candles(symbol, timeframe, start_date, end_date):
     for name, ex in exchanges:
         try:
             all_candles, since = [], start_ms
+            empty_count = 0
             while since < end_ms:
                 batch = ex.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
-                if not batch: break
-                all_candles += [c for c in batch if c[0] < end_ms]
-                if len(batch) < 1000: break
-                since = batch[-1][0]+1
+                if not batch:
+                    empty_count += 1
+                    if empty_count >= 3: break
+                    time.sleep(1)
+                    continue
+                empty_count = 0
+                filtered = [c for c in batch if c[0] < end_ms]
+                all_candles += filtered
+                last_ts = batch[-1][0]
+                if last_ts >= end_ms: break       # reached end of requested range
+                if last_ts <= since: break        # no progress — exchange returned same candles
+                since = last_ts + 1
+                time.sleep(0.2)                   # rate limit protection between batches
             if len(all_candles) > 50:
                 _mem_cache[cache_key] = all_candles
                 if SUPABASE_URL: save_candles(symbol, timeframe, all_candles)
