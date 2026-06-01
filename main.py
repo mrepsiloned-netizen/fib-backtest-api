@@ -63,12 +63,25 @@ class CompareRequest(BaseModel):
 # ── SUPABASE CANDLE CACHE ─────────────────────────────────
 def get_cached_candles(symbol, timeframe, start_ms, end_ms):
     try:
-        query = f"symbol=eq.{symbol}&timeframe=eq.{timeframe}&ts=gte.{start_ms}&ts=lte.{end_ms}&order=ts.asc&limit=10000&select=ts,open,high,low,close,volume"
-        res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{query}", headers=HEADERS, timeout=10)
-        if res.status_code == 200:
-            rows = res.json()
-            if len(rows) > 50:
-                return [[r["ts"],r["open"],r["high"],r["low"],r["close"],r["volume"]] for r in rows]
+        all_rows = []
+        offset = 0
+        page_size = 10000
+        while True:
+            query = (f"symbol=eq.{symbol}&timeframe=eq.{timeframe}"
+                     f"&ts=gte.{start_ms}&ts=lte.{end_ms}"
+                     f"&order=ts.asc&limit={page_size}&offset={offset}"
+                     f"&select=ts,open,high,low,close,volume")
+            res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{query}", headers=HEADERS, timeout=30)
+            if res.status_code == 200:
+                rows = res.json()
+                if not rows: break
+                all_rows += rows
+                if len(rows) < page_size: break
+                offset += page_size
+            else:
+                break
+        if len(all_rows) > 50:
+            return [[r["ts"],r["open"],r["high"],r["low"],r["close"],r["volume"]] for r in all_rows]
     except Exception as e:
         print(f"Candle cache read error: {e}")
     return None
@@ -76,7 +89,7 @@ def get_cached_candles(symbol, timeframe, start_ms, end_ms):
 def save_candles(symbol, timeframe, candles):
     try:
         url = f"{SUPABASE_URL}/rest/v1/candles"
-        save_headers = {**HEADERS, "Prefer": "return=minimal,resolution=ignore-duplicates"}
+        save_headers = {**HEADERS, "Prefer": "return=minimal,resolution=merge-duplicates"}
         for i in range(0, len(candles), 500):
             batch = candles[i:i+500]
             rows = [{"symbol":symbol,"timeframe":timeframe,"ts":c[0],"open":float(c[1]),"high":float(c[2]),"low":float(c[3]),"close":float(c[4]),"volume":float(c[5])} for c in batch]
@@ -140,8 +153,16 @@ def fetch_candles(symbol, timeframe, start_date, end_date):
     if SUPABASE_URL:
         cached = get_cached_candles(symbol, timeframe, start_ms, end_ms)
         if cached:
-            _mem_cache[cache_key] = cached
-            return cached, "Cache (Supabase)"
+            # Validate cache completeness — reject if significantly under-fetched
+            duration_ms = end_ms - start_ms
+            tf_ms = {"1m":60000,"5m":300000,"15m":900000,"1h":3600000,"4h":14400000,"1d":86400000}
+            expected = duration_ms / tf_ms.get(timeframe, 900000)
+            completeness = len(cached) / expected if expected > 0 else 1
+            if completeness >= 0.75:  # accept if we have 75%+ of expected candles
+                _mem_cache[cache_key] = cached
+                return cached, "Cache (Supabase)"
+            else:
+                print(f"Cache incomplete for {symbol} {timeframe}: {len(cached)}/{int(expected)} candles ({completeness:.1%}) — refetching")
 
     exchanges = [("KuCoin",ccxt.kucoin()),("OKX",ccxt.okx()),("Bybit",ccxt.bybit())]
     for name, ex in exchanges:
