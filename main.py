@@ -199,8 +199,9 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
         # Rule: one trade per pair at a time
         if one_per_pair and in_trade: continue
 
-        # Rule: p3 must be recent enough (relative to where we'd start scanning for entry)
-        if recency_bars > 0 and (p3["idx"] + recency_bars) < n and (n - 1 - p3["idx"]) > max_bars + recency_bars: continue
+        # Note: recency_bars filter intentionally removed from backtest core.
+        # In a historical backtest every pivot was "recent" at the time it formed.
+        # Recency filtering only makes sense in live/paper trading context.
 
         fh  = p1["price"] if st=="bear" else p2["price"]
         fl  = p2["price"] if st=="bear" else p1["price"]
