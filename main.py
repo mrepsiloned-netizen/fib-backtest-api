@@ -4,7 +4,7 @@
 # one trade per pair, candle recency filter
 # ============================================================
 
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import ccxt
@@ -15,6 +15,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import os
 import httpx
+import time
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -408,6 +409,67 @@ def cache_status():
         "memory_cache_keys":list(_mem_cache.keys()),
         "supabase_connected":bool(SUPABASE_URL),
         "cached_results":result_count,
+    }
+
+# ── PREFETCH SYSTEM ───────────────────────────────────────
+_prefetch_status = {}  # key: "symbol_timeframe_start_end" → status dict
+
+def _do_prefetch(symbol, timeframe, start_date, end_date):
+    key = f"{symbol}_{timeframe}_{start_date}_{end_date}"
+    _prefetch_status[key] = {"status":"running","candles":0,"error":None}
+    try:
+        candles, source = fetch_candles(symbol, timeframe, start_date, end_date)
+        _prefetch_status[key] = {"status":"done","candles":len(candles),"source":source,"error":None}
+        print(f"Prefetch done: {symbol} {timeframe} — {len(candles)} candles from {source}")
+    except Exception as e:
+        _prefetch_status[key] = {"status":"error","candles":0,"error":str(e)}
+        print(f"Prefetch error: {symbol} {timeframe} — {e}")
+
+class PrefetchRequest(BaseModel):
+    symbol: str = "BTC/USDT"
+    timeframe: str = "15m"
+    start_date: str = "2025-01-01"
+    end_date: str = "2026-01-01"
+
+@app.post("/prefetch")
+def prefetch(req: PrefetchRequest, background_tasks: BackgroundTasks):
+    key = f"{req.symbol}_{req.timeframe}_{req.start_date}_{req.end_date}"
+    if _prefetch_status.get(key, {}).get("status") == "running":
+        return {"status":"already_running","message":f"Already fetching {req.symbol} {req.timeframe}"}
+    background_tasks.add_task(_do_prefetch, req.symbol, req.timeframe, req.start_date, req.end_date)
+    _prefetch_status[key] = {"status":"queued","candles":0,"error":None}
+    return {"status":"queued","message":f"Fetching {req.symbol} {req.timeframe} {req.start_date}→{req.end_date} in background"}
+
+@app.get("/prefetch-status")
+def prefetch_status_check(symbol: str, timeframe: str, start_date: str, end_date: str):
+    key = f"{symbol}_{timeframe}_{start_date}_{end_date}"
+    job  = _prefetch_status.get(key, {"status":"not_started","candles":0,"error":None})
+
+    # Also check Supabase for actual candle count
+    try:
+        start_ms = int(datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
+        end_ms   = int(datetime.now(timezone.utc).timestamp()*1000) if end_date=="now" else \
+                   int(datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
+        tf_ms    = {"1m":60000,"5m":300000,"15m":900000,"1h":3600000,"4h":14400000,"1d":86400000}
+        expected = (end_ms - start_ms) / tf_ms.get(timeframe, 900000)
+
+        # Quick count from Supabase
+        q = f"symbol=eq.{symbol}&timeframe=eq.{timeframe}&ts=gte.{start_ms}&ts=lte.{end_ms}&select=ts"
+        res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q}&limit=1",
+                       headers={**HEADERS, "Prefer":"count=exact"}, timeout=5)
+        db_count = int(res.headers.get("content-range","0/0").split("/")[-1]) if res.status_code==200 else 0
+        pct = round(db_count / expected * 100, 1) if expected > 0 else 0
+    except:
+        db_count, expected, pct = 0, 0, 0
+
+    return {
+        "symbol":symbol,"timeframe":timeframe,
+        "job_status":job["status"],
+        "db_candles":db_count,
+        "expected":int(expected),
+        "completeness_pct":pct,
+        "ready": pct >= 75,
+        "error":job.get("error"),
     }
 
 @app.get("/results-history")
