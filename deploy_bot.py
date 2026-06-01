@@ -26,6 +26,7 @@ FILE_ROUTES = {
     "index.html":       {"repo": "fib-backtest-ui",  "path": "index.html"},
     "main.py":          {"repo": "fib-backtest-api", "path": "main.py"},
     "paper_trader.py":  {"repo": "fib-backtest-api", "path": "paper_trader.py"},
+    "live_trader.py":   {"repo": "fib-backtest-api", "path": "live_trader.py"},
     "deploy_bot.py":    {"repo": "fib-backtest-api", "path": "deploy_bot.py"},
     "requirements.txt": {"repo": "fib-backtest-api", "path": "requirements.txt"},
     "Procfile":         {"repo": "fib-backtest-api", "path": "Procfile"},
@@ -122,6 +123,7 @@ Just send me any of these files and I'll push to GitHub automatically:
 📄 <code>index.html</code> → fib-backtest-ui
 📄 <code>main.py</code> → fib-backtest-api
 📄 <code>paper_trader.py</code> → fib-backtest-api
+📄 <code>live_trader.py</code> → fib-backtest-api
 📄 <code>deploy_bot.py</code> → fib-backtest-api
 📄 <code>requirements.txt</code> → fib-backtest-api
 📄 <code>Procfile</code> → fib-backtest-api
