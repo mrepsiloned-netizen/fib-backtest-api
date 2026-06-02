@@ -106,6 +106,8 @@ def save_candles(symbol, timeframe, candles):
 def get_cached_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, end_date, fib_level=0.618):
     try:
         if end_date == "now": return None
+        # Skip cache for sub-day periods (datetime strings contain T or space)
+        if "T" in start_date or " " in start_date: return None
         query = (f"symbol=eq.{symbol}&timeframe=eq.{timeframe}"
                  f"&pivot_n=eq.{pivot_n}&risk_method=eq.{risk_method}"
                  f"&rr=eq.{rr}&period_start=eq.{start_date}&period_end=eq.{end_date}"
@@ -126,6 +128,8 @@ def get_cached_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, e
 def save_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, end_date, stats, fib_level=0.618):
     try:
         if end_date == "now" or not stats: return
+        # Skip cache save for sub-day periods
+        if "T" in start_date or " " in start_date: return
         url = f"{SUPABASE_URL}/rest/v1/results"
         save_headers = {**HEADERS, "Prefer": "return=minimal,resolution=ignore-duplicates"}
         row = {
