@@ -36,9 +36,9 @@ MODE      = "LIVE"  # change to "PAPER" to revert to paper mode
 
 # ── WATCHLIST — Core 3 only, no 1M speed test for live ────
 WATCHLIST = [
-    {"symbol":"BTC/USDT","timeframe":"15m","pivot_n":5,"rr":2.0,"label":"🔵 Low Risk / Stable"},
-    {"symbol":"ETH/USDT","timeframe":"1h", "pivot_n":3,"rr":4.0,"label":"🟡 Mid Risk"},
-    {"symbol":"SOL/USDT","timeframe":"15m","pivot_n":3,"rr":4.0,"label":"🔴 High Risk"},
+    {"symbol":"ETH/USDT","timeframe":"1m", "pivot_n":8,"rr":1.5,"label":"⚡ Fast — ETH 1M"},
+    {"symbol":"SOL/USDT","timeframe":"15m","pivot_n":3,"rr":4.0,"label":"🔵 Mid — SOL 15M"},
+    {"symbol":"BTC/USDT","timeframe":"1h", "pivot_n":3,"rr":2.0,"label":"🟡 Slow — BTC 1H"},
 ]
 
 # ── SUPABASE ──────────────────────────────────────────────
@@ -337,6 +337,7 @@ def detect_signal(candles, pivots, rr):
 
 # ── MAIN LOOP ─────────────────────────────────────────────
 open_signals = {}  # key: symbol_timeframe
+pair_bias    = {}  # key: symbol_timeframe → "bull" | "bear" | None
 
 def run():
     global open_signals
@@ -419,6 +420,13 @@ def run():
                     pivots = find_pivots(candles, pivot_n)
                     signal = detect_signal(candles, pivots, rr)
 
+                    # Bias filter — skip if conflicts with current bias
+                    current_bias = pair_bias.get(key)
+                    signal_dir   = signal["structure"] if signal else None
+                    if signal and current_bias and current_bias != signal_dir:
+                        print(f"[{now_str}] Bias skip: {symbol} {timeframe} signal={signal_dir} bias={current_bias}")
+                        signal = None
+
                     if signal and key not in open_signals:
                         if now-last_signal.get(key,0)>interval:
                             # Sync real balance before placing order
@@ -478,19 +486,22 @@ def run():
                             sig["order_status"] = "filled"
                             print(f"[{now_str}] Order filled: {symbol} @ {sig['entry']}")
 
-                    # If filled — monitor SL/TP via ticker
+                    # If filled — monitor SL/TP via candle high/low (catches wicks)
                     if sig.get("order_status") == "filled":
-                        ticker    = bybit.fetch_ticker(symbol)
-                        price     = ticker["last"]
+                        latest    = fetch_candles(data_exchange, sig["symbol"], sig["timeframe"], limit=2)
+                        if not latest: continue
+                        candle    = latest[-1]
+                        c_high    = candle[2]
+                        c_low     = candle[3]
                         direction = sig["direction"]
-                        won=False; hit=False; exit_price=price
+                        won=False; hit=False; exit_price=None
 
                         if direction=="LONG":
-                            if price<=sig["sl"]: won=False;hit=True;exit_price=sig["sl"]
-                            elif price>=sig["tp"]: won=True;hit=True;exit_price=sig["tp"]
+                            if c_low<=sig["sl"]:   won=False; hit=True; exit_price=sig["sl"]
+                            elif c_high>=sig["tp"]: won=True;  hit=True; exit_price=sig["tp"]
                         else:
-                            if price>=sig["sl"]: won=False;hit=True;exit_price=sig["sl"]
-                            elif price<=sig["tp"]: won=True;hit=True;exit_price=sig["tp"]
+                            if c_high>=sig["sl"]:  won=False; hit=True; exit_price=sig["sl"]
+                            elif c_low<=sig["tp"]:  won=True;  hit=True; exit_price=sig["tp"]
 
                         if hit:
                             # Sync real balance after close
@@ -522,6 +533,13 @@ def run():
 
                             send_exit(sig["symbol"], sig["timeframe"], sig, exit_price, won, pnl, acc)
                             closed.append(key)
+                            # Bias flip on SL — match backtest behaviour
+                            if not won:
+                                flipped = "bull" if sig["structure"]=="bear" else "bear"
+                                pair_bias[key] = flipped
+                                print(f"[{now_str}] Bias flipped to {flipped}: {sig['symbol']} {sig['timeframe']}")
+                            else:
+                                pair_bias[key] = None
                             print(f"[{now_str}] {'✅TP' if won else '❌SL'}: {symbol} PnL=${pnl}")
 
                 except Exception as e:
