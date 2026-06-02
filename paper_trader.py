@@ -35,14 +35,9 @@ FIB_LEVEL     = 0.618
 
 # ── WATCHLIST ─────────────────────────────────────────────
 WATCHLIST = [
-    # Core 3 strategies — based on backtest results
-    {"symbol":"BTC/USDT","timeframe":"15m","pivot_n":5,"rr":2.0,"label":"🔵 Low Risk / Stable"},
-    {"symbol":"ETH/USDT","timeframe":"1h", "pivot_n":3,"rr":4.0,"label":"🟡 Mid Risk"},
-    {"symbol":"SOL/USDT","timeframe":"15m","pivot_n":3,"rr":4.0,"label":"🔴 High Risk"},
-    # 1M speed test — bot validation only
-    {"symbol":"XRP/USDT","timeframe":"1m", "pivot_n":3,"rr":2.0,"label":"⚡ 1M Speed Test"},
-    {"symbol":"BNB/USDT","timeframe":"1m", "pivot_n":3,"rr":2.0,"label":"⚡ 1M Speed Test"},
-    {"symbol":"INJ/USDT","timeframe":"1m", "pivot_n":3,"rr":2.0,"label":"⚡ 1M Speed Test"},
+    {"symbol":"ETH/USDT","timeframe":"1m", "pivot_n":8,"rr":1.5,"label":"⚡ Fast — ETH 1M"},
+    {"symbol":"SOL/USDT","timeframe":"15m","pivot_n":3,"rr":4.0,"label":"🔵 Mid — SOL 15M"},
+    {"symbol":"BTC/USDT","timeframe":"1h", "pivot_n":3,"rr":2.0,"label":"🟡 Slow — BTC 1H"},
 ]
 
 # ── SUPABASE ──────────────────────────────────────────────
