@@ -447,22 +447,25 @@ def prefetch_status_check(symbol: str, timeframe: str, start_date: str, end_date
     key = f"{symbol}_{timeframe}_{start_date}_{end_date}"
     job  = _prefetch_status.get(key, {"status":"not_started","candles":0,"error":None})
 
-    # Also check Supabase for actual candle count
+    db_count, expected, pct = 0, 0, 0
     try:
-        start_ms = int(datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
-        end_ms   = int(datetime.now(timezone.utc).timestamp()*1000) if end_date=="now" else \
-                   int(datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
+        now_ms   = int(datetime.now(timezone.utc).timestamp()*1000)
+        end_ms   = now_ms if end_date=="now" else int(datetime.strptime(end_date[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
+        start_ms = int(datetime.strptime(start_date[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
         tf_ms    = {"1m":60000,"5m":300000,"15m":900000,"1h":3600000,"4h":14400000,"1d":86400000}
         expected = (end_ms - start_ms) / tf_ms.get(timeframe, 900000)
+        print(f"Prefetch status: {symbol} {timeframe} {start_date}→{end_date} expected={int(expected)}")
 
-        # Quick count from Supabase
         q = f"symbol=eq.{symbol}&timeframe=eq.{timeframe}&ts=gte.{start_ms}&ts=lte.{end_ms}&select=ts"
         res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q}&limit=1",
-                       headers={**HEADERS, "Prefer":"count=exact"}, timeout=5)
-        db_count = int(res.headers.get("content-range","0/0").split("/")[-1]) if res.status_code==200 else 0
+                       headers={**HEADERS, "Prefer":"count=exact"}, timeout=10)
+        print(f"Supabase count response: {res.status_code} headers={dict(res.headers)}")
+        if res.status_code == 200:
+            cr = res.headers.get("content-range","0/0")
+            db_count = int(cr.split("/")[-1]) if "/" in cr and cr.split("/")[-1].isdigit() else 0
         pct = round(db_count / expected * 100, 1) if expected > 0 else 0
-    except:
-        db_count, expected, pct = 0, 0, 0
+    except Exception as e:
+        print(f"Prefetch status error: {e}")
 
     return {
         "symbol":symbol,"timeframe":timeframe,
