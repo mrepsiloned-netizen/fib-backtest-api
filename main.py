@@ -95,7 +95,7 @@ def save_candles(symbol, timeframe, candles):
             batch = candles[i:i+500]
             rows = [{"symbol":symbol,"timeframe":timeframe,"ts":c[0],"open":float(c[1]),"high":float(c[2]),"low":float(c[3]),"close":float(c[4]),"volume":float(c[5])} for c in batch]
             res = httpx.post(url, json=rows, headers=save_headers, timeout=30)
-            if res.status_code not in [200, 201, 204]:
+            if res.status_code not in [200,201]:
                 print(f"Candle save error {res.status_code}: {res.text[:200]}")
             else:
                 print(f"Saved {len(batch)} candles for {symbol} {timeframe}")
@@ -145,9 +145,14 @@ def save_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, end_dat
 _mem_cache = {}
 
 def fetch_candles(symbol, timeframe, start_date, end_date):
-    start_ms = int(datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
-    end_ms   = int(datetime.now(timezone.utc).timestamp()*1000) if end_date=="now" else \
-               int(datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
+    # Support both date ("2025-01-01") and datetime ("2025-01-01 14:00") for sub-day periods
+    def parse_dt(s):
+        for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"]:
+            try: return int(datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp()*1000)
+            except: pass
+        return int(datetime.now(timezone.utc).timestamp()*1000)
+    start_ms = parse_dt(start_date)
+    end_ms   = int(datetime.now(timezone.utc).timestamp()*1000) if end_date=="now" else parse_dt(end_date)
     cache_key = f"{symbol}_{timeframe}_{start_date}_{end_date}"
 
     if cache_key in _mem_cache:
@@ -215,65 +220,121 @@ def find_pivots(highs, lows, N):
 
 # ── BACKTEST CORE ─────────────────────────────────────────
 def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair):
-    highs = np.array([c[2] for c in candles])
-    lows  = np.array([c[3] for c in candles])
-    n     = len(candles)
+    """
+    Updated fib entry logic to match live/paper trader:
+
+    LONG:
+      - Find P1 (swing low) → P2 (swing high) pair from pivot list
+      - Draw fib P1→P2, entry at 61.8% (closer to P1)
+      - Entry candle: wick touches 61.8% AND closes above it (rejection confirm)
+      - Enter at next candle open
+      - SL below P1, TP at RR target
+      - Bias flip on SL hit
+
+    SHORT (mirror):
+      - Find P1 (swing high) → P2 (swing low)
+      - Entry candle: wick touches 61.8% AND closes below it
+      - Enter at next candle open
+    """
+    highs      = np.array([c[2] for c in candles])
+    lows       = np.array([c[3] for c in candles])
+    opens      = np.array([c[1] for c in candles])
+    n          = len(candles)
     timestamps = [c[0] for c in candles]
-    trades, equity, bias, used = [], 100.0, None, -1
-    in_trade = False  # one_per_pair flag
+    trades, equity, bias = [], 100.0, None
+    in_trade   = False
+    used_p2_idx = -1  # track last P2 used to avoid reusing same setup
 
-    for pi in range(2, len(pivots)):
-        p1,p2,p3 = pivots[pi-2],pivots[pi-1],pivots[pi]
-        st = None
-        if p1["type"]=="H" and p2["type"]=="L" and p3["type"]=="H" and p3["price"]<p1["price"]: st="bear"
-        elif p1["type"]=="L" and p2["type"]=="H" and p3["type"]=="L" and p3["price"]>p1["price"]: st="bull"
-        if not st or p3["idx"]<=used: continue
-        if bias and bias!=st: continue
+    # Build pivot index lookup for fast access
+    pivot_highs = {p["idx"]: p for p in pivots if p["type"]=="H"}
+    pivot_lows  = {p["idx"]: p for p in pivots if p["type"]=="L"}
 
-        # Rule: one trade per pair at a time
+    # Scan each candle as potential entry trigger
+    for ci in range(1, n-1):
         if one_per_pair and in_trade: continue
 
-        # Note: recency_bars filter intentionally removed from backtest core.
-        # In a historical backtest every pivot was "recent" at the time it formed.
-        # Recency filtering only makes sense in live/paper trading context.
+        c_high  = highs[ci]
+        c_low   = lows[ci]
+        c_close = candles[ci][4]
+        c_open_next = opens[ci+1]  # next candle open = actual entry price
 
-        fh  = p1["price"] if st=="bear" else p2["price"]
-        fl  = p2["price"] if st=="bear" else p1["price"]
-        rng = fh-fl
-        if rng<=0: continue
-        f618  = fl+rng*fib_level if st=="bear" else fh-rng*fib_level
-        sl    = fh+rng*0.02      if st=="bear" else fl-rng*0.02
-        rpp   = abs(f618-sl)
-        if rpp<=0: continue
-        tp    = f618-rpp*rr      if st=="bear" else f618+rpp*rr
-        pos   = (equity*risk_pct)/rpp
+        signal = None
 
-        # Find entry — with time expiry (max_bars) and structure invalidation
-        ec=None
-        for ci in range(p3["idx"]+1, min(p3["idx"]+max_bars,n)):
-            if st=="bear":
-                if highs[ci]>fh: break          # structure invalidated
-                if highs[ci]>=f618: ec=ci; break
-            else:
-                if lows[ci]<fl: break           # structure invalidated
-                if lows[ci]<=f618: ec=ci; break
-        if ec is None: continue
+        # ── LONG: find most recent P1(L)→P2(H) where P2 is before ci ──
+        if bias != "bear":
+            for p2 in sorted([p for p in pivots if p["type"]=="H" and p["idx"] < ci], key=lambda x: -x["idx"]):
+                if p2["idx"] <= used_p2_idx: break
+                # Find P1 — most recent Low before P2
+                p1_candidates = [p for p in pivots if p["type"]=="L" and p["idx"] < p2["idx"]]
+                if not p1_candidates: break
+                p1 = max(p1_candidates, key=lambda x: x["idx"])
+                if p1["price"] >= p2["price"]: break
+                rng = p2["price"] - p1["price"]
+                if rng <= 0: break
+                f618 = p2["price"] - rng * fib_level  # 61.8% down from P2, closer to P1
+                sl   = p1["price"] - rng * 0.02
+                rpp  = abs(f618 - sl)
+                if rpp <= 0: break
+                tp   = f618 + rpp * rr
+                # Invalidation: price broke below P1 or above P2 before ci
+                if min(lows[p2["idx"]:ci+1]) < p1["price"]: break
+                if max(highs[p2["idx"]:ci+1]) > p2["price"]: break
+                # Entry: wick touched 61.8% AND closed above it
+                if c_low <= f618 and c_close > f618:
+                    signal = {"st":"bull","f618":f618,"sl":sl,"tp":tp,"rpp":rpp,"p2idx":p2["idx"]}
+                break
 
-        # Find exit — with max hold
+        # ── SHORT: find most recent P1(H)→P2(L) where P2 is before ci ──
+        if not signal and bias != "bull":
+            for p2 in sorted([p for p in pivots if p["type"]=="L" and p["idx"] < ci], key=lambda x: -x["idx"]):
+                if p2["idx"] <= used_p2_idx: break
+                p1_candidates = [p for p in pivots if p["type"]=="H" and p["idx"] < p2["idx"]]
+                if not p1_candidates: break
+                p1 = max(p1_candidates, key=lambda x: x["idx"])
+                if p1["price"] <= p2["price"]: break
+                rng = p1["price"] - p2["price"]
+                if rng <= 0: break
+                f618 = p2["price"] + rng * fib_level  # 61.8% up from P2, closer to P1
+                sl   = p1["price"] + rng * 0.02
+                rpp  = abs(f618 - sl)
+                if rpp <= 0: break
+                tp   = f618 - rpp * rr
+                # Invalidation: price broke above P1 or below P2 before ci
+                if max(highs[p2["idx"]:ci+1]) > p1["price"]: break
+                if min(lows[p2["idx"]:ci+1]) < p2["price"]: break
+                # Entry: wick touched 61.8% AND closed below it
+                if c_high >= f618 and c_close < f618:
+                    signal = {"st":"bear","f618":f618,"sl":sl,"tp":tp,"rpp":rpp,"p2idx":p2["idx"]}
+                break
+
+        if not signal: continue
+
+        st    = signal["st"]
+        f618  = signal["f618"]
+        sl    = signal["sl"]
+        tp    = signal["tp"]
+        rpp   = signal["rpp"]
+        # Enter at next candle open (realistic — not at fib level itself)
+        entry = c_open_next
+        pos   = (equity * risk_pct) / rpp
+        used_p2_idx = signal["p2idx"]
+
+        # Find exit from ci+2 onwards
         in_trade = True
         xc=xp=xr=None
-        for ci in range(ec+1, min(ec+max_hold,n)):
+        for xi in range(ci+2, min(ci+max_hold, n)):
             if st=="bear":
-                if highs[ci]>=sl: xp=sl;xr="SL";xc=ci;break
-                if lows[ci]<=tp:  xp=tp;xr="TP";xc=ci;break
+                if highs[xi] >= sl: xp=sl; xr="SL"; xc=xi; break
+                if lows[xi]  <= tp: xp=tp; xr="TP"; xc=xi; break
             else:
-                if lows[ci]<=sl:  xp=sl;xr="SL";xc=ci;break
-                if highs[ci]>=tp: xp=tp;xr="TP";xc=ci;break
+                if lows[xi]  <= sl: xp=sl; xr="SL"; xc=xi; break
+                if highs[xi] >= tp: xp=tp; xr="TP"; xc=xi; break
+
         if xc is None:
             in_trade = False
             continue
 
-        pnl    = (f618-xp)*pos if st=="bear" else (xp-f618)*pos
+        pnl    = (entry-xp)*pos if st=="bear" else (xp-entry)*pos
         equity += pnl
         won    = xr=="TP"
         bias   = None if won else ("bull" if st=="bear" else "bear")
@@ -281,12 +342,12 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
         trades.append({
             "id":len(trades)+1,"direction":"LONG" if st=="bull" else "SHORT",
-            "entry_time":timestamps[ec],"exit_time":timestamps[xc],
-            "entry":round(f618,4),"sl":round(sl,4),"tp":round(tp,4),
+            "entry_time":timestamps[ci+1],"exit_time":timestamps[xc],
+            "entry":round(entry,4),"sl":round(sl,4),"tp":round(tp,4),
             "exit_price":round(xp,4),"result":xr,
             "pnl":round(pnl,4),"equity":round(equity,4),"won":won
         })
-        used = p3["idx"]
+
     return trades
 
 # ── STATS ─────────────────────────────────────────────────
@@ -456,21 +517,13 @@ def prefetch_status_check(symbol: str, timeframe: str, start_date: str, end_date
         expected = (end_ms - start_ms) / tf_ms.get(timeframe, 900000)
         print(f"Prefetch status: {symbol} {timeframe} {start_date}→{end_date} expected={int(expected)}")
 
-        # Paginated count — handles large candle sets (e.g. 525k for 1m)
-        q_base = f"symbol=eq.{symbol}&timeframe=eq.{timeframe}&ts=gte.{start_ms}&ts=lte.{end_ms}&select=ts"
-        offset = 0
-        page_size = 10000
-        while True:
-            res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q_base}&limit={page_size}&offset={offset}",
-                           headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=30)
-            if res.status_code == 200:
-                rows = res.json()
-                db_count += len(rows)
-                if len(rows) < page_size: break
-                offset += page_size
-            else:
-                break
-        print(f"Supabase count: {db_count} candles for {symbol} {timeframe}")
+        q = f"symbol=eq.{symbol}&timeframe=eq.{timeframe}&ts=gte.{start_ms}&ts=lte.{end_ms}&select=ts"
+        res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q}&limit=1",
+                       headers={**HEADERS, "Prefer":"count=exact"}, timeout=10)
+        print(f"Supabase count response: {res.status_code} headers={dict(res.headers)}")
+        if res.status_code == 200:
+            cr = res.headers.get("content-range","0/0")
+            db_count = int(cr.split("/")[-1]) if "/" in cr and cr.split("/")[-1].isdigit() else 0
         pct = round(db_count / expected * 100, 1) if expected > 0 else 0
     except Exception as e:
         print(f"Prefetch status error: {e}")
