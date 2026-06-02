@@ -145,9 +145,13 @@ def save_result(symbol, timeframe, pivot_n, risk_method, rr, start_date, end_dat
 _mem_cache = {}
 
 def fetch_candles(symbol, timeframe, start_date, end_date):
-    start_ms = int(datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
-    end_ms   = int(datetime.now(timezone.utc).timestamp()*1000) if end_date=="now" else \
-               int(datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
+    def parse_dt(s):
+        for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"]:
+            try: return int(datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp()*1000)
+            except: pass
+        return int(datetime.now(timezone.utc).timestamp()*1000)
+    start_ms = parse_dt(start_date)
+    end_ms   = int(datetime.now(timezone.utc).timestamp()*1000) if end_date=="now" else parse_dt(end_date)
     cache_key = f"{symbol}_{timeframe}_{start_date}_{end_date}"
 
     if cache_key in _mem_cache:
