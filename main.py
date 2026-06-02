@@ -385,14 +385,18 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
     # ── Main scan ──────────────────────────────────────────
     last_used_idx = -1
     active_setup  = None  # current fib setup waiting for entry
+    setup_search_from = 0  # candle index to start searching from
 
     for ci in range(1, n-1):
         if in_trade: continue
 
-        # Find new setup if none active
+        # Find new setup if none active — only search from where we left off
         if active_setup is None:
+            if ci < setup_search_from: continue
             setup = find_bos_setup(pivots, candles, bias, last_used_idx, N_min)
-            if setup is None: continue
+            if setup is None:
+                setup_search_from = ci + 10  # skip ahead, avoid re-searching every candle
+                continue
             st       = setup["st"]
             p2       = setup["p2"]
             p3_close = setup["p3_close"]
