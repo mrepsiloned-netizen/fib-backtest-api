@@ -95,7 +95,7 @@ def save_candles(symbol, timeframe, candles):
             batch = candles[i:i+500]
             rows = [{"symbol":symbol,"timeframe":timeframe,"ts":c[0],"open":float(c[1]),"high":float(c[2]),"low":float(c[3]),"close":float(c[4]),"volume":float(c[5])} for c in batch]
             res = httpx.post(url, json=rows, headers=save_headers, timeout=30)
-            if res.status_code not in [200,201]:
+            if res.status_code not in [200, 201, 204]:
                 print(f"Candle save error {res.status_code}: {res.text[:200]}")
             else:
                 print(f"Saved {len(batch)} candles for {symbol} {timeframe}")
@@ -456,13 +456,21 @@ def prefetch_status_check(symbol: str, timeframe: str, start_date: str, end_date
         expected = (end_ms - start_ms) / tf_ms.get(timeframe, 900000)
         print(f"Prefetch status: {symbol} {timeframe} {start_date}→{end_date} expected={int(expected)}")
 
-        # Direct count via Supabase RPC — avoids unreliable content-range header
-        q = f"symbol=eq.{symbol}&timeframe=eq.{timeframe}&ts=gte.{start_ms}&ts=lte.{end_ms}&select=ts"
-        res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q}&limit=100000",
-                       headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}, timeout=30)
-        print(f"Supabase count response: {res.status_code} rows={len(res.json()) if res.status_code==200 else 'err'}")
-        if res.status_code == 200:
-            db_count = len(res.json())
+        # Paginated count — handles large candle sets (e.g. 525k for 1m)
+        q_base = f"symbol=eq.{symbol}&timeframe=eq.{timeframe}&ts=gte.{start_ms}&ts=lte.{end_ms}&select=ts"
+        offset = 0
+        page_size = 10000
+        while True:
+            res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q_base}&limit={page_size}&offset={offset}",
+                           headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=30)
+            if res.status_code == 200:
+                rows = res.json()
+                db_count += len(rows)
+                if len(rows) < page_size: break
+                offset += page_size
+            else:
+                break
+        print(f"Supabase count: {db_count} candles for {symbol} {timeframe}")
         pct = round(db_count / expected * 100, 1) if expected > 0 else 0
     except Exception as e:
         print(f"Prefetch status error: {e}")
