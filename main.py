@@ -95,7 +95,7 @@ def save_candles(symbol, timeframe, candles):
             batch = candles[i:i+500]
             rows = [{"symbol":symbol,"timeframe":timeframe,"ts":c[0],"open":float(c[1]),"high":float(c[2]),"low":float(c[3]),"close":float(c[4]),"volume":float(c[5])} for c in batch]
             res = httpx.post(url, json=rows, headers=save_headers, timeout=30)
-            if res.status_code not in [200,201]:
+            if res.status_code not in [200, 201, 204]:
                 print(f"Candle save error {res.status_code}: {res.text[:200]}")
             else:
                 print(f"Saved {len(batch)} candles for {symbol} {timeframe}")
@@ -458,7 +458,7 @@ def prefetch_status_check(symbol: str, timeframe: str, start_date: str, end_date
 
         q = f"symbol=eq.{symbol}&timeframe=eq.{timeframe}&ts=gte.{start_ms}&ts=lte.{end_ms}&select=ts"
         res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q}&limit=1",
-                       headers={**HEADERS, "Prefer":"count=exact"}, timeout=10)
+                       headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Prefer": "count=exact"}, timeout=10)
         print(f"Supabase count response: {res.status_code} headers={dict(res.headers)}")
         if res.status_code == 200:
             cr = res.headers.get("content-range","0/0")
