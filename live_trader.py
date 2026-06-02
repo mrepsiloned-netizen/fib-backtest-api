@@ -298,42 +298,116 @@ def find_pivots(candles, N):
     return deduped
 
 def detect_signal(candles, pivots, rr):
-    if len(pivots)<3: return None
-    p1,p2,p3=pivots[-3],pivots[-2],pivots[-1]
-    current=candles[-1][4]
-    n=len(candles)
+    """
+    Correct fib entry logic:
 
-    structure=None
-    if p1["type"]=="H" and p2["type"]=="L" and p3["type"]=="H" and p3["price"]<p1["price"]: structure="bear"
-    elif p1["type"]=="L" and p2["type"]=="H" and p3["type"]=="L" and p3["price"]>p1["price"]: structure="bull"
-    if not structure: return None
+    LONG:
+      - Find P1 (swing low) and P2 (swing high, after P1, higher than P1)
+      - P2 must be a genuine Higher High (higher than pivot before P1)
+      - Draw fib from P1 low → P2 high
+      - Entry at 61.8% retracement (closer to P1)
+      - Wait for current candle low to TOUCH 61.8% zone
+      - Enter next candle open
+      - SL below P1 with buffer
+      - Invalidation: price breaks above P2 (redraw) or below P1 (trend broken)
 
-    # Recency check — p3 must be within last 50 candles
-    if n-p3["idx"]>50: return None
+    SHORT (mirror):
+      - Find P1 (swing high) and P2 (swing low, after P1, lower than P1)
+      - Draw fib from P1 high → P2 low
+      - Entry at 61.8% retracement (closer to P1)
+      - Wait for current candle high to TOUCH 61.8% zone
+      - Enter next candle open
+      - SL above P1 with buffer
+      - Invalidation: price breaks below P2 or above P1
+    """
+    if len(pivots) < 4: return None
 
-    fh=p1["price"] if structure=="bear" else p2["price"]
-    fl=p2["price"] if structure=="bear" else p1["price"]
-    rng=fh-fl
-    if rng<=0: return None
+    current_high = candles[-1][2]   # current candle high (wick)
+    current_low  = candles[-1][3]   # current candle low (wick)
+    current_close= candles[-1][4]
+    n = len(candles)
 
-    fib618=fl+rng*FIB_LEVEL if structure=="bear" else fh-rng*FIB_LEVEL
-    sl=fh+rng*0.02 if structure=="bear" else fl-rng*0.02
-    rpp=abs(fib618-sl)
-    if rpp<=0: return None
-    tp=fib618-rpp*rr if structure=="bear" else fib618+rpp*rr
+    # ── LONG SETUP ────────────────────────────────────────
+    # Find most recent valid P1 (Low) → P2 (High) pair
+    # P2 must come after P1, P2 > P1, and P2 must be higher than the High before P1
+    long_signal = None
+    for i in range(len(pivots)-1, 0, -1):
+        p2 = pivots[i]
+        if p2["type"] != "H": continue
+        # Find P1 — the most recent Low before P2
+        for j in range(i-1, -1, -1):
+            p1 = pivots[j]
+            if p1["type"] != "L": continue
+            # P1 must be lower than P2 (basic uptrend)
+            if p1["price"] >= p2["price"]: break
+            # P2 recency check — P2 must be within last 100 candles
+            if n - p2["idx"] > 100: break
+            # Fib levels
+            rng = p2["price"] - p1["price"]
+            if rng <= 0: break
+            fib618 = p2["price"] - rng * FIB_LEVEL  # 61.8% down from P2, closer to P1
+            sl     = p1["price"] - rng * 0.02        # below P1 with buffer
+            rpp    = abs(fib618 - sl)
+            if rpp <= 0: break
+            tp     = fib618 + rpp * rr
+            # Invalidation: price already broke below P1 → no long
+            if current_low < p1["price"]: break
+            # Invalidation: price broke above P2 → structure extended, skip
+            if current_high > p2["price"]: break
+            # Entry trigger: current candle LOW touched or crossed 61.8% zone
+            zone_pct = abs(current_low - fib618) / fib618 * 100
+            if current_low <= fib618 and current_close > fib618:
+                # Price wicked into zone but closed above — valid touch, enter next candle
+                long_signal = {
+                    "structure":"bull","direction":"LONG",
+                    "p1":round(p1["price"],6),"p2":round(p2["price"],6),
+                    "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
+                    "current":round(current_close,6),"rr":rr,"zone_pct":round(zone_pct,3)
+                }
+            break
+        if long_signal: break
 
-    # Structure invalidation check
-    if structure=="bear" and current>fh: return None
-    if structure=="bull" and current<fl: return None
+    # ── SHORT SETUP ───────────────────────────────────────
+    short_signal = None
+    for i in range(len(pivots)-1, 0, -1):
+        p2 = pivots[i]
+        if p2["type"] != "L": continue
+        # Find P1 — the most recent High before P2
+        for j in range(i-1, -1, -1):
+            p1 = pivots[j]
+            if p1["type"] != "H": continue
+            # P1 must be higher than P2 (basic downtrend)
+            if p1["price"] <= p2["price"]: break
+            # P2 recency check
+            if n - p2["idx"] > 100: break
+            # Fib levels
+            rng = p1["price"] - p2["price"]
+            if rng <= 0: break
+            fib618 = p2["price"] + rng * FIB_LEVEL  # 61.8% up from P2, closer to P1
+            sl     = p1["price"] + rng * 0.02        # above P1 with buffer
+            rpp    = abs(fib618 - sl)
+            if rpp <= 0: break
+            tp     = fib618 - rpp * rr
+            # Invalidation: price already broke above P1 → no short
+            if current_high > p1["price"]: break
+            # Invalidation: price broke below P2 → structure extended, skip
+            if current_low < p2["price"]: break
+            # Entry trigger: current candle HIGH touched 61.8% zone but closed below
+            zone_pct = abs(current_high - fib618) / fib618 * 100
+            if current_high >= fib618 and current_close < fib618:
+                short_signal = {
+                    "structure":"bear","direction":"SHORT",
+                    "p1":round(p1["price"],6),"p2":round(p2["price"],6),
+                    "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
+                    "current":round(current_close,6),"rr":rr,"zone_pct":round(zone_pct,3)
+                }
+            break
+        if short_signal: break
 
-    zone_pct=abs(current-fib618)/fib618*100
-    if zone_pct<=0.5:
-        return {
-            "structure":structure,"direction":"SHORT" if structure=="bear" else "LONG",
-            "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
-            "current":round(current,6),"rr":rr,"zone_pct":round(zone_pct,3)
-        }
-    return None
+    # Return whichever signal fired (prefer the one with better zone proximity)
+    if long_signal and short_signal:
+        return long_signal if long_signal["zone_pct"] < short_signal["zone_pct"] else short_signal
+    return long_signal or short_signal
 
 # ── MAIN LOOP ─────────────────────────────────────────────
 open_signals = {}  # key: symbol_timeframe
