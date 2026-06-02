@@ -35,9 +35,14 @@ FIB_LEVEL     = 0.618
 
 # ── WATCHLIST ─────────────────────────────────────────────
 WATCHLIST = [
-    {"symbol":"ETH/USDT","timeframe":"1m", "pivot_n":8,"rr":1.5,"label":"⚡ Fast — ETH 1M"},
-    {"symbol":"SOL/USDT","timeframe":"15m","pivot_n":3,"rr":4.0,"label":"🔵 Mid — SOL 15M"},
-    {"symbol":"BTC/USDT","timeframe":"1h", "pivot_n":3,"rr":2.0,"label":"🟡 Slow — BTC 1H"},
+    # Core 3 strategies — based on backtest results
+    {"symbol":"BTC/USDT","timeframe":"15m","pivot_n":5,"rr":2.0,"label":"🔵 Low Risk / Stable"},
+    {"symbol":"ETH/USDT","timeframe":"1h", "pivot_n":3,"rr":4.0,"label":"🟡 Mid Risk"},
+    {"symbol":"SOL/USDT","timeframe":"15m","pivot_n":3,"rr":4.0,"label":"🔴 High Risk"},
+    # 1M speed test — bot validation only
+    {"symbol":"XRP/USDT","timeframe":"1m", "pivot_n":3,"rr":2.0,"label":"⚡ 1M Speed Test"},
+    {"symbol":"BNB/USDT","timeframe":"1m", "pivot_n":3,"rr":2.0,"label":"⚡ 1M Speed Test"},
+    {"symbol":"INJ/USDT","timeframe":"1m", "pivot_n":3,"rr":2.0,"label":"⚡ 1M Speed Test"},
 ]
 
 # ── SUPABASE ──────────────────────────────────────────────
@@ -203,139 +208,153 @@ def fetch_candles(exchange, symbol, timeframe, limit=300):
     return exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
 
 def find_pivots(candles, N):
+    """Pivot detection — N candles left and right."""
     highs = np.array([c[2] for c in candles])
     lows  = np.array([c[3] for c in candles])
+    closes= np.array([c[4] for c in candles])
     pivots = []
     for i in range(N, len(candles)-N):
-        if highs[i]==max(highs[i-N:i+N+1]):
-            pivots.append({"idx":i,"type":"H","price":float(highs[i])})
-        elif lows[i]==min(lows[i-N:i+N+1]):
-            pivots.append({"idx":i,"type":"L","price":float(lows[i])})
-    deduped=[]
+        if highs[i] == max(highs[i-N:i+N+1]):
+            pivots.append({"idx":i,"type":"H","price":float(highs[i]),"close":float(closes[i])})
+        elif lows[i] == min(lows[i-N:i+N+1]):
+            pivots.append({"idx":i,"type":"L","price":float(lows[i]),"close":float(closes[i])})
+    deduped = []
     for p in pivots:
         if not deduped: deduped.append(p); continue
-        last=deduped[-1]
+        last = deduped[-1]
         if last["type"]==p["type"]:
             if p["type"]=="H" and p["price"]>last["price"]: deduped[-1]=p
             elif p["type"]=="L" and p["price"]<last["price"]: deduped[-1]=p
         else: deduped.append(p)
     return deduped
 
+
 def detect_signal(candles, pivots, rr):
     """
-    Correct fib entry logic:
+    BOS-based Fibonacci pullback signal detection.
 
     LONG:
-      - Find P1 (swing low) and P2 (swing high, after P1, higher than P1)
-      - P2 must be a genuine Higher High (higher than pivot before P1)
-      - Draw fib from P1 low → P2 high
-      - Entry at 61.8% retracement (closer to P1)
-      - Wait for current candle low to TOUCH 61.8% zone
-      - Enter next candle open
-      - SL below P1 with buffer
-      - Invalidation: price breaks above P2 (redraw) or below P1 (trend broken)
+      P1 = most recent confirmed pivot HIGH
+      BOS = current candle close > P1 high (P3)
+      P3 - P1 >= N_MIN candles (duration filter)
+      P2 = min(close[P1:P3]) — lowest close between P1 and P3
+      Range filter: (P3_close - P2) / P2 > 0.003
+      Entry: current candle LOW <= fib618 AND close > fib618
+      Enter next candle open
+      SL = P2, TP = entry + (entry - SL) * RR
 
-    SHORT (mirror):
-      - Find P1 (swing high) and P2 (swing low, after P1, lower than P1)
-      - Draw fib from P1 high → P2 low
-      - Entry at 61.8% retracement (closer to P1)
-      - Wait for current candle high to TOUCH 61.8% zone
-      - Enter next candle open
-      - SL above P1 with buffer
-      - Invalidation: price breaks below P2 or above P1
+    SHORT: mirror logic
     """
-    if len(pivots) < 4: return None
+    if len(candles) < 20 or len(pivots) < 1: return None
 
-    current_high = candles[-1][2]   # current candle high (wick)
-    current_low  = candles[-1][3]   # current candle low (wick)
-    current_close= candles[-1][4]
-    n = len(candles)
+    highs  = np.array([c[2] for c in candles])
+    lows   = np.array([c[3] for c in candles])
+    closes = np.array([c[4] for c in candles])
+    n      = len(candles)
 
-    # ── LONG SETUP ────────────────────────────────────────
-    # Find most recent valid P1 (Low) → P2 (High) pair
-    # P2 must come after P1, P2 > P1, and P2 must be higher than the High before P1
-    long_signal = None
-    for i in range(len(pivots)-1, 0, -1):
-        p2 = pivots[i]
-        if p2["type"] != "H": continue
-        # Find P1 — the most recent Low before P2
-        for j in range(i-1, -1, -1):
-            p1 = pivots[j]
-            if p1["type"] != "L": continue
-            # P1 must be lower than P2 (basic uptrend)
-            if p1["price"] >= p2["price"]: break
-            # P2 recency check — P2 must be within last 100 candles
-            if n - p2["idx"] > 100: break
-            # Fib levels
-            rng = p2["price"] - p1["price"]
-            if rng <= 0: break
-            fib618 = p2["price"] - rng * FIB_LEVEL  # 61.8% down from P2, closer to P1
-            sl     = p1["price"] - rng * 0.02        # below P1 with buffer
+    c_high  = highs[-1]
+    c_low   = lows[-1]
+    c_close = closes[-1]
+    N_MIN   = 3
+    MIN_RANGE = 0.003
+
+    for direction in ["bull", "bear"]:
+        # Find most recent P1
+        p1_candidates = [p for p in pivots if
+                        (direction=="bull" and p["type"]=="H") or
+                        (direction=="bear" and p["type"]=="L")]
+        if not p1_candidates: continue
+        p1 = p1_candidates[-1]
+        p1_idx = p1["idx"]
+
+        if direction == "bull":
+            p1_price = p1["price"]
+            # BOS: current close > P1 high
+            if c_close <= p1_price: continue
+            # Duration filter
+            bos_idx = n - 1
+            if bos_idx - p1_idx < N_MIN: continue
+            # P2 = min close between P1 and BOS
+            p2 = float(min(closes[p1_idx:bos_idx+1]))
+            rng = c_close - p2
+            if rng <= 0 or rng/p2 < MIN_RANGE: continue
+            fib618 = p2 + rng * FIB_LEVEL
+            sl     = p2
             rpp    = abs(fib618 - sl)
-            if rpp <= 0: break
+            if rpp <= 0: continue
             tp     = fib618 + rpp * rr
-            # Invalidation: price already broke below P1 → no long
-            if current_low < p1["price"]: break
-            # Invalidation: price broke above P2 → structure extended, skip
-            if current_high > p2["price"]: break
-            # Entry trigger: current candle LOW touched or crossed 61.8% zone
-            zone_pct = abs(current_low - fib618) / fib618 * 100
-            if current_low <= fib618 and current_close > fib618:
-                # Price wicked into zone but closed above — valid touch, enter next candle
-                long_signal = {
+            # Entry trigger: wick touches fib618, closes above
+            if c_low <= fib618 and c_close > fib618:
+                return {
                     "structure":"bull","direction":"LONG",
-                    "p1":round(p1["price"],6),"p2":round(p2["price"],6),
                     "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
-                    "current":round(current_close,6),"rr":rr,"zone_pct":round(zone_pct,3)
+                    "p1":round(p1_price,6),"p2":round(p2,6),
+                    "current":round(c_close,6),"rr":rr
                 }
-            break
-        if long_signal: break
 
-    # ── SHORT SETUP ───────────────────────────────────────
-    short_signal = None
-    for i in range(len(pivots)-1, 0, -1):
-        p2 = pivots[i]
-        if p2["type"] != "L": continue
-        # Find P1 — the most recent High before P2
-        for j in range(i-1, -1, -1):
-            p1 = pivots[j]
-            if p1["type"] != "H": continue
-            # P1 must be higher than P2 (basic downtrend)
-            if p1["price"] <= p2["price"]: break
-            # P2 recency check
-            if n - p2["idx"] > 100: break
-            # Fib levels
-            rng = p1["price"] - p2["price"]
-            if rng <= 0: break
-            fib618 = p2["price"] + rng * FIB_LEVEL  # 61.8% up from P2, closer to P1
-            sl     = p1["price"] + rng * 0.02        # above P1 with buffer
+        else:  # bear
+            p1_price = p1["price"]
+            # BOS: current close < P1 low
+            if c_close >= p1_price: continue
+            bos_idx = n - 1
+            if bos_idx - p1_idx < N_MIN: continue
+            # P2 = max close between P1 and BOS
+            p2 = float(max(closes[p1_idx:bos_idx+1]))
+            rng = p2 - c_close
+            if rng <= 0 or rng/p2 < MIN_RANGE: continue
+            fib618 = p2 - rng * FIB_LEVEL
+            sl     = p2
             rpp    = abs(fib618 - sl)
-            if rpp <= 0: break
+            if rpp <= 0: continue
             tp     = fib618 - rpp * rr
-            # Invalidation: price already broke above P1 → no short
-            if current_high > p1["price"]: break
-            # Invalidation: price broke below P2 → structure extended, skip
-            if current_low < p2["price"]: break
-            # Entry trigger: current candle HIGH touched 61.8% zone but closed below
-            zone_pct = abs(current_high - fib618) / fib618 * 100
-            if current_high >= fib618 and current_close < fib618:
-                short_signal = {
+            # Entry trigger: wick touches fib618, closes below
+            if c_high >= fib618 and c_close < fib618:
+                return {
                     "structure":"bear","direction":"SHORT",
-                    "p1":round(p1["price"],6),"p2":round(p2["price"],6),
                     "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
-                    "current":round(current_close,6),"rr":rr,"zone_pct":round(zone_pct,3)
+                    "p1":round(p1_price,6),"p2":round(p2,6),
+                    "current":round(c_close,6),"rr":rr
                 }
-            break
-        if short_signal: break
 
-    # Return whichever signal fired (prefer the one with better zone proximity)
-    if long_signal and short_signal:
-        return long_signal if long_signal["zone_pct"] < short_signal["zone_pct"] else short_signal
-    return long_signal or short_signal
+    return None
+    p1,p2,p3=pivots[-3],pivots[-2],pivots[-1]
+    current=candles[-1][4]
+    n=len(candles)
+
+    structure=None
+    if p1["type"]=="H" and p2["type"]=="L" and p3["type"]=="H" and p3["price"]<p1["price"]: structure="bear"
+    elif p1["type"]=="L" and p2["type"]=="H" and p3["type"]=="L" and p3["price"]>p1["price"]: structure="bull"
+    if not structure: return None
+
+    # Recency check — p3 must be within last 50 candles
+    if n-p3["idx"]>50: return None
+
+    fh=p1["price"] if structure=="bear" else p2["price"]
+    fl=p2["price"] if structure=="bear" else p1["price"]
+    rng=fh-fl
+    if rng<=0: return None
+
+    fib618=fl+rng*FIB_LEVEL if structure=="bear" else fh-rng*FIB_LEVEL
+    sl=fh+rng*0.02 if structure=="bear" else fl-rng*0.02
+    rpp=abs(fib618-sl)
+    if rpp<=0: return None
+    tp=fib618-rpp*rr if structure=="bear" else fib618+rpp*rr
+
+    # Structure invalidation check
+    if structure=="bear" and current>fh: return None
+    if structure=="bull" and current<fl: return None
+
+    zone_pct=abs(current-fib618)/fib618*100
+    if zone_pct<=0.5:
+        return {
+            "structure":structure,"direction":"SHORT" if structure=="bear" else "LONG",
+            "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
+            "current":round(current,6),"rr":rr,"zone_pct":round(zone_pct,3)
+        }
+    return None
 
 # ── MAIN LOOP ─────────────────────────────────────────────
 open_signals = {}  # key: symbol_timeframe (one per pair+tf combo)
-pair_bias    = {}  # key: symbol_timeframe → "bull" | "bear" | None
 
 def run():
     global open_signals
@@ -397,20 +416,12 @@ def run():
                     pivots = find_pivots(candles, pivot_n)
                     signal = detect_signal(candles, pivots, rr)
 
-                    # Bias filter — skip if signal direction conflicts with current bias
-                    current_bias = pair_bias.get(key)
-                    signal_dir   = signal["structure"] if signal else None
-                    if signal and current_bias and current_bias != signal_dir:
-                        print(f"[{now_str}] Bias skip: {symbol} {timeframe} signal={signal_dir} bias={current_bias}")
-                        signal = None
-
                     if signal and key not in open_signals:
                         if now-last_signal.get(key,0)>interval:
                             acc = init_account()
                             send_entry(symbol, timeframe, signal, label, acc)
                             last_signal[key]=now
-                            # Lock entry_balance at open — never recalculate at exit
-                            open_signals[key]={**signal,"symbol":symbol,"timeframe":timeframe,"label":label,"entry_time":now,"entry_balance":acc["balance"]}
+                            open_signals[key]={**signal,"symbol":symbol,"timeframe":timeframe,"label":label,"entry_time":now}
                             print(f"[{now_str}] ✅ ENTRY: {symbol} {timeframe} {signal['direction']} {label}")
                     else:
                         print(f"[{now_str}] No signal: {symbol} {timeframe} N={pivot_n} {rr}R")
@@ -421,31 +432,25 @@ def run():
                     print(f"[{now_str}] Error {symbol} {timeframe}: {e}")
                     time.sleep(2)
 
-            # Check SL/TP on open signals — using candle high/low, not ticker
+            # Check SL/TP on open signals
             closed=[]
             for key,sig in open_signals.items():
                 try:
-                    # Fetch latest candle to check high/low (catches intra-candle wicks)
-                    latest = fetch_candles(exchange, sig["symbol"], sig["timeframe"], limit=2)
-                    if not latest: continue
-                    candle    = latest[-1]
-                    c_high    = candle[2]
-                    c_low     = candle[3]
+                    ticker    = exchange.fetch_ticker(sig["symbol"])
+                    price     = ticker["last"]
                     direction = sig["direction"]
-                    won=False; hit=False; exit_price=None
+                    won=False; hit=False; exit_price=price
 
                     if direction=="LONG":
-                        if c_low<=sig["sl"]:  won=False; hit=True; exit_price=sig["sl"]
-                        elif c_high>=sig["tp"]: won=True;  hit=True; exit_price=sig["tp"]
+                        if price<=sig["sl"]: won=False;hit=True;exit_price=sig["sl"]
+                        elif price>=sig["tp"]: won=True;hit=True;exit_price=sig["tp"]
                     else:
-                        if c_high>=sig["sl"]: won=False; hit=True; exit_price=sig["sl"]
-                        elif c_low<=sig["tp"]:  won=True;  hit=True; exit_price=sig["tp"]
+                        if price>=sig["sl"]: won=False;hit=True;exit_price=sig["sl"]
+                        elif price<=sig["tp"]: won=True;hit=True;exit_price=sig["tp"]
 
                     if hit:
                         acc     = init_account()
-                        # Use entry_balance locked at open — not current balance
-                        entry_bal = sig.get("entry_balance", acc["balance"])
-                        risk_amt= entry_bal*RISK_PCT
+                        risk_amt= acc["balance"]*RISK_PCT
                         risk_pp = abs(sig["entry"]-sig["sl"])
                         pos_size= risk_amt/risk_pp if risk_pp>0 else 0
                         pnl     = round((sig["entry"]-exit_price)*pos_size if direction=="SHORT" else (exit_price-sig["entry"])*pos_size, 4)
@@ -463,13 +468,6 @@ def run():
 
                         send_exit(sig["symbol"],sig["timeframe"],sig,exit_price,won,pnl,acc)
                         closed.append(key)
-                        # Bias flip on SL — match backtest behaviour
-                        if not won:
-                            flipped = "bull" if sig["structure"]=="bear" else "bear"
-                            pair_bias[key] = flipped
-                            print(f"[{now_str}] Bias flipped to {flipped}: {sig['symbol']} {sig['timeframe']}")
-                        else:
-                            pair_bias[key] = None  # TP hit — reset bias
                         print(f"[{now_str}] {'✅TP' if won else '❌SL'}: {sig['symbol']} {sig['timeframe']} PnL=${pnl}")
 
                 except Exception as e:
