@@ -266,6 +266,7 @@ def detect_signal(candles, pivots, rr):
 
 # ── MAIN LOOP ─────────────────────────────────────────────
 open_signals = {}  # key: symbol_timeframe (one per pair+tf combo)
+pair_bias    = {}  # key: symbol_timeframe → "bull" | "bear" | None
 
 def run():
     global open_signals
@@ -327,12 +328,20 @@ def run():
                     pivots = find_pivots(candles, pivot_n)
                     signal = detect_signal(candles, pivots, rr)
 
+                    # Bias filter — skip if signal direction conflicts with current bias
+                    current_bias = pair_bias.get(key)
+                    signal_dir   = signal["structure"] if signal else None
+                    if signal and current_bias and current_bias != signal_dir:
+                        print(f"[{now_str}] Bias skip: {symbol} {timeframe} signal={signal_dir} bias={current_bias}")
+                        signal = None
+
                     if signal and key not in open_signals:
                         if now-last_signal.get(key,0)>interval:
                             acc = init_account()
                             send_entry(symbol, timeframe, signal, label, acc)
                             last_signal[key]=now
-                            open_signals[key]={**signal,"symbol":symbol,"timeframe":timeframe,"label":label,"entry_time":now}
+                            # Lock entry_balance at open — never recalculate at exit
+                            open_signals[key]={**signal,"symbol":symbol,"timeframe":timeframe,"label":label,"entry_time":now,"entry_balance":acc["balance"]}
                             print(f"[{now_str}] ✅ ENTRY: {symbol} {timeframe} {signal['direction']} {label}")
                     else:
                         print(f"[{now_str}] No signal: {symbol} {timeframe} N={pivot_n} {rr}R")
@@ -343,25 +352,31 @@ def run():
                     print(f"[{now_str}] Error {symbol} {timeframe}: {e}")
                     time.sleep(2)
 
-            # Check SL/TP on open signals
+            # Check SL/TP on open signals — using candle high/low, not ticker
             closed=[]
             for key,sig in open_signals.items():
                 try:
-                    ticker    = exchange.fetch_ticker(sig["symbol"])
-                    price     = ticker["last"]
+                    # Fetch latest candle to check high/low (catches intra-candle wicks)
+                    latest = fetch_candles(exchange, sig["symbol"], sig["timeframe"], limit=2)
+                    if not latest: continue
+                    candle    = latest[-1]
+                    c_high    = candle[2]
+                    c_low     = candle[3]
                     direction = sig["direction"]
-                    won=False; hit=False; exit_price=price
+                    won=False; hit=False; exit_price=None
 
                     if direction=="LONG":
-                        if price<=sig["sl"]: won=False;hit=True;exit_price=sig["sl"]
-                        elif price>=sig["tp"]: won=True;hit=True;exit_price=sig["tp"]
+                        if c_low<=sig["sl"]:  won=False; hit=True; exit_price=sig["sl"]
+                        elif c_high>=sig["tp"]: won=True;  hit=True; exit_price=sig["tp"]
                     else:
-                        if price>=sig["sl"]: won=False;hit=True;exit_price=sig["sl"]
-                        elif price<=sig["tp"]: won=True;hit=True;exit_price=sig["tp"]
+                        if c_high>=sig["sl"]: won=False; hit=True; exit_price=sig["sl"]
+                        elif c_low<=sig["tp"]:  won=True;  hit=True; exit_price=sig["tp"]
 
                     if hit:
                         acc     = init_account()
-                        risk_amt= acc["balance"]*RISK_PCT
+                        # Use entry_balance locked at open — not current balance
+                        entry_bal = sig.get("entry_balance", acc["balance"])
+                        risk_amt= entry_bal*RISK_PCT
                         risk_pp = abs(sig["entry"]-sig["sl"])
                         pos_size= risk_amt/risk_pp if risk_pp>0 else 0
                         pnl     = round((sig["entry"]-exit_price)*pos_size if direction=="SHORT" else (exit_price-sig["entry"])*pos_size, 4)
@@ -379,6 +394,13 @@ def run():
 
                         send_exit(sig["symbol"],sig["timeframe"],sig,exit_price,won,pnl,acc)
                         closed.append(key)
+                        # Bias flip on SL — match backtest behaviour
+                        if not won:
+                            flipped = "bull" if sig["structure"]=="bear" else "bear"
+                            pair_bias[key] = flipped
+                            print(f"[{now_str}] Bias flipped to {flipped}: {sig['symbol']} {sig['timeframe']}")
+                        else:
+                            pair_bias[key] = None  # TP hit — reset bias
                         print(f"[{now_str}] {'✅TP' if won else '❌SL'}: {sig['symbol']} {sig['timeframe']} PnL=${pnl}")
 
                 except Exception as e:
