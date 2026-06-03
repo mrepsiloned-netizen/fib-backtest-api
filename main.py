@@ -168,21 +168,33 @@ def fetch_candles(symbol, timeframe, start_date, end_date):
             time.sleep(1.0)  # rate limit buffer between exchange attempts
             all_candles, since = [], start_ms
             empty_count = 0
+            retry_count = 0
             while since < end_ms:
-                batch = ex.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+                try:
+                    batch = ex.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+                except Exception as re:
+                    if "429" in str(re) or "rate" in str(re).lower() or "too many" in str(re).lower():
+                        retry_count += 1
+                        if retry_count > 5: break
+                        wait = retry_count * 3
+                        print(f"Rate limited on {name}, waiting {wait}s...")
+                        time.sleep(wait)
+                        continue
+                    raise
                 if not batch:
                     empty_count += 1
                     if empty_count >= 3: break
                     time.sleep(1)
                     continue
                 empty_count = 0
+                retry_count = 0
                 filtered = [c for c in batch if c[0] < end_ms]
                 all_candles += filtered
                 last_ts = batch[-1][0]
-                if last_ts >= end_ms: break       # reached end of requested range
-                if last_ts <= since: break        # no progress — exchange returned same candles
+                if last_ts >= end_ms: break
+                if last_ts <= since: break
                 since = last_ts + 1
-                time.sleep(0.2)                   # rate limit protection between batches
+                time.sleep(0.5)  # rate limit protection between batches
             if len(all_candles) > 50:
                 _mem_cache[cache_key] = all_candles
                 if SUPABASE_URL: save_candles(symbol, timeframe, all_candles)
@@ -682,20 +694,25 @@ def prefetch_status_check(symbol: str, timeframe: str, start_date: str, end_date
         expected = (end_ms - start_ms) / tf_ms.get(timeframe, 900000)
         print(f"Prefetch status: {symbol} {timeframe} {start_date}→{end_date} expected={int(expected)}")
 
-        # Paginated count — handles large candle sets (e.g. 525k for 1m)
-        q_base = f"symbol=eq.{symbol}&timeframe=eq.{timeframe}&ts=gte.{start_ms}&ts=lte.{end_ms}&select=ts"
-        offset = 0
-        page_size = 10000
-        while True:
-            res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q_base}&limit={page_size}&offset={offset}",
-                           headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=30)
-            if res.status_code == 200:
-                rows = res.json()
-                db_count += len(rows)
-                if len(rows) < page_size: break
-                offset += page_size
-            else:
-                break
+        # Use Supabase HEAD request with count=exact for fast accurate count
+        q_base = f"symbol=eq.{symbol}&timeframe=eq.{timeframe}&ts=gte.{start_ms}&ts=lte.{end_ms}"
+        res = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/candles?{q_base}&select=ts",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Prefer": "count=exact",
+                "Range-Unit": "items",
+                "Range": "0-0"
+            }, timeout=15
+        )
+        if res.status_code in [200, 206]:
+            cr = res.headers.get("content-range", "0/0")
+            # content-range format: "0-0/TOTAL"
+            if "/" in cr:
+                total_part = cr.split("/")[-1]
+                if total_part.isdigit():
+                    db_count = int(total_part)
         print(f"Supabase count: {db_count} candles for {symbol} {timeframe}")
         pct = round(db_count / expected * 100, 1) if expected > 0 else 0
     except Exception as e:
