@@ -25,6 +25,10 @@ SUPABASE_HEADERS = {
 }
 
 SCAN_INTERVALS = {
+    "1m":15,"5m":300,"15m":900,
+    "1h":3600,"4h":14400,"1d":86400,
+}
+SIGNAL_COOLDOWNS = {
     "1m":60,"5m":300,"15m":900,
     "1h":3600,"4h":14400,"1d":86400,
 }
@@ -245,6 +249,9 @@ def detect_signal(candles, pivots, rr):
     closes = np.array([c[4] for c in candles])
     n      = len(candles)
 
+    # BOS confirmation: candles[-2] (prev closed candle)
+    bos_close = closes[-2]
+    # Entry trigger: candles[-1] (current candle)
     c_high  = highs[-1]
     c_low   = lows[-1]
     c_close = closes[-1]
@@ -262,21 +269,21 @@ def detect_signal(candles, pivots, rr):
 
         if direction == "bull":
             p1_price = p1["price"]
-            # BOS: current close > P1 high
-            if c_close <= p1_price: continue
-            # Duration filter
-            bos_idx = n - 1
+            # BOS: previous candle already closed above P1
+            if bos_close <= p1_price: continue
+            # Duration filter — BOS candle is n-2
+            bos_idx = n - 2
             if bos_idx - p1_idx < N_MIN: continue
             # P2 = min close between P1 and BOS
             p2 = float(min(closes[p1_idx:bos_idx+1]))
-            rng = c_close - p2
+            rng = bos_close - p2
             if rng <= 0 or rng/p2 < MIN_RANGE: continue
             fib618 = p2 + rng * FIB_LEVEL
             sl     = p2
             rpp    = abs(fib618 - sl)
             if rpp <= 0: continue
             tp     = fib618 + rpp * rr
-            # Entry trigger: wick touches fib618, closes above
+            # Entry trigger: current candle wicks to fib618 and closes above
             if c_low <= fib618 and c_close > fib618:
                 return {
                     "structure":"bull","direction":"LONG",
@@ -287,20 +294,20 @@ def detect_signal(candles, pivots, rr):
 
         else:  # bear
             p1_price = p1["price"]
-            # BOS: current close < P1 low
-            if c_close >= p1_price: continue
-            bos_idx = n - 1
+            # BOS: previous candle already closed below P1
+            if bos_close >= p1_price: continue
+            bos_idx = n - 2
             if bos_idx - p1_idx < N_MIN: continue
             # P2 = max close between P1 and BOS
             p2 = float(max(closes[p1_idx:bos_idx+1]))
-            rng = p2 - c_close
+            rng = p2 - bos_close
             if rng <= 0 or rng/p2 < MIN_RANGE: continue
             fib618 = p2 - rng * FIB_LEVEL
             sl     = p2
             rpp    = abs(fib618 - sl)
             if rpp <= 0: continue
             tp     = fib618 - rpp * rr
-            # Entry trigger: wick touches fib618, closes below
+            # Entry trigger: current candle wicks to fib618 and closes below
             if c_high >= fib618 and c_close < fib618:
                 return {
                     "structure":"bear","direction":"SHORT",
@@ -309,41 +316,6 @@ def detect_signal(candles, pivots, rr):
                     "current":round(c_close,6),"rr":rr
                 }
 
-    return None
-    p1,p2,p3=pivots[-3],pivots[-2],pivots[-1]
-    current=candles[-1][4]
-    n=len(candles)
-
-    structure=None
-    if p1["type"]=="H" and p2["type"]=="L" and p3["type"]=="H" and p3["price"]<p1["price"]: structure="bear"
-    elif p1["type"]=="L" and p2["type"]=="H" and p3["type"]=="L" and p3["price"]>p1["price"]: structure="bull"
-    if not structure: return None
-
-    # Recency check — p3 must be within last 50 candles
-    if n-p3["idx"]>50: return None
-
-    fh=p1["price"] if structure=="bear" else p2["price"]
-    fl=p2["price"] if structure=="bear" else p1["price"]
-    rng=fh-fl
-    if rng<=0: return None
-
-    fib618=fl+rng*FIB_LEVEL if structure=="bear" else fh-rng*FIB_LEVEL
-    sl=fh+rng*0.02 if structure=="bear" else fl-rng*0.02
-    rpp=abs(fib618-sl)
-    if rpp<=0: return None
-    tp=fib618-rpp*rr if structure=="bear" else fib618+rpp*rr
-
-    # Structure invalidation check
-    if structure=="bear" and current>fh: return None
-    if structure=="bull" and current<fl: return None
-
-    zone_pct=abs(current-fib618)/fib618*100
-    if zone_pct<=0.5:
-        return {
-            "structure":structure,"direction":"SHORT" if structure=="bear" else "LONG",
-            "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
-            "current":round(current,6),"rr":rr,"zone_pct":round(zone_pct,3)
-        }
     return None
 
 # ── MAIN LOOP ─────────────────────────────────────────────
@@ -398,10 +370,11 @@ def run():
                 pivot_n   = watch["pivot_n"]
                 rr        = watch["rr"]
                 label     = watch["label"]
-                key       = f"{symbol}_{timeframe}"  # one per pair+timeframe
-                interval  = SCAN_INTERVALS.get(timeframe, 1800)
+                key            = f"{symbol}_{timeframe}"  # one per pair+timeframe
+                scan_interval  = SCAN_INTERVALS.get(timeframe, 60)
+                sig_cooldown   = SIGNAL_COOLDOWNS.get(timeframe, 1800)
 
-                if now-last_scan.get(key,0)<interval: continue
+                if now-last_scan.get(key,0)<scan_interval: continue
                 last_scan[key]=now
 
                 try:
@@ -466,11 +439,11 @@ def run():
                         signal = None
 
                     if signal and key not in open_signals:
-                        if now-last_signal.get(key,0)>interval:
+                        if now-last_signal.get(key,0)>sig_cooldown:
                             acc = init_account()
                             send_entry(symbol, timeframe, signal, label, acc)
                             last_signal[key]=now
-                            open_signals[key]={**signal,"symbol":symbol,"timeframe":timeframe,"label":label,"entry_time":now}
+                            open_signals[key]={**signal,"symbol":symbol,"timeframe":timeframe,"label":label,"entry_time":now,"entry_balance":acc["balance"]}
                             print(f"[{now_str}] ✅ ENTRY: {symbol} {timeframe} {signal['direction']} {label}")
                     else:
                         print(f"[{now_str}] No signal: {symbol} {timeframe} N={pivot_n} {rr}R")
