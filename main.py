@@ -196,45 +196,54 @@ def fetch_candles(symbol, timeframe, start_date, end_date):
     raise Exception(f"All exchanges failed for {symbol} {timeframe}")
 
 # ── PIVOTS ────────────────────────────────────────────────
+
+# ── PIVOT DETECTION ───────────────────────────────────────
 def find_pivots(highs, lows, N):
     """
-    Pivot detection — N candles left and right.
-    Uses HIGH for pivot highs, LOW for pivot lows.
+    Find pivot highs and lows using N candles left and right.
+    A pivot high: highest among 2N+1 candles centered on i.
+    A pivot low:  lowest among 2N+1 candles centered on i.
     Deduplicates consecutive same-type pivots.
     """
     pivots = []
-    for i in range(N, len(highs)-N):
+    for i in range(N, len(highs) - N):
         if highs[i] == max(highs[i-N:i+N+1]):
-            pivots.append({"idx":i,"type":"H","price":float(highs[i]),"close":float(lows[i])})
+            pivots.append({"idx": i, "type": "H", "price": float(highs[i])})
         elif lows[i] == min(lows[i-N:i+N+1]):
-            pivots.append({"idx":i,"type":"L","price":float(lows[i]),"close":float(highs[i])})
+            pivots.append({"idx": i, "type": "L", "price": float(lows[i])})
+    # Deduplicate consecutive same-type pivots — keep most extreme
     deduped = []
     for p in pivots:
-        if not deduped: deduped.append(p); continue
+        if not deduped:
+            deduped.append(p)
+            continue
         last = deduped[-1]
-        if last["type"]==p["type"]:
-            if p["type"]=="H" and p["price"]>last["price"]: deduped[-1]=p
-            elif p["type"]=="L" and p["price"]<last["price"]: deduped[-1]=p
-        else: deduped.append(p)
+        if last["type"] == p["type"]:
+            if p["type"] == "H" and p["price"] > last["price"]: deduped[-1] = p
+            elif p["type"] == "L" and p["price"] < last["price"]: deduped[-1] = p
+        else:
+            deduped.append(p)
     return deduped
+
 
 # ── BACKTEST CORE ─────────────────────────────────────────
 def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair):
     """
     BOS-based Fibonacci pullback backtest.
 
-    LONG:
-      P1 = confirmed pivot HIGH (LH)
-      BOS = first candle close > P1 high (= P3)
-      P3 - P1 >= N candles (duration filter)
-      P2 = min(close[P1:P3]) — lowest close between P1 and P3
-      Range filter: (P3_close - P2) / P2 > 0.003
-      Fib drawn P2 → P3_close
-      Entry: candle LOW <= fib618 AND close > fib618
-      Enter next candle open
-      SL = P2, TP = entry + (entry - SL) * RR
-      TP hit → N=1 HH detection for next trade
-      SL hit → flip bias to SHORT
+    LONG SETUP:
+      1. P1 = confirmed pivot HIGH
+      2. P3 = first candle that CLOSES above P1 (Break of Structure)
+         - Must be at least N_MIN candles after P1
+         - If rejected P3 - P1 < N_MIN, P3 becomes new P1
+      3. P2 = min(close) between P1 and P3
+      4. Range filter: (P3 - P2) / P2 > 0.3%
+      5. Draw fib P2 → P3
+      6. Entry: candle LOW <= fib618 AND close > fib618 (wick touch + rejection)
+      7. Enter at NEXT candle open
+      8. SL = P2, TP = entry + (entry - SL) * RR
+      9. TP hit → N=1 HH detection for next setup
+         SL hit → flip bias to SHORT
 
     SHORT: mirror logic
     """
@@ -246,158 +255,163 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
     timestamps = [c[0] for c in candles]
     trades     = []
     equity     = 100.0
-    bias       = None   # None, "bull", "bear"
+    bias       = None      # None, "bull", "bear"
     in_trade   = False
-    MIN_RANGE  = 0.003  # 0.3% minimum fib range
+    MIN_RANGE  = 0.003     # 0.3% minimum fib range
 
-    # ── Helper: find BOS setup from pivot list ─────────────
-    def find_bos_setup(pivots, candles, bias, last_used_idx, N_min):
-        highs  = np.array([c[2] for c in candles])
-        lows   = np.array([c[3] for c in candles])
-        closes = np.array([c[4] for c in candles])
-        n      = len(candles)
+    if n < 50 or len(pivots) < 2:
+        return trades
 
-        # Scan pivots FORWARD (chronological) to find first valid BOS
-        # after last_used_idx — ensures we find setups as they occur in time
-        for pi in range(len(pivots)):
-            p1 = pivots[pi]
-            if p1["idx"] <= last_used_idx: continue
+    # ── Step 1: Precompute all BOS setups in chronological order ──
+    # This avoids repeated scanning — one pass to find all valid setups
+    def get_all_setups(pivots, bias_filter=None):
+        """Find all valid BOS setups in chronological order."""
+        setups = []
+        ph = [p for p in pivots if p["type"] == "H"]
+        pl = [p for p in pivots if p["type"] == "L"]
+        N_min = 3
 
-            # LONG: P1 must be a pivot HIGH
-            if bias != "bear" and p1["type"] == "H":
-                p1_high = p1["price"]
-                p1_idx  = p1["idx"]
-
-                # Scan forward for BOS: first close > P1 high
-                for ci in range(p1_idx + N_min, n - 2):  # n-2 ensures candles after P3
-                    if closes[ci] > p1_high:
-                        if ci - p1_idx < N_min: break
-                        p3_close = closes[ci]
+        # LONG setups: pivot HIGH → BOS up
+        if bias_filter != "bear":
+            for p1 in ph:
+                p1_idx   = p1["idx"]
+                p1_price = p1["price"]
+                # Scan forward for BOS candle
+                for ci in range(p1_idx + 1, n - 1):
+                    if closes[ci] > p1_price:
+                        # Check duration
+                        if ci - p1_idx < N_min:
+                            # Too close — this P3 becomes new P1, skip
+                            break
                         p3_idx   = ci
-                        p2_close = float(min(closes[p1_idx:p3_idx+1]))
-                        rng = p3_close - p2_close
-                        if rng <= 0: break
-                        if rng / p2_close < MIN_RANGE: break
-                        return {
+                        p3_close = closes[ci]
+                        # P2 = min close between P1 and P3
+                        p2 = float(min(closes[p1_idx:p3_idx + 1]))
+                        rng = p3_close - p2
+                        if rng <= 0 or rng / max(p2, 1) < MIN_RANGE:
+                            break
+                        setups.append({
                             "st": "bull",
-                            "p1_idx": p1_idx, "p1_price": p1_high,
-                            "p2": p2_close,
-                            "p3_idx": p3_idx, "p3_close": p3_close,
-                            "rng": rng
-                        }
-                    # No pre-BOS invalidation — let BOS check handle it
+                            "p1_idx": p1_idx, "p1_price": p1_price,
+                            "p2": p2, "p3_idx": p3_idx, "p3_close": p3_close,
+                            "rng": rng, "fib618": p2 + rng * fib_level,
+                            "sl": p2
+                        })
+                        break
+                    # If price clearly breaks below P1 level by more than range,
+                    # P1 is no longer relevant
+                    if lows[ci] < p1_price * 0.90:
+                        break
 
-            # SHORT: P1 must be a pivot LOW
-            elif bias != "bull" and p1["type"] == "L":
-                p1_low  = p1["price"]
-                p1_idx  = p1["idx"]
-
-                for ci in range(p1_idx + N_min, n - 2):
-                    if closes[ci] < p1_low:
-                        if ci - p1_idx < N_min: break
-                        p3_close = closes[ci]
+        # SHORT setups: pivot LOW → BOS down
+        if bias_filter != "bull":
+            for p1 in pl:
+                p1_idx   = p1["idx"]
+                p1_price = p1["price"]
+                for ci in range(p1_idx + 1, n - 1):
+                    if closes[ci] < p1_price:
+                        if ci - p1_idx < N_min:
+                            break
                         p3_idx   = ci
-                        p2_close = float(max(closes[p1_idx:p3_idx+1]))
-                        rng = p2_close - p3_close
-                        if rng <= 0: break
-                        if rng / p2_close < MIN_RANGE: break
-                        return {
+                        p3_close = closes[ci]
+                        p2 = float(max(closes[p1_idx:p3_idx + 1]))
+                        rng = p2 - p3_close
+                        if rng <= 0 or rng / max(p2, 1) < MIN_RANGE:
+                            break
+                        setups.append({
                             "st": "bear",
-                            "p1_idx": p1_idx, "p1_price": p1_low,
-                            "p2": p2_close,
-                            "p3_idx": p3_idx, "p3_close": p3_close,
-                            "rng": rng
-                        }
-                    # No pre-BOS invalidation — let BOS check handle it
-        return None
+                            "p1_idx": p1_idx, "p1_price": p1_price,
+                            "p2": p2, "p3_idx": p3_idx, "p3_close": p3_close,
+                            "rng": rng, "fib618": p2 - rng * fib_level,
+                            "sl": p2
+                        })
+                        break
+                    if highs[ci] > p1_price * 1.10:
+                        break
 
-    # ── Helper: N=1 HH/LL detection after TP ──────────────
-    def find_next_anchor(candles, from_idx, direction, max_candles=50):
-        highs  = np.array([c[2] for c in candles])
-        lows   = np.array([c[3] for c in candles])
-        closes = np.array([c[4] for c in candles])
-        n      = len(candles)
+        # Sort by P3 index (chronological order)
+        setups.sort(key=lambda x: x["p3_idx"])
+        return setups
 
+    # ── Step 2: N=1 HH/LL detection after TP ──────────────
+    def find_next_anchor(from_idx, direction):
+        candidate_idx = from_idx
+        max_candles   = 50
         if direction == "bull":
-            candidate     = highs[from_idx]
-            candidate_idx = from_idx
-            for ci in range(from_idx+1, min(from_idx+max_candles, n)):
-                if highs[ci] > candidate:
-                    candidate     = highs[ci]
-                    candidate_idx = ci
+            candidate = highs[from_idx]
+            for xi in range(from_idx + 1, min(from_idx + max_candles, n)):
+                if highs[xi] > candidate:
+                    candidate     = highs[xi]
+                    candidate_idx = xi
                 else:
                     # Confirmed — new HH
-                    new_p3_close = closes[candidate_idx]
-                    new_p2       = float(min(closes[from_idx:candidate_idx+1]))
-                    rng          = new_p3_close - new_p2
-                    if rng > 0 and rng/new_p2 >= MIN_RANGE:
-                        return {"p2": new_p2, "p3_close": new_p3_close,
-                                "p3_idx": candidate_idx, "rng": rng}
+                    p3_close = closes[candidate_idx]
+                    p2       = float(min(closes[from_idx:candidate_idx + 1]))
+                    rng      = p3_close - p2
+                    if rng > 0 and rng / max(p2, 1) >= MIN_RANGE:
+                        return {"p2": p2, "p3_close": p3_close,
+                                "p3_idx": candidate_idx, "rng": rng,
+                                "fib618": p2 + rng * fib_level, "sl": p2}
                     return None
-            # Guard: force lock after max_candles
-            new_p3_close = closes[candidate_idx]
-            new_p2       = float(min(closes[from_idx:candidate_idx+1]))
-            rng          = new_p3_close - new_p2
-            if rng > 0 and rng/new_p2 >= MIN_RANGE:
-                return {"p2": new_p2, "p3_close": new_p3_close,
-                        "p3_idx": candidate_idx, "rng": rng}
-            return None
-
+            # Guard: use candidate after max_candles
+            p3_close = closes[candidate_idx]
+            p2       = float(min(closes[from_idx:candidate_idx + 1]))
+            rng      = p3_close - p2
+            if rng > 0 and rng / max(p2, 1) >= MIN_RANGE:
+                return {"p2": p2, "p3_close": p3_close,
+                        "p3_idx": candidate_idx, "rng": rng,
+                        "fib618": p2 + rng * fib_level, "sl": p2}
         else:  # bear
-            candidate     = lows[from_idx]
-            candidate_idx = from_idx
-            for ci in range(from_idx+1, min(from_idx+max_candles, n)):
-                if lows[ci] < candidate:
-                    candidate     = lows[ci]
-                    candidate_idx = ci
+            candidate = lows[from_idx]
+            for xi in range(from_idx + 1, min(from_idx + max_candles, n)):
+                if lows[xi] < candidate:
+                    candidate     = lows[xi]
+                    candidate_idx = xi
                 else:
-                    new_p3_close = closes[candidate_idx]
-                    new_p2       = float(max(closes[from_idx:candidate_idx+1]))
-                    rng          = new_p2 - new_p3_close
-                    if rng > 0 and rng/new_p2 >= MIN_RANGE:
-                        return {"p2": new_p2, "p3_close": new_p3_close,
-                                "p3_idx": candidate_idx, "rng": rng}
+                    p3_close = closes[candidate_idx]
+                    p2       = float(max(closes[from_idx:candidate_idx + 1]))
+                    rng      = p2 - p3_close
+                    if rng > 0 and rng / max(p2, 1) >= MIN_RANGE:
+                        return {"p2": p2, "p3_close": p3_close,
+                                "p3_idx": candidate_idx, "rng": rng,
+                                "fib618": p2 - rng * fib_level, "sl": p2}
                     return None
-            new_p3_close = closes[candidate_idx]
-            new_p2       = float(max(closes[from_idx:candidate_idx+1]))
-            rng          = new_p2 - new_p3_close
-            if rng > 0 and rng/new_p2 >= MIN_RANGE:
-                return {"p2": new_p2, "p3_close": new_p3_close,
-                        "p3_idx": candidate_idx, "rng": rng}
-            return None
+            p3_close = closes[candidate_idx]
+            p2       = float(max(closes[from_idx:candidate_idx + 1]))
+            rng      = p2 - p3_close
+            if rng > 0 and rng / max(p2, 1) >= MIN_RANGE:
+                return {"p2": p2, "p3_close": p3_close,
+                        "p3_idx": candidate_idx, "rng": rng,
+                        "fib618": p2 - rng * fib_level, "sl": p2}
+        return None
 
-    # ── Determine N_min from pivot spacing ─────────────────
-    N_min = 3  # minimum candles between P1 and P3
+    # ── Step 3: Main trade simulation ─────────────────────
+    # Get all setups upfront in chronological order
+    all_setups = get_all_setups(pivots)
+    setup_idx  = 0   # pointer into all_setups
+    active_setup = None
+    last_p3_idx  = -1
 
-    # ── Main scan ──────────────────────────────────────────
-    last_used_idx = -1
-    active_setup  = None  # current fib setup waiting for entry
-    setup_search_from = 0  # candle index to start searching from
+    ci = 1
+    while ci < n - 1:
+        if in_trade:
+            ci += 1
+            continue
 
-    for ci in range(1, n-1):
-        if in_trade: continue
-
-        # Find new setup if none active — only look at data up to current candle
+        # Get next active setup if none
         if active_setup is None:
-            if ci < setup_search_from: continue
-            # Only use candles up to ci so we dont see the future
-            setup = find_bos_setup(pivots, candles, bias, last_used_idx, N_min)
-            if setup is None:
-                setup_search_from = ci + 10
-                continue
-            st       = setup["st"]
-            p2       = setup["p2"]
-            p3_close = setup["p3_close"]
-            p3_idx   = setup["p3_idx"]
-            rng      = setup["rng"]
-            fib618   = (p2 + rng * fib_level) if st == "bull" else (p2 - rng * fib_level)
-            sl       = p2
-            active_setup = {
-                "st": st, "p2": p2, "p3_close": p3_close,
-                "p3_idx": p3_idx, "rng": rng, "fib618": fib618, "sl": sl
-            }
-            last_used_idx = p3_idx
-            if ci <= p3_idx: continue
+            # Find next setup after last_p3_idx that matches bias
+            while setup_idx < len(all_setups):
+                s = all_setups[setup_idx]
+                setup_idx += 1
+                if s["p3_idx"] <= last_p3_idx: continue
+                if bias == "bear" and s["st"] == "bull": continue
+                if bias == "bull" and s["st"] == "bear": continue
+                active_setup = s
+                ci = s["p3_idx"] + 1  # start scanning from candle after P3
+                break
+            if active_setup is None:
+                break  # no more setups
 
         st     = active_setup["st"]
         fib618 = active_setup["fib618"]
@@ -405,103 +419,101 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
         p2     = active_setup["p2"]
         p3_idx = active_setup["p3_idx"]
 
+        if ci >= n - 1:
+            break
+
         c_low   = lows[ci]
         c_high  = highs[ci]
         c_close = closes[ci]
 
-        # Invalidation before entry
+        # Invalidation: price broke through P2 (structure invalid)
         if st == "bull" and c_low < p2:
-            active_setup = None; continue
+            active_setup = None
+            ci += 1
+            continue
         if st == "bear" and c_high > p2:
-            active_setup = None; continue
-
-        # Trend extending — update P3 using N=1
-        if st == "bull" and c_high > active_setup["p3_close"]:
-            anchor = find_next_anchor(candles, p3_idx, "bull")
-            if anchor:
-                rng    = anchor["rng"]
-                fib618 = anchor["p2"] + rng * fib_level
-                active_setup.update({"p2": anchor["p2"], "p3_close": anchor["p3_close"],
-                    "p3_idx": anchor["p3_idx"], "rng": rng,
-                    "fib618": fib618, "sl": anchor["p2"]})
-                sl_lvl = anchor["p2"]
+            active_setup = None
+            ci += 1
             continue
 
-        if st == "bear" and c_low < active_setup["p3_close"]:
-            anchor = find_next_anchor(candles, p3_idx, "bear")
-            if anchor:
-                rng    = anchor["rng"]
-                fib618 = anchor["p2"] - rng * fib_level
-                active_setup.update({"p2": anchor["p2"], "p3_close": anchor["p3_close"],
-                    "p3_idx": anchor["p3_idx"], "rng": rng,
-                    "fib618": fib618, "sl": anchor["p2"]})
-                sl_lvl = anchor["p2"]
-            continue
-
-        # Entry trigger
+        # Entry trigger: wick touches fib618, close confirms
         triggered = False
         if st == "bull" and c_low <= fib618 and c_close > fib618:
             triggered = True
         elif st == "bear" and c_high >= fib618 and c_close < fib618:
             triggered = True
 
-        if not triggered: continue
+        if not triggered:
+            ci += 1
+            continue
 
         # Enter at next candle open
-        entry  = float(opens[ci+1])
-        rpp    = abs(entry - sl_lvl)
-        if rpp <= 0: active_setup = None; continue
-        tp     = entry + rpp * rr if st == "bull" else entry - rpp * rr
-        pos    = (equity * risk_pct) / rpp
+        if ci + 1 >= n:
+            break
+        entry = float(opens[ci + 1])
+        rpp   = abs(entry - sl_lvl)
+        if rpp <= 0:
+            active_setup = None
+            ci += 1
+            continue
+        tp  = entry + rpp * rr if st == "bull" else entry - rpp * rr
+        pos = (equity * risk_pct) / rpp
 
         # Find exit
         in_trade = True
-        xc=xp=xr=None
-        for xi in range(ci+2, min(ci+max_hold, n)):
+        xc = xp = xr = None
+        for xi in range(ci + 2, min(ci + max_hold, n)):
             if st == "bull":
-                if lows[xi]  <= sl_lvl: xp=sl_lvl; xr="SL"; xc=xi; break
-                if highs[xi] >= tp:     xp=tp;      xr="TP"; xc=xi; break
+                if lows[xi]  <= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
+                if highs[xi] >= tp:     xp = tp;      xr = "TP"; xc = xi; break
             else:
-                if highs[xi] >= sl_lvl: xp=sl_lvl; xr="SL"; xc=xi; break
-                if lows[xi]  <= tp:     xp=tp;      xr="TP"; xc=xi; break
+                if highs[xi] >= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
+                if lows[xi]  <= tp:     xp = tp;      xr = "TP"; xc = xi; break
 
         if xc is None:
             in_trade     = False
             active_setup = None
+            ci += 1
             continue
 
-        pnl    = (entry-xp)*pos if st=="bear" else (xp-entry)*pos
+        pnl    = (entry - xp) * pos if st == "bear" else (xp - entry) * pos
         equity += pnl
-        won    = xr=="TP"
+        won    = xr == "TP"
+
+        last_p3_idx = p3_idx
 
         if won:
-            # After TP: find next anchor using N=1
-            anchor = find_next_anchor(candles, xc, st)
+            # After TP: N=1 detection for next anchor
+            anchor = find_next_anchor(xc, st)
             if anchor:
-                rng    = anchor["rng"]
-                fib618 = (anchor["p2"] + rng * fib_level) if st=="bull" else (anchor["p2"] - rng * fib_level)
-                active_setup = {
-                    "st": st, "p2": anchor["p2"], "p3_close": anchor["p3_close"],
-                    "p3_idx": anchor["p3_idx"], "rng": rng,
-                    "fib618": fib618, "sl": anchor["p2"]
-                }
+                active_setup = anchor
+                active_setup["st"] = st
+                ci = anchor["p3_idx"] + 1
             else:
                 active_setup = None
+                ci = xc + 1
             bias = None
         else:
-            # SL hit: flip bias, reset setup
-            bias         = "bull" if st=="bear" else "bear"
+            # SL hit: flip bias
+            bias         = "bull" if st == "bear" else "bear"
             active_setup = None
+            ci = xc + 1
 
         in_trade = False
 
         trades.append({
-            "id":len(trades)+1,
-            "direction":"LONG" if st=="bull" else "SHORT",
-            "entry_time":timestamps[ci+1],"exit_time":timestamps[xc],
-            "entry":round(entry,4),"sl":round(sl_lvl,4),"tp":round(tp,4),
-            "exit_price":round(xp,4),"result":xr,
-            "pnl":round(pnl,4),"equity":round(equity,4),"won":won
+            "id": len(trades) + 1,
+            "direction": "LONG" if st == "bull" else "SHORT",
+            "entry_time": timestamps[ci - 1] if ci > 0 else timestamps[0],
+            "exit_time":  timestamps[xc],
+            "entry": round(entry, 4),
+            "sl":    round(sl_lvl, 4),
+            "tp":    round(tp, 4),
+            "exit_price": round(xp, 4),
+            "result": xr,
+            "pnl":    round(pnl, 4),
+            "equity": round(equity, 4),
+            "won":    won
         })
 
     return trades
