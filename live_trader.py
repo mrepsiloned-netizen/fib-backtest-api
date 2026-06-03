@@ -40,7 +40,9 @@ MODE      = "LIVE"  # change to "PAPER" to revert to paper mode
 
 # ── WATCHLIST — Single primary strategy ────
 WATCHLIST = [
-    {"symbol":"SOL/USDT","timeframe":"1m","pivot_n":3,"rr":1.5,"label":"⚡ SOL 1M — Primary"},
+    {"symbol":"SOL/USDT","timeframe":"1m","pivot_n":3,"rr":1.5,"label":"⚡ SOL 1M"},
+    {"symbol":"BTC/USDT","timeframe":"1m","pivot_n":3,"rr":2.0,"label":"⚡ BTC 1M"},
+    {"symbol":"XRP/USDT","timeframe":"1m","pivot_n":5,"rr":1.5,"label":"⚡ XRP 1M"},
 ]
 
 # ── SUPABASE ──────────────────────────────────────────────
