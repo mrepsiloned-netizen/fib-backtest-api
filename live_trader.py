@@ -308,17 +308,11 @@ def detect_signal(candles, pivots, rr):
     """
     BOS-based Fibonacci pullback signal detection.
 
-    LONG:
-      P1 = most recent confirmed pivot HIGH
-      BOS = current candle close > P1 high (P3)
-      P3 - P1 >= N_MIN candles (duration filter)
-      P2 = min(close[P1:P3]) — lowest close between P1 and P3
-      Range filter: (P3_close - P2) / P2 > 0.003
-      Entry: current candle LOW <= fib618 AND close > fib618
-      Enter next candle open
-      SL = P2, TP = entry + (entry - SL) * RR
+    BEAR: P1(L) → P2(H) → P3(L, BOS below P1) → pullback to 61.8% → SHORT
+    BULL: P1(H) → P2(L) → P3(H, BOS above P1) → pullback to 61.8% → LONG
 
-    SHORT: mirror logic
+    Key fix: exclude pivots within MIN_AGE candles of current — prevents P3
+    from being picked as P1 once it gets confirmed by find_pivots.
     """
     if len(candles) < 20 or len(pivots) < 1: return None
 
@@ -327,71 +321,57 @@ def detect_signal(candles, pivots, rr):
     closes = np.array([c[4] for c in candles])
     n      = len(candles)
 
-    # BOS confirmation: candles[-2] (prev closed candle)
-    bos_close = closes[-2]
-    # Entry trigger: candles[-1] (current candle)
     c_high  = highs[-1]
     c_low   = lows[-1]
     c_close = closes[-1]
-    N_MIN   = 3
-    MIN_RANGE = 0.003
+    MIN_RANGE  = 0.002
+    MIN_AGE = 4
 
     for direction in ["bull", "bear"]:
-        # Find most recent P1
         p1_candidates = [p for p in pivots if
-                        (direction=="bull" and p["type"]=="H") or
-                        (direction=="bear" and p["type"]=="L")]
+                        ((direction=="bull" and p["type"]=="H") or
+                         (direction=="bear" and p["type"]=="L"))
+                        and (n - 1 - p["idx"]) >= MIN_AGE]
         if not p1_candidates: continue
-        p1 = p1_candidates[-1]
+        p1     = p1_candidates[-1]
         p1_idx = p1["idx"]
 
         if direction == "bull":
             p1_price = p1["price"]
-            # BOS: previous candle already closed above P1
-            if bos_close <= p1_price: continue
-            # Duration filter — BOS candle is n-2
-            bos_idx = n - 2
-            if bos_idx - p1_idx < N_MIN: continue
-            # P2 = min close between P1 and BOS
-            p2 = float(min(closes[p1_idx:bos_idx+1]))
-            rng = bos_close - p2
-            if rng <= 0 or rng/p2 < MIN_RANGE: continue
+            if c_close <= p1_price: continue
+            p2 = float(min(lows[p1_idx:n]))
+            rng = c_close - p2
+            if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: continue
             fib618 = p2 + rng * FIB_LEVEL
             sl     = p2
             rpp    = abs(fib618 - sl)
             if rpp <= 0: continue
-            tp     = fib618 + rpp * rr
-            # Entry trigger: current candle wicks to fib618 and closes above
+            tp = fib618 + rpp * rr
             if c_low <= fib618 and c_close > fib618:
                 return {
-                    "structure":"bull","direction":"LONG",
-                    "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
-                    "p1":round(p1_price,6),"p2":round(p2,6),
-                    "current":round(c_close,6),"rr":rr
+                    "structure": "bull", "direction": "LONG",
+                    "entry": round(fib618, 6), "sl": round(sl, 6), "tp": round(tp, 6),
+                    "p1": round(p1_price, 6), "p2": round(p2, 6),
+                    "current": round(c_close, 6), "rr": rr
                 }
 
         else:  # bear
             p1_price = p1["price"]
-            # BOS: previous candle already closed below P1
-            if bos_close >= p1_price: continue
-            bos_idx = n - 2
-            if bos_idx - p1_idx < N_MIN: continue
-            # P2 = max close between P1 and BOS
-            p2 = float(max(closes[p1_idx:bos_idx+1]))
-            rng = p2 - bos_close
-            if rng <= 0 or rng/p2 < MIN_RANGE: continue
+            if c_close >= p1_price: continue
+            p2 = float(max(highs[p1_idx:n]))
+            rng = p2 - c_close
+            if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: continue
             fib618 = p2 - rng * FIB_LEVEL
             sl     = p2
             rpp    = abs(fib618 - sl)
             if rpp <= 0: continue
-            tp     = fib618 - rpp * rr
-            # Entry trigger: current candle wicks to fib618 and closes below
+            tp = fib618 - rpp * rr
             if c_high >= fib618 and c_close < fib618:
                 return {
-                    "structure":"bear","direction":"SHORT",
-                    "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
-                    "p1":round(p1_price,6),"p2":round(p2,6),
-                    "current":round(c_close,6),"rr":rr
+                    "structure": "bear", "direction": "SHORT",
+                    "entry": round(fib618, 6), "sl": round(sl, 6), "tp": round(tp, 6),
+                    "p1": round(p1_price, 6), "p2": round(p2, 6),
+                    "current": round(c_close, 6), "rr": rr
                 }
 
     return None
