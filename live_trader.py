@@ -34,11 +34,9 @@ RISK_PCT  = 0.02   # 2% risk per trade
 FIB_LEVEL = 0.618
 MODE      = "LIVE"  # change to "PAPER" to revert to paper mode
 
-# ── WATCHLIST — Core 3 only, no 1M speed test for live ────
+# ── WATCHLIST — Single primary strategy ────
 WATCHLIST = [
-    {"symbol":"BTC/USDT","timeframe":"15m","pivot_n":5,"rr":2.0,"label":"🔵 Low Risk / Stable"},
-    {"symbol":"ETH/USDT","timeframe":"1h", "pivot_n":3,"rr":4.0,"label":"🟡 Mid Risk"},
-    {"symbol":"SOL/USDT","timeframe":"15m","pivot_n":3,"rr":4.0,"label":"🔴 High Risk"},
+    {"symbol":"SOL/USDT","timeframe":"1m","pivot_n":3,"rr":1.5,"label":"⚡ SOL 1M — Primary"},
 ]
 
 # ── SUPABASE ──────────────────────────────────────────────
