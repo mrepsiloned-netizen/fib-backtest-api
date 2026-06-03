@@ -19,7 +19,7 @@ import time
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-executor = ThreadPoolExecutor(max_workers=8)
+executor = ThreadPoolExecutor(max_workers=2)
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
@@ -162,8 +162,10 @@ def fetch_candles(symbol, timeframe, start_date, end_date):
             return cached, "Cache (Supabase)"
 
     exchanges = [("KuCoin",ccxt.kucoin()),("OKX",ccxt.okx()),("Bybit",ccxt.bybit())]
+    exchange_errors = []
     for name, ex in exchanges:
         try:
+            time.sleep(1.0)  # rate limit buffer between exchange attempts
             all_candles, since = [], start_ms
             empty_count = 0
             while since < end_ms:
@@ -187,7 +189,8 @@ def fetch_candles(symbol, timeframe, start_date, end_date):
                 return all_candles, name
         except Exception as e:
             print(f"{name} failed: {e}")
-    raise Exception(f"All exchanges failed for {symbol} {timeframe}")
+            exchange_errors.append(f"{name}: {str(e)[:60]}")
+    raise Exception(f"No data for {symbol} {timeframe}. Use Prefetch button first. ({'; '.join(exchange_errors)})")
 
 # ── PIVOTS ────────────────────────────────────────────────
 
