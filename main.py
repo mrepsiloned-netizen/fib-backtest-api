@@ -156,16 +156,10 @@ def fetch_candles(symbol, timeframe, start_date, end_date):
     if SUPABASE_URL:
         cached = get_cached_candles(symbol, timeframe, start_ms, end_ms)
         if cached:
-            # Validate cache completeness — reject if significantly under-fetched
-            duration_ms = end_ms - start_ms
-            tf_ms = {"1m":60000,"5m":300000,"15m":900000,"1h":3600000,"4h":14400000,"1d":86400000}
-            expected = duration_ms / tf_ms.get(timeframe, 900000)
-            completeness = len(cached) / expected if expected > 0 else 1
-            if completeness >= 0.75:  # accept if we have 75%+ of expected candles
-                _mem_cache[cache_key] = cached
-                return cached, "Cache (Supabase)"
-            else:
-                print(f"Cache incomplete for {symbol} {timeframe}: {len(cached)}/{int(expected)} candles ({completeness:.1%}) — refetching")
+            # Accept cache if it has data — crypto has gaps, don't refetch unnecessarily
+            print(f"Cache hit: {symbol} {timeframe} {len(cached)} candles")
+            _mem_cache[cache_key] = cached
+            return cached, "Cache (Supabase)"
 
     exchanges = [("KuCoin",ccxt.kucoin()),("OKX",ccxt.okx()),("Bybit",ccxt.bybit())]
     for name, ex in exchanges:
