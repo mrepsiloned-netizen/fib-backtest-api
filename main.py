@@ -285,7 +285,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             "p3_idx": p3_idx, "p3_close": p3_close,
                             "rng": rng
                         }
-                    if lows[ci] < p1_high * 0.95: break
+                    # No pre-BOS invalidation — let BOS check handle it
 
             # SHORT: P1 must be a pivot LOW
             elif bias != "bull" and p1["type"] == "L":
@@ -308,7 +308,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             "p3_idx": p3_idx, "p3_close": p3_close,
                             "rng": rng
                         }
-                    if highs[ci] > p1_low * 1.05: break
+                    # No pre-BOS invalidation — let BOS check handle it
         return None
 
     # ── Helper: N=1 HH/LL detection after TP ──────────────
