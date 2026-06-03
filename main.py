@@ -257,33 +257,27 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
         closes = np.array([c[4] for c in candles])
         n      = len(candles)
 
-        # Find most recent valid P1 pivot high (for LONG)
-        # or pivot low (for SHORT)
-        for pi in range(len(pivots)-1, -1, -1):
+        # Scan pivots FORWARD (chronological) to find first valid BOS
+        # after last_used_idx — ensures we find setups as they occur in time
+        for pi in range(len(pivots)):
             p1 = pivots[pi]
+            if p1["idx"] <= last_used_idx: continue
 
             # LONG: P1 must be a pivot HIGH
             if bias != "bear" and p1["type"] == "H":
-                if p1["idx"] <= last_used_idx: continue
                 p1_high = p1["price"]
                 p1_idx  = p1["idx"]
 
                 # Scan forward for BOS: first close > P1 high
-                for ci in range(p1_idx + N_min, n):
+                for ci in range(p1_idx + N_min, n - 2):  # n-2 ensures candles after P3
                     if closes[ci] > p1_high:
-                        # P3 found — check duration
                         if ci - p1_idx < N_min: break
                         p3_close = closes[ci]
                         p3_idx   = ci
-
-                        # P2 = min close between P1 and P3
                         p2_close = float(min(closes[p1_idx:p3_idx+1]))
-
-                        # Range filter
                         rng = p3_close - p2_close
                         if rng <= 0: break
                         if rng / p2_close < MIN_RANGE: break
-
                         return {
                             "st": "bull",
                             "p1_idx": p1_idx, "p1_price": p1_high,
@@ -291,29 +285,22 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             "p3_idx": p3_idx, "p3_close": p3_close,
                             "rng": rng
                         }
-                    # If price goes significantly lower, P1 may be invalid
                     if lows[ci] < p1_high * 0.95: break
 
             # SHORT: P1 must be a pivot LOW
             elif bias != "bull" and p1["type"] == "L":
-                if p1["idx"] <= last_used_idx: continue
                 p1_low  = p1["price"]
                 p1_idx  = p1["idx"]
 
-                # Scan forward for BOS: first close < P1 low
-                for ci in range(p1_idx + N_min, n):
+                for ci in range(p1_idx + N_min, n - 2):
                     if closes[ci] < p1_low:
                         if ci - p1_idx < N_min: break
                         p3_close = closes[ci]
                         p3_idx   = ci
-
-                        # P2 = max close between P1 and P3
                         p2_close = float(max(closes[p1_idx:p3_idx+1]))
-
                         rng = p2_close - p3_close
                         if rng <= 0: break
                         if rng / p2_close < MIN_RANGE: break
-
                         return {
                             "st": "bear",
                             "p1_idx": p1_idx, "p1_price": p1_low,
@@ -390,12 +377,13 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
     for ci in range(1, n-1):
         if in_trade: continue
 
-        # Find new setup if none active — only search from where we left off
+        # Find new setup if none active — only look at data up to current candle
         if active_setup is None:
             if ci < setup_search_from: continue
+            # Only use candles up to ci so we dont see the future
             setup = find_bos_setup(pivots, candles, bias, last_used_idx, N_min)
             if setup is None:
-                setup_search_from = ci + 10  # skip ahead, avoid re-searching every candle
+                setup_search_from = ci + 10
                 continue
             st       = setup["st"]
             p2       = setup["p2"]
