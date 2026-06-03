@@ -426,9 +426,11 @@ def detect_signal(candles, pivots, rr):
 
 # ── MAIN LOOP ─────────────────────────────────────────────
 open_signals = {}  # key: symbol_timeframe
+pair_bias    = {}  # key: symbol_timeframe → "bull" | "bear" | None
+tp_anchors   = {}  # key: symbol_timeframe → N=1 anchor tracking after TP
 
 def run():
-    global open_signals
+    global open_signals, pair_bias, tp_anchors
     print("💰 Fib Live Trader v1 starting...")
 
     data_exchange = get_data_exchange()
@@ -507,6 +509,47 @@ def run():
 
                     pivots = find_pivots(candles, pivot_n)
                     signal = detect_signal(candles, pivots, rr)
+
+                    # N=1 anchor tracking after TP — use candle high/low
+                    if key in tp_anchors and key not in open_signals:
+                        anchor = tp_anchors[key]
+                        try:
+                            ohlcv_anchor = data_exchange.fetch_ohlcv(symbol, timeframe, limit=2)
+                            if ohlcv_anchor:
+                                c = ohlcv_anchor[-1]
+                                c_h = c[2]; c_l = c[3]
+                                anchor["candles_since"] = anchor.get("candles_since", 0) + 1
+                                if anchor["direction"] == "bull":
+                                    if c_h > anchor["candidate"]:
+                                        anchor["candidate"] = c_h
+                                    else:
+                                        new_p3 = anchor["candidate"]
+                                        new_p2 = anchor["from_price"]
+                                        rng    = new_p3 - new_p2
+                                        if rng > 0 and rng/max(new_p2,1) >= 0.003:
+                                            print(f"[{now_str}] N=1 HH confirmed @ ${new_p3:.4f}")
+                                        del tp_anchors[key]
+                                else:
+                                    if c_l < anchor["candidate"]:
+                                        anchor["candidate"] = c_l
+                                    else:
+                                        new_p3 = anchor["candidate"]
+                                        new_p2 = anchor["from_price"]
+                                        rng    = new_p2 - new_p3
+                                        if rng > 0 and rng/max(new_p2,1) >= 0.003:
+                                            print(f"[{now_str}] N=1 LL confirmed @ ${new_p3:.4f}")
+                                        del tp_anchors[key]
+                                if anchor.get("candles_since", 0) >= 50:
+                                    if key in tp_anchors: del tp_anchors[key]
+                        except Exception as e:
+                            print(f"[{now_str}] Anchor error {key}: {e}")
+
+                    # Bias filter
+                    current_bias = pair_bias.get(key)
+                    signal_dir   = signal["structure"] if signal else None
+                    if signal and current_bias and current_bias != signal_dir:
+                        print(f"[{now_str}] Bias skip: {symbol} {timeframe} signal={signal_dir} bias={current_bias}")
+                        signal = None
 
                     if signal and key not in open_signals:
                         if now-last_signal.get(key,0)>interval:
@@ -612,6 +655,22 @@ def run():
                             send_exit(sig["symbol"], sig["timeframe"], sig, exit_price, won, pnl, acc)
                             closed.append(key)
                             print(f"[{now_str}] {'✅TP' if won else '❌SL'}: {symbol} PnL=${pnl}")
+
+                            if won:
+                                pair_bias[key] = None
+                                anchor_price = exit_price
+                                tp_anchors[key] = {
+                                    "direction": sig["structure"],
+                                    "from_price": sig["p2"] if "p2" in sig else anchor_price,
+                                    "candidate":  anchor_price,
+                                    "candles_since": 0
+                                }
+                                print(f"[{now_str}] TP hit — watching for next N=1 anchor from ${anchor_price:.4f}: {symbol} {timeframe}")
+                            else:
+                                flipped = "bull" if sig["structure"]=="bear" else "bear"
+                                pair_bias[key] = flipped
+                                if key in tp_anchors: del tp_anchors[key]
+                                print(f"[{now_str}] SL hit — bias flipped to {flipped}: {symbol} {timeframe}")
 
                 except Exception as e:
                     print(f"Monitor error {key}: {e}")
