@@ -163,10 +163,16 @@ def fetch_candles(symbol, timeframe, start_date, end_date):
     if SUPABASE_URL:
         cached = get_cached_candles(symbol, timeframe, start_ms, end_ms)
         if cached:
-            # Accept cache if it has data — crypto has gaps, don't refetch unnecessarily
-            print(f"Cache hit: {symbol} {timeframe} {len(cached)} candles")
-            _mem_cache[cache_key] = cached
-            return cached, "Cache (Supabase)"
+            # Check completeness — estimate expected candles from date range
+            interval_ms = {"1m":60000,"5m":300000,"15m":900000,"1h":3600000,"4h":14400000,"1d":86400000}.get(timeframe,60000)
+            expected    = (end_ms - start_ms) / interval_ms
+            coverage    = len(cached) / expected
+            print(f"Cache hit: {symbol} {timeframe} {len(cached)} candles ({coverage*100:.0f}% of expected)")
+            if coverage >= 0.70:  # accept if at least 70% complete
+                _mem_cache[cache_key] = cached
+                return cached, "Cache (Supabase)"
+            else:
+                print(f"Cache incomplete ({coverage*100:.0f}%), fetching fresh data...")
 
     exchanges = [("KuCoin",ccxt.kucoin()),("OKX",ccxt.okx()),("Bybit",ccxt.bybit())]
     exchange_errors = []
@@ -1054,10 +1060,12 @@ def process_request(req: BacktestRequest):
 
         eq_curve=[]
         eq=100.0; ti=0
+        # Sample every N candles — more for 1m to avoid too many points
+        sample = {"1m":30,"5m":12,"15m":4,"1h":1,"4h":1,"1d":1}.get(req.timeframe,10)
         for i,c in enumerate(candles):
             if ti<len(trades) and trades[ti]["exit_time"]<=c[0]:
                 eq=trades[ti]["equity"]; ti+=1
-            if i%10==0:
+            if i%sample==0:
                 eq_curve.append({"t":c[0],"eq":round(eq,2)})
 
         return {
