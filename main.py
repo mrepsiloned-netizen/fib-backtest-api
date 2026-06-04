@@ -41,10 +41,14 @@ class BacktestRequest(BaseModel):
     risk_pct: float = 0.02
     rr: float = 2.0
     fib_level: float = 0.618
-    max_bars: int = 200          # time expiry — max candles to wait for entry
-    max_hold: int = 200          # max candles to hold trade
-    recency_bars: int = 50       # p3 must be within last N candles
-    one_per_pair: bool = True    # only one trade per pair at a time
+    max_bars: int = 200
+    max_hold: int = 200
+    recency_bars: int = 50
+    one_per_pair: bool = True
+    min_swing_pct: float = 0.002
+    stop_buffer_pct: float = 0.001
+    k_stale: int = 0
+    entry_mode: str = "rejection"  # touch | rejection | reclaim
 
 class BatchRequest(BaseModel):
     configs: List[BacktestRequest]
@@ -236,25 +240,23 @@ def find_pivots(highs, lows, N):
 
 
 # ── BACKTEST CORE ─────────────────────────────────────────
-def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair):
+def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection"):
     """
-    BOS-based Fibonacci pullback backtest.
+    BOS-based Fibonacci pullback backtest — proper state machine.
 
-    LONG SETUP:
-      1. P1 = confirmed pivot HIGH
-      2. P3 = first candle that CLOSES above P1 (Break of Structure)
-         - Must be at least N_MIN candles after P1
-         - If rejected P3 - P1 < N_MIN, P3 becomes new P1
-      3. P2 = min(close) between P1 and P3
-      4. Range filter: (P3 - P2) / P2 > 0.3%
-      5. Draw fib P2 → P3
-      6. Entry: candle LOW <= fib618 AND close > fib618 (wick touch + rejection)
-      7. Enter at NEXT candle open
-      8. SL = P2, TP = entry + (entry - SL) * RR
-      9. TP hit → N=1 HH detection for next setup
-         SL hit → flip bias to SHORT
-
-    SHORT: mirror logic
+    STATE 1 HUNT   : find confirmed pivot HIGH (bull) or LOW (bear) = P1
+    STATE 2 AWAIT  : track running P2, wait for next confirmed pivot
+                     higher (bull) / lower (bear) than P1 = BOS → STATE 3
+                     lower/equal → becomes new P1, reset P2
+    STATE 3 ARMED  : P2 fixed, P3 floating (running extreme)
+                     fib entry trails with P3
+                     Each closed candle:
+                       1. New extreme → update P3, recompute fib
+                       2. Close below P1 (bull) / above P1 (bear) → cancel → STATE 1
+                       3. Entry triggered (wick to fib618, close confirms) → STATE 4
+                       4. New confirmed pivot forms → Option 3a/3b logic
+                       5. k_stale exceeded → cancel → STATE 1
+    STATE 4 TRADE  : manage SL/TP, ignore new structures, on exit → STATE 1
     """
     highs      = np.array([c[2] for c in candles])
     lows       = np.array([c[3] for c in candles])
@@ -264,268 +266,383 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
     timestamps = [c[0] for c in candles]
     trades     = []
     equity     = 100.0
-    bias       = None      # None, "bull", "bear"
-    in_trade   = False
-    MIN_RANGE  = 0.003     # 0.3% minimum fib range
+    N          = len(pivots) > 0 and pivots[0].get("n", 3) or 3
 
     if n < 50 or len(pivots) < 2:
         return trades
 
-    # ── Step 1: Precompute all BOS setups in chronological order ──
-    # This avoids repeated scanning — one pass to find all valid setups
-    def get_all_setups(pivots, bias_filter=None):
-        """Find all valid BOS setups in chronological order."""
-        setups = []
-        ph = [p for p in pivots if p["type"] == "H"]
-        pl = [p for p in pivots if p["type"] == "L"]
-        N_min = 3
+    def is_pivot_high(idx):
+        """Check if candle at idx is a confirmed pivot high in pivots list."""
+        return any(p["idx"] == idx and p["type"] == "H" for p in pivots)
 
-        # LONG setups: pivot HIGH → BOS up
-        if bias_filter != "bear":
-            for p1 in ph:
-                p1_idx   = p1["idx"]
-                p1_price = p1["price"]
-                # Scan forward for BOS candle
-                for ci in range(p1_idx + 1, n - 1):
-                    if closes[ci] > p1_price:
-                        # Check duration
-                        if ci - p1_idx < N_min:
-                            # Too close — this P3 becomes new P1, skip
-                            break
-                        p3_idx   = ci
-                        p3_close = closes[ci]
-                        # P2 = min close between P1 and P3
-                        p2 = float(min(closes[p1_idx:p3_idx + 1]))
-                        rng = p3_close - p2
-                        if rng <= 0 or rng / max(p2, 1) < MIN_RANGE:
-                            break
-                        setups.append({
-                            "st": "bull",
-                            "p1_idx": p1_idx, "p1_price": p1_price,
-                            "p2": p2, "p3_idx": p3_idx, "p3_close": p3_close,
-                            "rng": rng, "fib618": p2 + rng * fib_level,
-                            "sl": p2
-                        })
-                        break
-                    # If price clearly breaks below P1 level by more than range,
-                    # P1 is no longer relevant
-                    if lows[ci] < p1_price * 0.90:
-                        break
+    def is_pivot_low(idx):
+        """Check if candle at idx is a confirmed pivot low in pivots list."""
+        return any(p["idx"] == idx and p["type"] == "L" for p in pivots)
 
-        # SHORT setups: pivot LOW → BOS down
-        if bias_filter != "bull":
-            for p1 in pl:
-                p1_idx   = p1["idx"]
-                p1_price = p1["price"]
-                for ci in range(p1_idx + 1, n - 1):
-                    if closes[ci] < p1_price:
-                        if ci - p1_idx < N_min:
-                            break
-                        p3_idx   = ci
-                        p3_close = closes[ci]
-                        p2 = float(max(closes[p1_idx:p3_idx + 1]))
-                        rng = p2 - p3_close
-                        if rng <= 0 or rng / max(p2, 1) < MIN_RANGE:
-                            break
-                        setups.append({
-                            "st": "bear",
-                            "p1_idx": p1_idx, "p1_price": p1_price,
-                            "p2": p2, "p3_idx": p3_idx, "p3_close": p3_close,
-                            "rng": rng, "fib618": p2 - rng * fib_level,
-                            "sl": p2
-                        })
-                        break
-                    if highs[ci] > p1_price * 1.10:
-                        break
+    # Build pivot lookup sets for fast access
+    pivot_highs = {p["idx"]: p["price"] for p in pivots if p["type"] == "H"}
+    pivot_lows  = {p["idx"]: p["price"] for p in pivots if p["type"] == "L"}
 
-        # Sort by P3 index (chronological order)
-        setups.sort(key=lambda x: x["p3_idx"])
-        return setups
+    def run_direction(st):
+        """Run full state machine for one direction: bull or bear."""
+        nonlocal equity
+        direction_trades = []
 
-    # ── Step 2: N=1 HH/LL detection after TP ──────────────
-    def find_next_anchor(from_idx, direction):
-        candidate_idx = from_idx
-        max_candles   = 50
-        if direction == "bull":
-            candidate = highs[from_idx]
-            for xi in range(from_idx + 1, min(from_idx + max_candles, n)):
-                if highs[xi] > candidate:
-                    candidate     = highs[xi]
-                    candidate_idx = xi
-                else:
-                    # Confirmed — new HH
-                    p3_close = closes[candidate_idx]
-                    p2       = float(min(closes[from_idx:candidate_idx + 1]))
-                    rng      = p3_close - p2
-                    if rng > 0 and rng / max(p2, 1) >= MIN_RANGE:
-                        return {"p2": p2, "p3_close": p3_close,
-                                "p3_idx": candidate_idx, "rng": rng,
-                                "fib618": p2 + rng * fib_level, "sl": p2}
-                    return None
-            # Guard: use candidate after max_candles
-            p3_close = closes[candidate_idx]
-            p2       = float(min(closes[from_idx:candidate_idx + 1]))
-            rng      = p3_close - p2
-            if rng > 0 and rng / max(p2, 1) >= MIN_RANGE:
-                return {"p2": p2, "p3_close": p3_close,
-                        "p3_idx": candidate_idx, "rng": rng,
-                        "fib618": p2 + rng * fib_level, "sl": p2}
-        else:  # bear
-            candidate = lows[from_idx]
-            for xi in range(from_idx + 1, min(from_idx + max_candles, n)):
-                if lows[xi] < candidate:
-                    candidate     = lows[xi]
-                    candidate_idx = xi
-                else:
-                    p3_close = closes[candidate_idx]
-                    p2       = float(max(closes[from_idx:candidate_idx + 1]))
-                    rng      = p2 - p3_close
-                    if rng > 0 and rng / max(p2, 1) >= MIN_RANGE:
-                        return {"p2": p2, "p3_close": p3_close,
-                                "p3_idx": candidate_idx, "rng": rng,
-                                "fib618": p2 - rng * fib_level, "sl": p2}
-                    return None
-            p3_close = closes[candidate_idx]
-            p2       = float(max(closes[from_idx:candidate_idx + 1]))
-            rng      = p2 - p3_close
-            if rng > 0 and rng / max(p2, 1) >= MIN_RANGE:
-                return {"p2": p2, "p3_close": p3_close,
-                        "p3_idx": candidate_idx, "rng": rng,
-                        "fib618": p2 - rng * fib_level, "sl": p2}
-        return None
+        # STATE 1 initial: find first P1
+        # For bull: P1 = confirmed pivot HIGH
+        # For bear: P1 = confirmed pivot LOW
+        p1_idx   = None
+        p1_price = None
 
-    # ── Step 3: Main trade simulation ─────────────────────
-    # Get all setups upfront in chronological order
-    all_setups = get_all_setups(pivots)
-    setup_idx  = 0   # pointer into all_setups
-    active_setup = None
-    last_p3_idx  = -1
+        # Find first valid P1
+        for p in pivots:
+            if st == "bull" and p["type"] == "H":
+                p1_idx = p["idx"]; p1_price = p["price"]; break
+            if st == "bear" and p["type"] == "L":
+                p1_idx = p["idx"]; p1_price = p["price"]; break
+        if p1_idx is None:
+            return direction_trades
 
-    ci = 1
-    while ci < n - 1:
-        if in_trade:
-            ci += 1
-            continue
+        state        = 2          # start at AWAIT BREAK
+        p2           = None       # locked when BOS confirmed
+        p3_float     = None       # floating extreme after BOS
+        fib_entry    = None       # trailing entry level
+        bos_idx      = None       # candle index where BOS confirmed
+        armed_since  = None       # candle index when armed (for k_stale)
+        pending_p1   = None       # new P1 candidate seen in Option 3a
+        c_watch      = None       # for reclaim mode: candle idx when close crossed fib
 
-        # Get next active setup if none
-        if active_setup is None:
-            # Find next setup after last_p3_idx that matches bias
-            while setup_idx < len(all_setups):
-                s = all_setups[setup_idx]
-                setup_idx += 1
-                if s["p3_idx"] <= last_p3_idx: continue
-                if bias == "bear" and s["st"] == "bull": continue
-                if bias == "bull" and s["st"] == "bear": continue
-                active_setup = s
-                ci = s["p3_idx"] + 1  # start scanning from candle after P3
-                break
-            if active_setup is None:
-                break  # no more setups
-
-        st     = active_setup["st"]
-        fib618 = active_setup["fib618"]
-        sl_lvl = active_setup["sl"]
-        p2     = active_setup["p2"]
-        p3_idx = active_setup["p3_idx"]
-
-        if ci >= n - 1:
-            break
-
-        c_low   = lows[ci]
-        c_high  = highs[ci]
-        c_close = closes[ci]
-
-        # Invalidation: price broke through P2 (structure invalid)
-        if st == "bull" and c_low < p2:
-            active_setup = None
-            ci += 1
-            continue
-        if st == "bear" and c_high > p2:
-            active_setup = None
-            ci += 1
-            continue
-
-        # Entry trigger: wick touches fib618, close confirms
-        triggered = False
-        if st == "bull" and c_low <= fib618 and c_close > fib618:
-            triggered = True
-        elif st == "bear" and c_high >= fib618 and c_close < fib618:
-            triggered = True
-
-        if not triggered:
-            ci += 1
-            continue
-
-        # Enter at next candle open
-        if ci + 1 >= n:
-            break
-        entry = float(opens[ci + 1])
-        rpp   = abs(entry - sl_lvl)
-        if rpp <= 0:
-            active_setup = None
-            ci += 1
-            continue
-        tp  = entry + rpp * rr if st == "bull" else entry - rpp * rr
-        pos = (equity * risk_pct) / rpp
-
-        # Find exit
-        in_trade = True
-        xc = xp = xr = None
-        for xi in range(ci + 2, min(ci + max_hold, n)):
-            if st == "bull":
-                if lows[xi]  <= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
-                if highs[xi] >= tp:     xp = tp;      xr = "TP"; xc = xi; break
-            else:
-                if highs[xi] >= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
-                if lows[xi]  <= tp:     xp = tp;      xr = "TP"; xc = xi; break
-
-        if xc is None:
-            in_trade     = False
-            active_setup = None
-            ci += 1
-            continue
-
-        pnl    = (entry - xp) * pos if st == "bear" else (xp - entry) * pos
-        equity += pnl
-        won    = xr == "TP"
-
-        last_p3_idx = p3_idx
-
-        if won:
-            # After TP: N=1 detection for next anchor
-            anchor = find_next_anchor(xc, st)
-            if anchor:
-                active_setup = anchor
-                active_setup["st"] = st
-                ci = anchor["p3_idx"] + 1
-            else:
-                active_setup = None
-                ci = xc + 1
-            bias = None
+        # Running P2 candidate while in AWAIT BREAK
+        if st == "bull":
+            p2_candidate = float(min(lows[p1_idx:p1_idx+1+1]))
         else:
-            # SL hit: flip bias
-            bias         = "bull" if st == "bear" else "bear"
-            active_setup = None
-            ci = xc + 1
+            p2_candidate = float(max(highs[p1_idx:p1_idx+1+1]))
 
-        in_trade = False
+        ci = p1_idx + 1
 
-        trades.append({
-            "id": len(trades) + 1,
-            "direction": "LONG" if st == "bull" else "SHORT",
-            "entry_time": timestamps[ci - 1] if ci > 0 else timestamps[0],
-            "exit_time":  timestamps[xc],
-            "entry": round(entry, 4),
-            "sl":    round(sl_lvl, 4),
-            "tp":    round(tp, 4),
-            "exit_price": round(xp, 4),
-            "result": xr,
-            "pnl":    round(pnl, 4),
-            "equity": round(equity, 4),
-            "won":    won
-        })
+        while ci < n - 1:
+            c_high  = highs[ci]
+            c_low   = lows[ci]
+            c_close = closes[ci]
+            c_open  = opens[ci]
 
-    return trades
+            # ── STATE 2: AWAIT BREAK ──────────────────────
+            if state == 2:
+                # Update running P2 candidate
+                if st == "bull":
+                    p2_candidate = min(p2_candidate, float(lows[ci]))
+                else:
+                    p2_candidate = max(p2_candidate, float(highs[ci]))
+
+                # Check if this candle is a confirmed pivot
+                is_ph = ci in pivot_highs
+                is_pl = ci in pivot_lows
+
+                if st == "bull" and is_ph:
+                    new_high = pivot_highs[ci]
+                    if new_high > p1_price:
+                        # BOS confirmed — lock P2, start floating P3
+                        p2        = p2_candidate
+                        bos_idx   = ci
+                        p3_float  = float(highs[ci])   # start floating at BOS high
+                        rng       = p3_float - p2
+                        if rng > 0 and rng / max(p2, 1) >= min_swing_pct:
+                            fib_entry   = p3_float - rng * fib_level
+                            armed_since = ci
+                            pending_p1  = None
+                            state       = 3
+                        else:
+                            # Range too small — treat as new P1
+                            p1_idx = ci; p1_price = new_high
+                            p2_candidate = float(min(lows[ci:ci+1+1]))
+                    else:
+                        # Lower high → new P1
+                        p1_idx = ci; p1_price = new_high
+                        p2_candidate = float(min(lows[ci:ci+1+1]))
+
+                elif st == "bear" and is_pl:
+                    new_low = pivot_lows[ci]
+                    if new_low < p1_price:
+                        # BOS confirmed
+                        p2        = p2_candidate
+                        bos_idx   = ci
+                        p3_float  = float(lows[ci])
+                        rng       = p2 - p3_float
+                        if rng > 0 and rng / max(p2, 1) >= min_swing_pct:
+                            fib_entry   = p3_float + rng * fib_level
+                            armed_since = ci
+                            pending_p1  = None
+                            state       = 3
+                        else:
+                            p1_idx = ci; p1_price = new_low
+                            p2_candidate = float(max(highs[ci:ci+1+1]))
+                    else:
+                        # Higher low → new P1
+                        p1_idx = ci; p1_price = new_low
+                        p2_candidate = float(max(highs[ci:ci+1+1]))
+
+                ci += 1
+                continue
+
+            # ── STATE 3: ARMED ────────────────────────────
+            if state == 3:
+
+                # Check k_stale expiry
+                if k_stale > 0 and (ci - armed_since) > k_stale:
+                    # Reset — find new P1 from current position
+                    state = 2
+                    # Find next pivot after current position as new P1
+                    for p in pivots:
+                        if p["idx"] > ci:
+                            if st == "bull" and p["type"] == "H":
+                                p1_idx = p["idx"]; p1_price = p["price"]
+                                p2_candidate = float(min(lows[p1_idx:p1_idx+1+1]))
+                                ci = p1_idx + 1; break
+                            elif st == "bear" and p["type"] == "L":
+                                p1_idx = p["idx"]; p1_price = p["price"]
+                                p2_candidate = float(max(highs[p1_idx:p1_idx+1+1]))
+                                ci = p1_idx + 1; break
+                    continue
+
+                # 1. Update floating P3 if new extreme printed
+                if st == "bull" and c_high > p3_float:
+                    p3_float  = float(c_high)
+                    rng       = p3_float - p2
+                    if rng > 0:
+                        fib_entry = p3_float - rng * fib_level
+
+                elif st == "bear" and c_low < p3_float:
+                    p3_float  = float(c_low)
+                    rng       = p2 - p3_float
+                    if rng > 0:
+                        fib_entry = p3_float + rng * fib_level
+
+                # 2. Invalidation: close below P1 (bull) or above P1 (bear)
+                if st == "bull" and c_close < p1_price:
+                    state = 2
+                    p1_idx = None
+                    # Find next pivot HIGH as new P1
+                    for p in pivots:
+                        if p["idx"] > ci and p["type"] == "H":
+                            p1_idx = p["idx"]; p1_price = p["price"]
+                            p2_candidate = float(min(lows[p1_idx:p1_idx+1+1]))
+                            break
+                    if p1_idx is None:
+                        break
+                    ci = p1_idx + 1
+                    continue
+
+                if st == "bear" and c_close > p1_price:
+                    state = 2
+                    p1_idx = None
+                    for p in pivots:
+                        if p["idx"] > ci and p["type"] == "L":
+                            p1_idx = p["idx"]; p1_price = p["price"]
+                            p2_candidate = float(max(highs[p1_idx:p1_idx+1+1]))
+                            break
+                    if p1_idx is None:
+                        break
+                    ci = p1_idx + 1
+                    continue
+
+                # 4. Option 3 — new confirmed pivot forms while armed
+                is_ph = ci in pivot_highs
+                is_pl = ci in pivot_lows
+
+                if st == "bull" and is_ph:
+                    new_ph = pivot_highs[ci]
+                    if new_ph > p1_price:
+                        # Option 3a — note as new P1 candidate, old structure still valid
+                        pending_p1 = {"idx": ci, "price": new_ph}
+                        # Check if this triggers Option 3b (BOS above pending_p1)
+                        # That happens on subsequent candles — handled naturally
+
+                if st == "bear" and is_pl:
+                    new_pl = pivot_lows[ci]
+                    if new_pl < p1_price:
+                        pending_p1 = {"idx": ci, "price": new_pl}
+
+                # Option 3b — BOS above pending_p1 (bull) or below (bear)
+                if pending_p1 is not None:
+                    if st == "bull" and c_close > pending_p1["price"]:
+                        # New structure takes over
+                        p1_idx   = pending_p1["idx"]
+                        p1_price = pending_p1["price"]
+                        new_p2   = float(min(lows[p1_idx:ci+1]))
+                        new_p3   = float(max(highs[p1_idx:ci+1]))
+                        rng      = new_p3 - new_p2
+                        if rng > 0 and rng / max(new_p2, 1) >= min_swing_pct:
+                            p2        = new_p2
+                            p3_float  = new_p3
+                            fib_entry = p3_float - rng * fib_level
+                            bos_idx   = ci
+                            armed_since = ci
+                            pending_p1  = None
+                            # Stay in STATE 3 with new structure
+                        else:
+                            # Range too small, reset
+                            state = 2
+                            p2_candidate = float(min(lows[ci:ci+1+1]))
+                            pending_p1 = None
+                        ci += 1
+                        continue
+
+                    elif st == "bear" and c_close < pending_p1["price"]:
+                        p1_idx   = pending_p1["idx"]
+                        p1_price = pending_p1["price"]
+                        new_p2   = float(max(highs[p1_idx:ci+1]))
+                        new_p3   = float(min(lows[p1_idx:ci+1]))
+                        rng      = new_p2 - new_p3
+                        if rng > 0 and rng / max(new_p2, 1) >= min_swing_pct:
+                            p2        = new_p2
+                            p3_float  = new_p3
+                            fib_entry = p3_float + rng * fib_level
+                            bos_idx   = ci
+                            armed_since = ci
+                            pending_p1  = None
+                        else:
+                            state = 2
+                            p2_candidate = float(max(highs[ci:ci+1+1]))
+                            pending_p1 = None
+                        ci += 1
+                        continue
+
+                # 3. Entry trigger
+                # touch     — price touches fib618, fill immediately
+                # rejection — touch + close back above/below fib same candle
+                # reclaim   — close through fib, recover within 2 candles
+                triggered  = False
+                entry_price = None
+                if fib_entry is None:
+                    ci += 1; continue
+
+                if entry_mode == "touch":
+                    if st == "bull" and c_low <= fib_entry:
+                        triggered = True
+                        entry_price = float(opens[ci + 1]) if ci + 1 < n else None
+                    elif st == "bear" and c_high >= fib_entry:
+                        triggered = True
+                        entry_price = float(opens[ci + 1]) if ci + 1 < n else None
+
+                elif entry_mode == "rejection":
+                    if st == "bull" and c_low <= fib_entry and c_close > fib_entry:
+                        triggered = True
+                        entry_price = float(opens[ci + 1]) if ci + 1 < n else None
+                    elif st == "bear" and c_high >= fib_entry and c_close < fib_entry:
+                        triggered = True
+                        entry_price = float(opens[ci + 1]) if ci + 1 < n else None
+
+                elif entry_mode == "reclaim":
+                    # Step 1 — candle closes through fib, start watching
+                    if c_watch is None:
+                        if st == "bull" and c_close < fib_entry:
+                            c_watch = ci
+                        elif st == "bear" and c_close > fib_entry:
+                            c_watch = ci
+                    else:
+                        # Step 2 — within 2 candles, close reclaims above/below fib
+                        if (ci - c_watch) <= 2:
+                            if st == "bull" and c_close > fib_entry:
+                                triggered = True
+                                entry_price = c_close   # enter at reclaim close
+                                c_watch = None
+                            elif st == "bear" and c_close < fib_entry:
+                                triggered = True
+                                entry_price = c_close
+                                c_watch = None
+                        else:
+                            c_watch = None  # window expired
+
+                if not triggered or entry_price is None:
+                    ci += 1
+                    continue
+
+                # ── STATE 4: IN TRADE ─────────────────────
+                if ci + 1 >= n:
+                    break
+
+                entry   = entry_price
+                sl_lvl  = p2 - (p2 * stop_buffer_pct) if st == "bull" else p2 + (p2 * stop_buffer_pct)
+                rpp     = abs(entry - sl_lvl)
+                if rpp <= 0:
+                    ci += 1; continue
+
+                tp  = entry + rpp * rr if st == "bull" else entry - rpp * rr
+                pos = (equity * risk_pct) / rpp
+
+                xc = xp = xr = None
+                for xi in range(ci + 2, min(ci + max_hold, n)):
+                    # Stop-first rule: check SL before TP on same candle
+                    if st == "bull":
+                        if lows[xi]  <= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
+                        if highs[xi] >= tp:      xp = tp;     xr = "TP"; xc = xi; break
+                    else:
+                        if highs[xi] >= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
+                        if lows[xi]  <= tp:      xp = tp;     xr = "TP"; xc = xi; break
+
+                if xc is None:
+                    # max_hold reached — close at last close
+                    xc = min(ci + max_hold, n - 1)
+                    xp = float(closes[xc])
+                    xr = "TIMEOUT"
+
+                pnl    = (xp - entry) * pos if st == "bull" else (entry - xp) * pos
+                equity += pnl
+                won     = xr == "TP"
+
+                direction_trades.append({
+                    "id":         0,
+                    "direction":  "LONG" if st == "bull" else "SHORT",
+                    "entry_time": timestamps[ci + 1] if ci + 1 < n else timestamps[ci],
+                    "exit_time":  timestamps[xc],
+                    "entry":      round(entry, 6),
+                    "sl":         round(sl_lvl, 6),
+                    "tp":         round(tp, 6),
+                    "exit_price": round(xp, 6),
+                    "result":     xr,
+                    "pnl":        round(pnl, 4),
+                    "equity":     round(equity, 4),
+                    "won":        won,
+                    "p1":         round(p1_price, 6),
+                    "p2":         round(p2, 6),
+                    "p3":         round(p3_float, 6),
+                    "fib_entry":  round(fib_entry, 6),
+                })
+
+                # Reset to STATE 1 — find new P1 after exit
+                state = 2
+                pending_p1 = None
+                c_watch    = None
+                # Find next P1 after trade exit
+                for p in pivots:
+                    if p["idx"] > xc:
+                        if st == "bull" and p["type"] == "H":
+                            p1_idx = p["idx"]; p1_price = p["price"]
+                            p2_candidate = float(min(lows[p1_idx:p1_idx+2]))
+                            ci = p1_idx + 1; break
+                        elif st == "bear" and p["type"] == "L":
+                            p1_idx = p["idx"]; p1_price = p["price"]
+                            p2_candidate = float(max(highs[p1_idx:p1_idx+2]))
+                            ci = p1_idx + 1; break
+                else:
+                    break
+                continue
+
+            ci += 1
+
+        return direction_trades
+
+    # Run both directions and merge chronologically
+    bull_trades = run_direction("bull")
+    bear_trades = run_direction("bear")
+    all_trades  = sorted(bull_trades + bear_trades, key=lambda t: t["entry_time"])
+
+    # Re-number and recalculate equity sequentially
+    equity = 100.0
+    for i, t in enumerate(all_trades):
+        t["id"] = i + 1
+
+    return all_trades
 
 # ── STATS ─────────────────────────────────────────────────
 def calc_stats(trades, days):
@@ -589,7 +706,8 @@ def process_request(req: BacktestRequest):
         days=(candles[-1][0]-candles[0][0])//(86400000)
 
         trades_fixed=run_backtest_core(candles, pivots, 0.02, req.rr, req.fib_level,
-                                        req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair)
+                                        req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
+                                        req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode)
         stats_fixed=calc_stats(trades_fixed, days)
 
         risk_pct=req.risk_pct
@@ -599,7 +717,8 @@ def process_request(req: BacktestRequest):
             risk_pct=max(stats_fixed["kelly_full"], 0.01)
 
         trades=run_backtest_core(candles, pivots, risk_pct, req.rr, req.fib_level,
-                                  req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair)
+                                  req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
+                                  req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode)
         stats=calc_stats(trades, days)
 
         if SUPABASE_URL and stats:
