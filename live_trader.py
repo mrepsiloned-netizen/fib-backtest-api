@@ -428,6 +428,16 @@ open_signals = {}  # key: symbol_timeframe
 pair_bias    = {}  # key: symbol_timeframe → "bull" | "bear" | None
 tp_anchors   = {}  # key: symbol_timeframe → N=1 anchor tracking after TP
 
+def set_leverage_all(bybit, leverage=10):
+    """Set leverage for all watchlist pairs on Bybit."""
+    for watch in WATCHLIST:
+        symbol = watch["symbol"]
+        try:
+            bybit.set_leverage(leverage, symbol, params={"buyLeverage": leverage, "sellLeverage": leverage})
+            print(f"Leverage set: {symbol} → {leverage}x")
+        except Exception as e:
+            print(f"Leverage set failed {symbol}: {e}")
+
 def run():
     global open_signals, pair_bias, tp_anchors
     print("💰 Fib Live Trader v1 starting...")
@@ -443,6 +453,9 @@ def run():
 
     print(f"Bybit balance: ${real_balance:.2f} USDT")
 
+    # Set leverage for all pairs
+    set_leverage_all(bybit, leverage=10)
+
     acc = init_account(real_balance)
 
     watchlist_str = "\n".join([f"• {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R — {w['label']}" for w in WATCHLIST])
@@ -450,6 +463,7 @@ def run():
 
 <b>Bybit Balance:</b> ${real_balance:.2f} USDT
 <b>Risk per trade:</b> {RISK_PCT*100:.0f}%
+<b>Leverage:</b> 10x (auto-set)
 
 <b>Watchlist:</b>
 {watchlist_str}
