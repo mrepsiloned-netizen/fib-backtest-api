@@ -25,10 +25,6 @@ SUPABASE_HEADERS = {
 }
 
 SCAN_INTERVALS = {
-    "1m":15,"5m":300,"15m":900,
-    "1h":3600,"4h":14400,"1d":86400,
-}
-SIGNAL_COOLDOWNS = {
     "1m":60,"5m":300,"15m":900,
     "1h":3600,"4h":14400,"1d":86400,
 }
@@ -36,13 +32,17 @@ SIGNAL_COOLDOWNS = {
 START_BALANCE = 100.0
 RISK_PCT      = 0.02
 FIB_LEVEL     = 0.618
-MAX_CONSEC_LOSSES = 10  # circuit breaker — stop bot after this many consecutive losses
 
 # ── WATCHLIST ─────────────────────────────────────────────
 WATCHLIST = [
-    {"symbol":"ETH/USDT","timeframe":"1m","pivot_n":8,"rr":2.0,"fib_level":0.618,"label":"⚡ ETH 1M"},
-    {"symbol":"XRP/USDT","timeframe":"1m","pivot_n":8,"rr":2.0,"fib_level":0.618,"label":"⚡ XRP 1M"},
-    {"symbol":"BTC/USDT","timeframe":"1m","pivot_n":8,"rr":1.5,"fib_level":0.618,"label":"⚡ BTC 1M"},
+    # Core 3 strategies — based on backtest results
+    {"symbol":"BTC/USDT","timeframe":"15m","pivot_n":5,"rr":2.0,"label":"🔵 Low Risk / Stable"},
+    {"symbol":"ETH/USDT","timeframe":"1h", "pivot_n":3,"rr":4.0,"label":"🟡 Mid Risk"},
+    {"symbol":"SOL/USDT","timeframe":"15m","pivot_n":3,"rr":4.0,"label":"🔴 High Risk"},
+    # 1M speed test — bot validation only
+    {"symbol":"XRP/USDT","timeframe":"1m", "pivot_n":3,"rr":2.0,"label":"⚡ 1M Speed Test"},
+    {"symbol":"BNB/USDT","timeframe":"1m", "pivot_n":3,"rr":2.0,"label":"⚡ 1M Speed Test"},
+    {"symbol":"INJ/USDT","timeframe":"1m", "pivot_n":3,"rr":2.0,"label":"⚡ 1M Speed Test"},
 ]
 
 # ── SUPABASE ──────────────────────────────────────────────
@@ -229,77 +229,128 @@ def find_pivots(candles, N):
     return deduped
 
 
-def detect_signal(candles, pivots, rr, fib_level=0.618):
+def detect_signal(candles, pivots, rr):
     """
-    Original v6 logic — P1→P2→P3 triplet pattern.
+    BOS-based Fibonacci pullback signal detection.
 
-    BEAR: P1(H) → P2(L) → P3(H) where P3 < P1 (lower high)
-          Fib drawn P1→P2, entry at fib_level retracement, SHORT
-    BULL: P1(L) → P2(H) → P3(L) where P3 > P1 (higher low)
-          Fib drawn P1→P2, entry at fib_level retracement, LONG
+    LONG:
+      P1 = most recent confirmed pivot HIGH
+      BOS = current candle close > P1 high (P3)
+      P3 - P1 >= N_MIN candles (duration filter)
+      P2 = min(close[P1:P3]) — lowest close between P1 and P3
+      Range filter: (P3_close - P2) / P2 > 0.003
+      Entry: current candle LOW <= fib618 AND close > fib618
+      Enter next candle open
+      SL = P2, TP = entry + (entry - SL) * RR
 
-    Uses candles[-2] (last closed candle) — ignores live candle[-1].
+    SHORT: mirror logic
     """
-    if len(candles) < 20 or len(pivots) < 3: return None
+    if len(candles) < 20 or len(pivots) < 1: return None
 
     highs  = np.array([c[2] for c in candles])
     lows   = np.array([c[3] for c in candles])
+    closes = np.array([c[4] for c in candles])
     n      = len(candles)
 
-    # Use last closed candle (ignore live)
-    c_high = highs[-2]
-    c_low  = lows[-2]
-    ci     = n - 2   # index of last closed candle
+    c_high  = highs[-1]
+    c_low   = lows[-1]
+    c_close = closes[-1]
+    N_MIN   = 3
+    MIN_RANGE = 0.003
 
-    # Scan pivot triplets — most recent first
-    for pi in range(len(pivots)-1, 1, -1):
-        p1, p2, p3 = pivots[pi-2], pivots[pi-1], pivots[pi]
+    for direction in ["bull", "bear"]:
+        # Find most recent P1
+        p1_candidates = [p for p in pivots if
+                        (direction=="bull" and p["type"]=="H") or
+                        (direction=="bear" and p["type"]=="L")]
+        if not p1_candidates: continue
+        p1 = p1_candidates[-1]
+        p1_idx = p1["idx"]
 
-        # P3 must be confirmed (its idx must be before last closed candle)
-        if p3["idx"] >= ci: continue
+        if direction == "bull":
+            p1_price = p1["price"]
+            # BOS: current close > P1 high
+            if c_close <= p1_price: continue
+            # Duration filter
+            bos_idx = n - 1
+            if bos_idx - p1_idx < N_MIN: continue
+            # P2 = min close between P1 and BOS
+            p2 = float(min(closes[p1_idx:bos_idx+1]))
+            rng = c_close - p2
+            if rng <= 0 or rng/p2 < MIN_RANGE: continue
+            fib618 = p2 + rng * FIB_LEVEL
+            sl     = p2
+            rpp    = abs(fib618 - sl)
+            if rpp <= 0: continue
+            tp     = fib618 + rpp * rr
+            # Entry trigger: wick touches fib618, closes above
+            if c_low <= fib618 and c_close > fib618:
+                return {
+                    "structure":"bull","direction":"LONG",
+                    "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
+                    "p1":round(p1_price,6),"p2":round(p2,6),
+                    "current":round(c_close,6),"rr":rr
+                }
 
-        # Identify structure
-        st = None
-        if (p1["type"]=="H" and p2["type"]=="L" and
-            p3["type"]=="H" and p3["price"] < p1["price"]):
-            st = "bear"
-        elif (p1["type"]=="L" and p2["type"]=="H" and
-              p3["type"]=="L" and p3["price"] > p1["price"]):
-            st = "bull"
-        if not st: continue
+        else:  # bear
+            p1_price = p1["price"]
+            # BOS: current close < P1 low
+            if c_close >= p1_price: continue
+            bos_idx = n - 1
+            if bos_idx - p1_idx < N_MIN: continue
+            # P2 = max close between P1 and BOS
+            p2 = float(max(closes[p1_idx:bos_idx+1]))
+            rng = p2 - c_close
+            if rng <= 0 or rng/p2 < MIN_RANGE: continue
+            fib618 = p2 - rng * FIB_LEVEL
+            sl     = p2
+            rpp    = abs(fib618 - sl)
+            if rpp <= 0: continue
+            tp     = fib618 - rpp * rr
+            # Entry trigger: wick touches fib618, closes below
+            if c_high >= fib618 and c_close < fib618:
+                return {
+                    "structure":"bear","direction":"SHORT",
+                    "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
+                    "p1":round(p1_price,6),"p2":round(p2,6),
+                    "current":round(c_close,6),"rr":rr
+                }
 
-        # Fib calculation
-        fh  = p1["price"] if st=="bear" else p2["price"]
-        fl  = p2["price"] if st=="bear" else p1["price"]
-        rng = fh - fl
-        if rng <= 0: continue
+    return None
+    p1,p2,p3=pivots[-3],pivots[-2],pivots[-1]
+    current=candles[-1][4]
+    n=len(candles)
 
-        fib_entry = fl + rng * fib_level if st=="bear" else fh - rng * fib_level
-        sl        = fh + rng * 0.02      if st=="bear" else fl - rng * 0.02
-        rpp       = abs(fib_entry - sl)
-        if rpp <= 0: continue
-        tp        = fib_entry - rpp * rr if st=="bear" else fib_entry + rpp * rr
+    structure=None
+    if p1["type"]=="H" and p2["type"]=="L" and p3["type"]=="H" and p3["price"]<p1["price"]: structure="bear"
+    elif p1["type"]=="L" and p2["type"]=="H" and p3["type"]=="L" and p3["price"]>p1["price"]: structure="bull"
+    if not structure: return None
 
-        # Check structure not invalidated (price hasn't broken P1)
-        if st == "bear" and c_high > fh: continue
-        if st == "bull" and c_low  < fl: continue
+    # Recency check — p3 must be within last 50 candles
+    if n-p3["idx"]>50: return None
 
-        # Entry: last closed candle's wick touches fib level
-        if st == "bear" and c_high >= fib_entry:
-            return {
-                "structure": "bear", "direction": "SHORT",
-                "entry": round(fib_entry, 6), "sl": round(sl, 6), "tp": round(tp, 6),
-                "p1": round(p1["price"], 6), "p2": round(p2["price"], 6),
-                "p3": round(p3["price"], 6), "current": round(c_high, 6), "rr": rr
-            }
-        if st == "bull" and c_low <= fib_entry:
-            return {
-                "structure": "bull", "direction": "LONG",
-                "entry": round(fib_entry, 6), "sl": round(sl, 6), "tp": round(tp, 6),
-                "p1": round(p1["price"], 6), "p2": round(p2["price"], 6),
-                "p3": round(p3["price"], 6), "current": round(c_low, 6), "rr": rr
-            }
+    fh=p1["price"] if structure=="bear" else p2["price"]
+    fl=p2["price"] if structure=="bear" else p1["price"]
+    rng=fh-fl
+    if rng<=0: return None
 
+    fib618=fl+rng*FIB_LEVEL if structure=="bear" else fh-rng*FIB_LEVEL
+    sl=fh+rng*0.02 if structure=="bear" else fl-rng*0.02
+    rpp=abs(fib618-sl)
+    if rpp<=0: return None
+    tp=fib618-rpp*rr if structure=="bear" else fib618+rpp*rr
+
+    # Structure invalidation check
+    if structure=="bear" and current>fh: return None
+    if structure=="bull" and current<fl: return None
+
+    zone_pct=abs(current-fib618)/fib618*100
+    if zone_pct<=0.5:
+        return {
+            "structure":structure,"direction":"SHORT" if structure=="bear" else "LONG",
+            "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
+            "current":round(current,6),"rr":rr,"zone_pct":round(zone_pct,3)
+        }
     return None
 
 # ── MAIN LOOP ─────────────────────────────────────────────
@@ -326,25 +377,13 @@ def run():
     last_signal = {}
     last_scan   = {}
     last_daily  = 0
-    last_heartbeat  = 0
-    consec_losses   = 0   # consecutive loss counter across all pairs
+    last_heartbeat = 0
 
     while True:
         try:
             now     = time.time()
             now_utc = datetime.now(timezone.utc)
             now_str = now_utc.strftime("%H:%M:%S")
-
-            # ── CIRCUIT BREAKER ───────────────────────────
-            if consec_losses >= MAX_CONSEC_LOSSES:
-                send_telegram(f"""🛑 <b>CIRCUIT BREAKER TRIGGERED</b>
-
-{consec_losses} consecutive losses across all pairs.
-Bot has stopped scanning. Manual restart required.
-
-Review strategy before resuming.""")
-                print(f"[{now_str}] 🛑 Circuit breaker triggered — {consec_losses} consecutive losses. Bot stopped.")
-                break
 
             # Daily summary at 8AM UTC
             if now_utc.hour==8 and now_utc.minute<1 and now-last_daily>3600:
@@ -365,13 +404,11 @@ Review strategy before resuming.""")
                 timeframe = watch["timeframe"]
                 pivot_n   = watch["pivot_n"]
                 rr        = watch["rr"]
-                label      = watch["label"]
-                fib_level  = watch.get("fib_level", 0.618)
-                key            = f"{symbol}_{timeframe}"  # one per pair+timeframe
-                scan_interval  = SCAN_INTERVALS.get(timeframe, 60)
-                sig_cooldown   = SIGNAL_COOLDOWNS.get(timeframe, 1800)
+                label     = watch["label"]
+                key       = f"{symbol}_{timeframe}"  # one per pair+timeframe
+                interval  = SCAN_INTERVALS.get(timeframe, 1800)
 
-                if now-last_scan.get(key,0)<scan_interval: continue
+                if now-last_scan.get(key,0)<interval: continue
                 last_scan[key]=now
 
                 try:
@@ -379,7 +416,7 @@ Review strategy before resuming.""")
                     if not candles or len(candles)<50: continue
 
                     pivots = find_pivots(candles, pivot_n)
-                    signal = detect_signal(candles, pivots, rr, fib_level)
+                    signal = detect_signal(candles, pivots, rr)
 
                     # N=1 anchor tracking after TP — use candle high/low
                     if key in tp_anchors and key not in open_signals:
@@ -436,11 +473,11 @@ Review strategy before resuming.""")
                         signal = None
 
                     if signal and key not in open_signals:
-                        if now-last_signal.get(key,0)>sig_cooldown:
+                        if now-last_signal.get(key,0)>interval:
                             acc = init_account()
                             send_entry(symbol, timeframe, signal, label, acc)
                             last_signal[key]=now
-                            open_signals[key]={**signal,"symbol":symbol,"timeframe":timeframe,"label":label,"entry_time":now,"entry_balance":acc["balance"]}
+                            open_signals[key]={**signal,"symbol":symbol,"timeframe":timeframe,"label":label,"entry_time":now}
                             print(f"[{now_str}] ✅ ENTRY: {symbol} {timeframe} {signal['direction']} {label}")
                     else:
                         print(f"[{now_str}] No signal: {symbol} {timeframe} N={pivot_n} {rr}R")
@@ -495,24 +532,24 @@ Review strategy before resuming.""")
 
                         # After TP: set N=1 anchor state so next scan finds next HH/LL
                         if won:
-                            pair_bias[key] = None
+                            pair_bias[key] = None  # reset bias — stay same direction
+                            # Use P2 of the completed trade as anchor base
+                            # For bull: track new HH from TP level upward
+                            # For bear: track new LL from TP level downward
                             anchor_price = exit_price
                             tp_anchors[key] = {
-                                "direction": sig["structure"],
+                                "direction": sig["structure"],  # bull or bear
                                 "from_price": sig["p2"] if "p2" in sig else anchor_price,
                                 "candidate":  anchor_price,
                                 "candles_since": 0
                             }
-                            consec_losses = 0  # reset on win
                             print(f"[{now_str}] TP hit — watching for next N=1 anchor from ${anchor_price:.4f}: {sig['symbol']} {sig['timeframe']}")
                         else:
+                            # SL hit: flip bias
                             flipped = "bull" if sig["structure"]=="bear" else "bear"
                             pair_bias[key] = flipped
                             if key in tp_anchors: del tp_anchors[key]
-                            consec_losses += 1  # increment on loss
-                            print(f"[{now_str}] SL hit — bias flipped to {flipped}: {sig['symbol']} {sig['timeframe']} (consec losses: {consec_losses}/{MAX_CONSEC_LOSSES})")
-                            if consec_losses >= MAX_CONSEC_LOSSES:
-                                send_telegram(f"🚨 <b>WARNING</b> — {consec_losses} consecutive losses. Circuit breaker will trigger next loop.")
+                            print(f"[{now_str}] SL hit — bias flipped to {flipped}: {sig['symbol']} {sig['timeframe']}")
 
                 except Exception as e:
                     print(f"Check error {key}: {e}")
