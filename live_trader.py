@@ -40,9 +40,9 @@ MODE      = "LIVE"  # change to "PAPER" to revert to paper mode
 
 # ── WATCHLIST — Single primary strategy ────
 WATCHLIST = [
-    {"symbol":"SOL/USDT","timeframe":"1m","pivot_n":3,"rr":1.5,"label":"⚡ SOL 1M"},
-    {"symbol":"BTC/USDT","timeframe":"1m","pivot_n":3,"rr":2.0,"label":"⚡ BTC 1M"},
-    {"symbol":"XRP/USDT","timeframe":"1m","pivot_n":5,"rr":1.5,"label":"⚡ XRP 1M"},
+    {"symbol":"ETH/USDT","timeframe":"1m","pivot_n":8,"rr":2.0,"fib_level":0.618,"label":"⚡ ETH 1M"},
+    {"symbol":"XRP/USDT","timeframe":"1m","pivot_n":8,"rr":2.0,"fib_level":0.618,"label":"⚡ XRP 1M"},
+    {"symbol":"BTC/USDT","timeframe":"1m","pivot_n":8,"rr":1.5,"fib_level":0.618,"label":"⚡ BTC 1M"},
 ]
 
 # ── SUPABASE ──────────────────────────────────────────────
@@ -304,89 +304,72 @@ def find_pivots(candles, N):
     return deduped
 
 
-def detect_signal(candles, pivots, rr):
+def detect_signal(candles, pivots, rr, fib_level=0.618):
     """
-    BOS-based Fibonacci pullback signal detection.
+    Original v6 logic — P1→P2→P3 triplet pattern.
 
-    BEAR: P1(L) → P2(H) → P3(L, BOS below P1) → pullback to 61.8% → SHORT
-    BULL: P1(H) → P2(L) → P3(H, BOS above P1) → pullback to 61.8% → LONG
+    BEAR: P1(H) → P2(L) → P3(H) where P3 < P1 (lower high)
+          Fib drawn P1→P2, entry at fib_level retracement, SHORT
+    BULL: P1(L) → P2(H) → P3(L) where P3 > P1 (higher low)
+          Fib drawn P1→P2, entry at fib_level retracement, LONG
 
-    Key fix: exclude pivots within MIN_AGE candles of current — prevents P3
-    from being picked as P1 once it gets confirmed by find_pivots.
+    Uses candles[-2] (last closed candle) — ignores live candle[-1].
     """
-    if len(candles) < 20 or len(pivots) < 1: return None
+    if len(candles) < 20 or len(pivots) < 3: return None
 
-    highs  = np.array([c[2] for c in candles])
-    lows   = np.array([c[3] for c in candles])
-    closes = np.array([c[4] for c in candles])
-    n      = len(candles)
+    highs = np.array([c[2] for c in candles])
+    lows  = np.array([c[3] for c in candles])
+    n     = len(candles)
 
-    c_high  = highs[-1]
-    c_low   = lows[-1]
-    c_close = closes[-1]
-    MIN_RANGE  = 0.002
-    MIN_AGE = 4
+    # Use last closed candle (ignore live)
+    c_high = highs[-2]
+    c_low  = lows[-2]
+    ci     = n - 2
 
-    for direction in ["bull", "bear"]:
-        p1_candidates = [p for p in pivots if
-                        ((direction=="bull" and p["type"]=="H") or
-                         (direction=="bear" and p["type"]=="L"))
-                        and (n - 1 - p["idx"]) >= MIN_AGE]
-        if not p1_candidates: continue
-        p1     = p1_candidates[-1]
-        p1_idx = p1["idx"]
+    # Scan pivot triplets — most recent first
+    for pi in range(len(pivots)-1, 1, -1):
+        p1, p2, p3 = pivots[pi-2], pivots[pi-1], pivots[pi]
 
-        if direction == "bull":
-            p1_price = p1["price"]
-            if c_close <= p1_price: continue
-            p2 = float(min(lows[p1_idx:n]))
-            rng = c_close - p2
-            if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: continue
-            fib618 = p2 + rng * FIB_LEVEL
-            sl     = p2
-            rpp    = abs(fib618 - sl)
-            if rpp <= 0: continue
-            tp = fib618 + rpp * rr
-            if c_low <= fib618 and c_close > fib618:
-                return {
-                    "structure": "bull", "direction": "LONG",
-                    "entry": round(fib618, 6), "sl": round(sl, 6), "tp": round(tp, 6),
-                    "p1": round(p1_price, 6), "p2": round(p2, 6),
-                    "current": round(c_close, 6), "rr": rr
-                }
+        if p3["idx"] >= ci: continue
 
-        else:  # bear
-            p1_price = p1["price"]
-            if c_close >= p1_price: continue
-            p2 = float(max(highs[p1_idx:n]))
-            rng = p2 - c_close
-            if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: continue
-            fib618 = p2 - rng * FIB_LEVEL
-            sl     = p2
-            rpp    = abs(fib618 - sl)
-            if rpp <= 0: continue
-            tp = fib618 - rpp * rr
-            if c_high >= fib618 and c_close < fib618:
-                return {
-                    "structure": "bear", "direction": "SHORT",
-                    "entry": round(fib618, 6), "sl": round(sl, 6), "tp": round(tp, 6),
-                    "p1": round(p1_price, 6), "p2": round(p2, 6),
-                    "current": round(c_close, 6), "rr": rr
-                }
+        st = None
+        if (p1["type"]=="H" and p2["type"]=="L" and
+            p3["type"]=="H" and p3["price"] < p1["price"]):
+            st = "bear"
+        elif (p1["type"]=="L" and p2["type"]=="H" and
+              p3["type"]=="L" and p3["price"] > p1["price"]):
+            st = "bull"
+        if not st: continue
 
-    return None
+        fh  = p1["price"] if st=="bear" else p2["price"]
+        fl  = p2["price"] if st=="bear" else p1["price"]
+        rng = fh - fl
+        if rng <= 0: continue
 
-    # Structure invalidation check
-    if structure=="bear" and current>fh: return None
-    if structure=="bull" and current<fl: return None
+        fib_entry = fl + rng * fib_level if st=="bear" else fh - rng * fib_level
+        sl        = fh + rng * 0.02      if st=="bear" else fl - rng * 0.02
+        rpp       = abs(fib_entry - sl)
+        if rpp <= 0: continue
+        tp        = fib_entry - rpp * rr if st=="bear" else fib_entry + rpp * rr
 
-    zone_pct=abs(current-fib618)/fib618*100
-    if zone_pct<=0.5:
-        return {
-            "structure":structure,"direction":"SHORT" if structure=="bear" else "LONG",
-            "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
-            "current":round(current,6),"rr":rr,"zone_pct":round(zone_pct,3)
-        }
+        if st == "bear" and c_high > fh: continue
+        if st == "bull" and c_low  < fl: continue
+
+        if st == "bear" and c_high >= fib_entry:
+            return {
+                "structure": "bear", "direction": "SHORT",
+                "entry": round(fib_entry, 6), "sl": round(sl, 6), "tp": round(tp, 6),
+                "p1": round(p1["price"], 6), "p2": round(p2["price"], 6),
+                "p3": round(p3["price"], 6), "current": round(c_high, 6), "rr": rr
+            }
+        if st == "bull" and c_low <= fib_entry:
+            return {
+                "structure": "bull", "direction": "LONG",
+                "entry": round(fib_entry, 6), "sl": round(sl, 6), "tp": round(tp, 6),
+                "p1": round(p1["price"], 6), "p2": round(p2["price"], 6),
+                "p3": round(p3["price"], 6), "current": round(c_low, 6), "rr": rr
+            }
+
     return None
 
 # ── MAIN LOOP ─────────────────────────────────────────────
@@ -462,6 +445,7 @@ def run():
                 pivot_n   = watch["pivot_n"]
                 rr        = watch["rr"]
                 label     = watch["label"]
+                fib_level = watch.get("fib_level", 0.618)
                 key            = f"{symbol}_{timeframe}"
                 scan_interval  = SCAN_INTERVALS.get(timeframe, 60)
                 sig_cooldown   = SIGNAL_COOLDOWNS.get(timeframe, 1800)
@@ -474,7 +458,7 @@ def run():
                     if not candles or len(candles)<50: continue
 
                     pivots = find_pivots(candles, pivot_n)
-                    signal = detect_signal(candles, pivots, rr)
+                    signal = detect_signal(candles, pivots, rr, fib_level)
 
                     # N=1 anchor tracking after TP — use candle high/low
                     if key in tp_anchors and key not in open_signals:
