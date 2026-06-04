@@ -229,7 +229,7 @@ def get_bybit_balance(bybit):
         print(f"Balance fetch error: {e}")
         return None
 
-def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance, leverage=10):
+def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance, leverage=100):
     """Place limit order on Bybit with SL and TP"""
     try:
         risk_amt = balance * risk_pct
@@ -438,12 +438,12 @@ open_signals = {}  # key: symbol_timeframe
 pair_bias    = {}  # key: symbol_timeframe → "bull" | "bear" | None
 tp_anchors   = {}  # key: symbol_timeframe → N=1 anchor tracking after TP
 
-def set_leverage_all(bybit, leverage=10):
+def set_leverage_all(bybit, leverage=100):
     """Set leverage for all watchlist pairs on Bybit."""
     for watch in WATCHLIST:
         symbol = watch["symbol"]
         try:
-            bybit.set_leverage(leverage, symbol, params={"buyLeverage": leverage, "sellLeverage": leverage})
+            bybit.set_leverage(leverage, symbol, params={"buyLeverage": str(leverage), "sellLeverage": str(leverage)})
             print(f"Leverage set: {symbol} → {leverage}x")
         except Exception as e:
             print(f"Leverage set failed {symbol}: {e}")
@@ -464,7 +464,7 @@ def run():
     print(f"Bybit balance: ${real_balance:.2f} USDT")
 
     # Set leverage for all pairs
-    set_leverage_all(bybit, leverage=10)
+    set_leverage_all(bybit, leverage=100)
 
     acc = init_account(real_balance)
 
@@ -473,7 +473,7 @@ def run():
 
 <b>Bybit Balance:</b> ${real_balance:.2f} USDT
 <b>Risk per trade:</b> {RISK_PCT*100:.0f}%
-<b>Leverage:</b> 10x (auto-set)
+<b>Leverage:</b> 100x (auto-set)
 
 <b>Watchlist:</b>
 {watchlist_str}
@@ -601,7 +601,7 @@ Check open positions on Bybit and close manually if needed.""")
                             order = place_limit_order(
                                 bybit, symbol, signal["direction"],
                                 signal["entry"], signal["sl"], signal["tp"],
-                                RISK_PCT, real_balance, leverage=10
+                                RISK_PCT, real_balance, leverage=100
                             )
 
                             if order:
