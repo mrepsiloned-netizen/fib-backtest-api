@@ -26,19 +26,24 @@ SUPABASE_HEADERS = {
 }
 
 SCAN_INTERVALS = {
+    "1m":15,"5m":300,"15m":900,
+    "1h":3600,"4h":14400,"1d":86400,
+}
+SIGNAL_COOLDOWNS = {
     "1m":60,"5m":300,"15m":900,
     "1h":3600,"4h":14400,"1d":86400,
 }
 
 RISK_PCT  = 0.02   # 2% risk per trade
 FIB_LEVEL = 0.618
+MAX_CONSEC_LOSSES = 10  # circuit breaker — stop bot after this many consecutive losses
 MODE      = "LIVE"  # change to "PAPER" to revert to paper mode
 
-# ── WATCHLIST — Core 3 only, no 1M speed test for live ────
+# ── WATCHLIST — Single primary strategy ────
 WATCHLIST = [
-    {"symbol":"BTC/USDT","timeframe":"15m","pivot_n":5,"rr":2.0,"label":"🔵 Low Risk / Stable"},
-    {"symbol":"ETH/USDT","timeframe":"1h", "pivot_n":3,"rr":4.0,"label":"🟡 Mid Risk"},
-    {"symbol":"SOL/USDT","timeframe":"15m","pivot_n":3,"rr":4.0,"label":"🔴 High Risk"},
+    {"symbol":"ETH/USDT","timeframe":"1m","pivot_n":8,"rr":2.0,"fib_level":0.618,"label":"⚡ ETH 1M"},
+    {"symbol":"XRP/USDT","timeframe":"1m","pivot_n":8,"rr":2.0,"fib_level":0.618,"label":"⚡ XRP 1M"},
+    {"symbol":"BTC/USDT","timeframe":"1m","pivot_n":8,"rr":1.5,"fib_level":0.618,"label":"⚡ BTC 1M"},
 ]
 
 # ── SUPABASE ──────────────────────────────────────────────
@@ -224,29 +229,88 @@ def get_bybit_balance(bybit):
         print(f"Balance fetch error: {e}")
         return None
 
-def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance):
-    """Place limit order on Bybit with SL and TP"""
+def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance, leverage=100):
+    """Place limit order on Bybit UTA with SL and TP."""
     try:
         risk_amt = balance * risk_pct
         risk_pp  = abs(entry - sl)
         if risk_pp <= 0: return None
-        qty = round(risk_amt / risk_pp, 6)
 
+        # Symbol-specific precision
+        MIN_QTY = {
+            "ETH/USDT": 0.01,  "BTC/USDT": 0.001,
+            "XRP/USDT": 1.0,   "SOL/USDT": 0.1,
+            "BNB/USDT": 0.01,  "INJ/USDT": 0.1,
+        }
+        QTY_PRECISION = {
+            "ETH/USDT": 2,  "BTC/USDT": 3,
+            "XRP/USDT": 0,  "SOL/USDT": 1,
+            "BNB/USDT": 2,  "INJ/USDT": 1,
+        }
+        PRICE_PRECISION = {
+            "ETH/USDT": 2,  "BTC/USDT": 1,
+            "XRP/USDT": 4,  "SOL/USDT": 2,
+            "BNB/USDT": 2,  "INJ/USDT": 3,
+        }
+
+        min_qty  = MIN_QTY.get(symbol, 0.01)
+        qty_prec = QTY_PRECISION.get(symbol, 2)
+        px_prec  = PRICE_PRECISION.get(symbol, 2)
+
+        # UTA initial margin = notional / leverage
+        # Keep position small — use 10% of balance max per trade at 100x
+        # This ensures initial margin stays well within available balance
+        max_notional = balance * leverage * 0.05  # only 5% of buying power
+        qty_from_risk   = risk_amt / risk_pp
+        qty_from_margin = max_notional / entry
+        qty_raw = min(qty_from_risk, qty_from_margin)
+        qty     = max(round(qty_raw, qty_prec), min_qty)
+
+        # Enforce $5 minimum notional
+        notional = qty * entry
+        if notional < 5.0:
+            qty      = max(round(5.0 / entry, qty_prec), min_qty)
+            notional = qty * entry
+
+        margin = notional / leverage
+        print(f"Order sizing: risk_amt=${risk_amt:.2f} qty={qty} notional=${notional:.2f} margin=${margin:.2f} leverage={leverage}x")
+
+        # Round prices
+        entry_r = round(entry, px_prec)
+        sl_r    = round(sl,    px_prec)
+        tp_r    = round(tp,    px_prec)
+
+        # Price validation
         side = "buy" if direction == "LONG" else "sell"
+        if direction == "SHORT":
+            if tp_r >= entry_r:
+                print(f"TP invalid for SHORT: tp={tp_r} >= entry={entry_r}"); return None
+            if sl_r <= entry_r:
+                print(f"SL invalid for SHORT: sl={sl_r} <= entry={entry_r}"); return None
+        else:
+            if tp_r <= entry_r:
+                print(f"TP invalid for LONG: tp={tp_r} <= entry={entry_r}"); return None
+            if sl_r >= entry_r:
+                print(f"SL invalid for LONG: sl={sl_r} >= entry={entry_r}"); return None
 
-        # Place limit entry order
-        order = bybit.create_order(
-            symbol=symbol,
-            type="limit",
-            side=side,
-            amount=qty,
-            price=entry,
-            params={
-                "stopLoss":   {"triggerPrice": sl,  "type": "limit", "price": sl},
-                "takeProfit": {"triggerPrice": tp,  "type": "limit", "price": tp},
-            }
-        )
-        print(f"Order placed: {direction} {symbol} qty={qty} entry={entry} sl={sl} tp={tp}")
+        # UTA Bybit v5 order params
+        symbol_v5 = symbol.replace("/", "")
+        order = bybit.private_post_v5_order_create({
+            "category":         "linear",
+            "symbol":           symbol_v5,
+            "side":             "Buy" if direction == "LONG" else "Sell",
+            "orderType":        "Limit",
+            "qty":              str(qty),
+            "price":            str(entry_r),
+            "timeInForce":      "GTC",
+            "takeProfit":       str(tp_r),
+            "stopLoss":         str(sl_r),
+            "tpTriggerBy":      "LastPrice",
+            "slTriggerBy":      "LastPrice",
+            "reduceOnly":       False,
+            "closeOnTrigger":   False,
+        })
+        print(f"✅ Order placed: {direction} {symbol} qty={qty} entry={entry_r} sl={sl_r} tp={tp_r} margin=${margin:.2f}")
         return order
     except Exception as e:
         print(f"Order placement error: {e}")
@@ -300,134 +364,97 @@ def find_pivots(candles, N):
     return deduped
 
 
-def detect_signal(candles, pivots, rr):
+def detect_signal(candles, pivots, rr, fib_level=0.618):
     """
-    BOS-based Fibonacci pullback signal detection.
+    Original v6 logic — P1→P2→P3 triplet pattern.
 
-    LONG:
-      P1 = most recent confirmed pivot HIGH
-      BOS = current candle close > P1 high (P3)
-      P3 - P1 >= N_MIN candles (duration filter)
-      P2 = min(close[P1:P3]) — lowest close between P1 and P3
-      Range filter: (P3_close - P2) / P2 > 0.003
-      Entry: current candle LOW <= fib618 AND close > fib618
-      Enter next candle open
-      SL = P2, TP = entry + (entry - SL) * RR
+    BEAR: P1(H) → P2(L) → P3(H) where P3 < P1 (lower high)
+          Fib drawn P1→P2, entry at fib_level retracement, SHORT
+    BULL: P1(L) → P2(H) → P3(L) where P3 > P1 (higher low)
+          Fib drawn P1→P2, entry at fib_level retracement, LONG
 
-    SHORT: mirror logic
+    Uses candles[-2] (last closed candle) — ignores live candle[-1].
     """
-    if len(candles) < 20 or len(pivots) < 1: return None
+    if len(candles) < 20 or len(pivots) < 3: return None
 
-    highs  = np.array([c[2] for c in candles])
-    lows   = np.array([c[3] for c in candles])
-    closes = np.array([c[4] for c in candles])
-    n      = len(candles)
+    highs = np.array([c[2] for c in candles])
+    lows  = np.array([c[3] for c in candles])
+    n     = len(candles)
 
-    c_high  = highs[-1]
-    c_low   = lows[-1]
-    c_close = closes[-1]
-    N_MIN   = 3
-    MIN_RANGE = 0.003
+    # Use last closed candle (ignore live)
+    c_high = highs[-2]
+    c_low  = lows[-2]
+    ci     = n - 2
 
-    for direction in ["bull", "bear"]:
-        # Find most recent P1
-        p1_candidates = [p for p in pivots if
-                        (direction=="bull" and p["type"]=="H") or
-                        (direction=="bear" and p["type"]=="L")]
-        if not p1_candidates: continue
-        p1 = p1_candidates[-1]
-        p1_idx = p1["idx"]
+    # Scan pivot triplets — most recent first
+    for pi in range(len(pivots)-1, 1, -1):
+        p1, p2, p3 = pivots[pi-2], pivots[pi-1], pivots[pi]
 
-        if direction == "bull":
-            p1_price = p1["price"]
-            # BOS: current close > P1 high
-            if c_close <= p1_price: continue
-            # Duration filter
-            bos_idx = n - 1
-            if bos_idx - p1_idx < N_MIN: continue
-            # P2 = min close between P1 and BOS
-            p2 = float(min(closes[p1_idx:bos_idx+1]))
-            rng = c_close - p2
-            if rng <= 0 or rng/p2 < MIN_RANGE: continue
-            fib618 = p2 + rng * FIB_LEVEL
-            sl     = p2
-            rpp    = abs(fib618 - sl)
-            if rpp <= 0: continue
-            tp     = fib618 + rpp * rr
-            # Entry trigger: wick touches fib618, closes above
-            if c_low <= fib618 and c_close > fib618:
-                return {
-                    "structure":"bull","direction":"LONG",
-                    "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
-                    "p1":round(p1_price,6),"p2":round(p2,6),
-                    "current":round(c_close,6),"rr":rr
-                }
+        if p3["idx"] >= ci: continue
 
-        else:  # bear
-            p1_price = p1["price"]
-            # BOS: current close < P1 low
-            if c_close >= p1_price: continue
-            bos_idx = n - 1
-            if bos_idx - p1_idx < N_MIN: continue
-            # P2 = max close between P1 and BOS
-            p2 = float(max(closes[p1_idx:bos_idx+1]))
-            rng = p2 - c_close
-            if rng <= 0 or rng/p2 < MIN_RANGE: continue
-            fib618 = p2 - rng * FIB_LEVEL
-            sl     = p2
-            rpp    = abs(fib618 - sl)
-            if rpp <= 0: continue
-            tp     = fib618 - rpp * rr
-            # Entry trigger: wick touches fib618, closes below
-            if c_high >= fib618 and c_close < fib618:
-                return {
-                    "structure":"bear","direction":"SHORT",
-                    "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
-                    "p1":round(p1_price,6),"p2":round(p2,6),
-                    "current":round(c_close,6),"rr":rr
-                }
+        st = None
+        if (p1["type"]=="H" and p2["type"]=="L" and
+            p3["type"]=="H" and p3["price"] < p1["price"]):
+            st = "bear"
+        elif (p1["type"]=="L" and p2["type"]=="H" and
+              p3["type"]=="L" and p3["price"] > p1["price"]):
+            st = "bull"
+        if not st: continue
 
-    return None
-    p1,p2,p3=pivots[-3],pivots[-2],pivots[-1]
-    current=candles[-1][4]
-    n=len(candles)
+        fh  = p1["price"] if st=="bear" else p2["price"]
+        fl  = p2["price"] if st=="bear" else p1["price"]
+        rng = fh - fl
+        if rng <= 0: continue
 
-    structure=None
-    if p1["type"]=="H" and p2["type"]=="L" and p3["type"]=="H" and p3["price"]<p1["price"]: structure="bear"
-    elif p1["type"]=="L" and p2["type"]=="H" and p3["type"]=="L" and p3["price"]>p1["price"]: structure="bull"
-    if not structure: return None
+        fib_entry = fl + rng * fib_level if st=="bear" else fh - rng * fib_level
+        sl        = fh + rng * 0.02      if st=="bear" else fl - rng * 0.02
+        rpp       = abs(fib_entry - sl)
+        if rpp <= 0: continue
+        tp        = fib_entry - rpp * rr if st=="bear" else fib_entry + rpp * rr
 
-    # Recency check — p3 must be within last 50 candles
-    if n-p3["idx"]>50: return None
+        if st == "bear" and c_high > fh: continue
+        if st == "bull" and c_low  < fl: continue
 
-    fh=p1["price"] if structure=="bear" else p2["price"]
-    fl=p2["price"] if structure=="bear" else p1["price"]
-    rng=fh-fl
-    if rng<=0: return None
+        if st == "bear" and c_high >= fib_entry:
+            return {
+                "structure": "bear", "direction": "SHORT",
+                "entry": round(fib_entry, 6), "sl": round(sl, 6), "tp": round(tp, 6),
+                "p1": round(p1["price"], 6), "p2": round(p2["price"], 6),
+                "p3": round(p3["price"], 6), "current": round(c_high, 6), "rr": rr
+            }
+        if st == "bull" and c_low <= fib_entry:
+            return {
+                "structure": "bull", "direction": "LONG",
+                "entry": round(fib_entry, 6), "sl": round(sl, 6), "tp": round(tp, 6),
+                "p1": round(p1["price"], 6), "p2": round(p2["price"], 6),
+                "p3": round(p3["price"], 6), "current": round(c_low, 6), "rr": rr
+            }
 
-    fib618=fl+rng*FIB_LEVEL if structure=="bear" else fh-rng*FIB_LEVEL
-    sl=fh+rng*0.02 if structure=="bear" else fl-rng*0.02
-    rpp=abs(fib618-sl)
-    if rpp<=0: return None
-    tp=fib618-rpp*rr if structure=="bear" else fib618+rpp*rr
-
-    # Structure invalidation check
-    if structure=="bear" and current>fh: return None
-    if structure=="bull" and current<fl: return None
-
-    zone_pct=abs(current-fib618)/fib618*100
-    if zone_pct<=0.5:
-        return {
-            "structure":structure,"direction":"SHORT" if structure=="bear" else "LONG",
-            "entry":round(fib618,6),"sl":round(sl,6),"tp":round(tp,6),
-            "current":round(current,6),"rr":rr,"zone_pct":round(zone_pct,3)
-        }
     return None
 
 # ── MAIN LOOP ─────────────────────────────────────────────
 open_signals = {}  # key: symbol_timeframe
 pair_bias    = {}  # key: symbol_timeframe → "bull" | "bear" | None
 tp_anchors   = {}  # key: symbol_timeframe → N=1 anchor tracking after TP
+
+def set_leverage_all(bybit, leverage=100):
+    """Set leverage for all watchlist pairs - UTA compatible (no margin mode switch)."""
+    for watch in WATCHLIST:
+        symbol    = watch["symbol"]
+        symbol_v5 = symbol.replace("/", "")
+        lev_str   = str(leverage)
+        try:
+            bybit.private_post_v5_position_set_leverage({
+                "category":    "linear",
+                "symbol":      symbol_v5,
+                "buyLeverage": lev_str,
+                "sellLeverage":lev_str,
+            })
+            print(f"Leverage set: {symbol} → {leverage}x")
+        except Exception as e:
+            # UTA may already have leverage set — not a blocking error
+            print(f"Leverage note {symbol}: {e}")
+
 
 def run():
     global open_signals, pair_bias, tp_anchors
@@ -444,6 +471,9 @@ def run():
 
     print(f"Bybit balance: ${real_balance:.2f} USDT")
 
+    # Set leverage for all pairs
+    set_leverage_all(bybit, leverage=100)
+
     acc = init_account(real_balance)
 
     watchlist_str = "\n".join([f"• {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R — {w['label']}" for w in WATCHLIST])
@@ -451,6 +481,7 @@ def run():
 
 <b>Bybit Balance:</b> ${real_balance:.2f} USDT
 <b>Risk per trade:</b> {RISK_PCT*100:.0f}%
+<b>Leverage:</b> 100x (auto-set)
 
 <b>Watchlist:</b>
 {watchlist_str}
@@ -460,7 +491,8 @@ def run():
     last_signal    = {}
     last_scan      = {}
     last_daily     = 0
-    last_heartbeat = 0
+    last_heartbeat  = 0
+    consec_losses   = 0   # consecutive loss counter across all pairs
     bybit_fail_count = 0
 
     while True:
@@ -468,6 +500,18 @@ def run():
             now     = time.time()
             now_utc = datetime.now(timezone.utc)
             now_str = now_utc.strftime("%H:%M:%S")
+
+            # ── CIRCUIT BREAKER ───────────────────────────
+            if consec_losses >= MAX_CONSEC_LOSSES:
+                send_telegram(f"""🛑 <b>CIRCUIT BREAKER TRIGGERED</b> — LIVE
+
+{consec_losses} consecutive losses across all pairs.
+<b>Bot has stopped. No more orders will be placed.</b>
+Manual restart required after review.
+
+Check open positions on Bybit and close manually if needed.""")
+                print(f"[{now_str}] 🛑 Circuit breaker — {consec_losses} consecutive losses. Bot stopped.")
+                break
 
             # Daily summary at 8AM UTC
             if now_utc.hour==8 and now_utc.minute<1 and now-last_daily>3600:
@@ -497,10 +541,12 @@ def run():
                 pivot_n   = watch["pivot_n"]
                 rr        = watch["rr"]
                 label     = watch["label"]
-                key       = f"{symbol}_{timeframe}"
-                interval  = SCAN_INTERVALS.get(timeframe, 1800)
+                fib_level = watch.get("fib_level", 0.618)
+                key            = f"{symbol}_{timeframe}"
+                scan_interval  = SCAN_INTERVALS.get(timeframe, 60)
+                sig_cooldown   = SIGNAL_COOLDOWNS.get(timeframe, 1800)
 
-                if now-last_scan.get(key,0)<interval: continue
+                if now-last_scan.get(key,0)<scan_interval: continue
                 last_scan[key]=now
 
                 try:
@@ -508,7 +554,7 @@ def run():
                     if not candles or len(candles)<50: continue
 
                     pivots = find_pivots(candles, pivot_n)
-                    signal = detect_signal(candles, pivots, rr)
+                    signal = detect_signal(candles, pivots, rr, fib_level)
 
                     # N=1 anchor tracking after TP — use candle high/low
                     if key in tp_anchors and key not in open_signals:
@@ -552,7 +598,7 @@ def run():
                         signal = None
 
                     if signal and key not in open_signals:
-                        if now-last_signal.get(key,0)>interval:
+                        if now-last_signal.get(key,0)>sig_cooldown:
                             # Sync real balance before placing order
                             real_balance = get_bybit_balance(bybit)
                             if not real_balance:
@@ -563,7 +609,7 @@ def run():
                             order = place_limit_order(
                                 bybit, symbol, signal["direction"],
                                 signal["entry"], signal["sl"], signal["tp"],
-                                RISK_PCT, real_balance
+                                RISK_PCT, real_balance, leverage=100
                             )
 
                             if order:
@@ -665,12 +711,16 @@ def run():
                                     "candidate":  anchor_price,
                                     "candles_since": 0
                                 }
+                                consec_losses = 0  # reset on win
                                 print(f"[{now_str}] TP hit — watching for next N=1 anchor from ${anchor_price:.4f}: {symbol} {timeframe}")
                             else:
                                 flipped = "bull" if sig["structure"]=="bear" else "bear"
                                 pair_bias[key] = flipped
                                 if key in tp_anchors: del tp_anchors[key]
-                                print(f"[{now_str}] SL hit — bias flipped to {flipped}: {symbol} {timeframe}")
+                                consec_losses += 1  # increment on loss
+                                print(f"[{now_str}] SL hit — bias flipped to {flipped}: {symbol} {timeframe} (consec losses: {consec_losses}/{MAX_CONSEC_LOSSES})")
+                                if consec_losses >= MAX_CONSEC_LOSSES:
+                                    send_telegram(f"🚨 <b>WARNING — LIVE</b> — {consec_losses} consecutive losses. Circuit breaker will trigger.")
 
                 except Exception as e:
                     print(f"Monitor error {key}: {e}")
