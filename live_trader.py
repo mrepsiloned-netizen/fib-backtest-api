@@ -268,6 +268,11 @@ def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance
         qty     = max(round(qty_raw, qty_prec), min_qty)
 
         notional = qty * entry
+        # Bybit minimum notional value is $5 for linear perpetuals
+        if notional < 5.0:
+            qty = max(round(5.0 / entry, qty_prec), min_qty)
+            notional = qty * entry
+
         margin   = notional / leverage
 
         print(f"Order sizing: risk_amt=${risk_amt:.2f} qty={qty} notional=${notional:.2f} margin=${margin:.2f} leverage={leverage}x")
@@ -440,27 +445,34 @@ pair_bias    = {}  # key: symbol_timeframe → "bull" | "bear" | None
 tp_anchors   = {}  # key: symbol_timeframe → N=1 anchor tracking after TP
 
 def set_leverage_all(bybit, leverage=100):
-    """Set leverage and isolated margin for all watchlist pairs on Bybit."""
+    """Set isolated margin + leverage for all watchlist pairs using Bybit v5 API."""
     for watch in WATCHLIST:
-        symbol = watch["symbol"]
-        # Convert symbol format ETH/USDT → ETHUSDT for Bybit v5
-        symbol_v5 = symbol.replace("/", "")
+        symbol    = watch["symbol"]
+        symbol_v5 = symbol.replace("/", "")  # ETH/USDT → ETHUSDT
+        lev_str   = str(leverage)
         try:
+            # Step 1: Switch to isolated margin (tradeMode=1)
+            bybit.private_post_v5_position_switch_isolated({
+                "category":    "linear",
+                "symbol":      symbol_v5,
+                "tradeMode":   1,
+                "buyLeverage": lev_str,
+                "sellLeverage":lev_str,
+            })
+            print(f"Isolated margin set: {symbol}")
+        except Exception as e:
+            print(f"Switch isolated failed {symbol}: {e}")
+        try:
+            # Step 2: Set leverage
             bybit.private_post_v5_position_set_leverage({
-                "category": "linear",
-                "symbol": symbol_v5,
-                "buyLeverage": str(leverage),
-                "sellLeverage": str(leverage),
+                "category":    "linear",
+                "symbol":      symbol_v5,
+                "buyLeverage": lev_str,
+                "sellLeverage":lev_str,
             })
             print(f"Leverage set: {symbol} → {leverage}x")
         except Exception as e:
             print(f"Leverage set failed {symbol}: {e}")
-            # Fallback to ccxt method
-            try:
-                bybit.set_leverage(leverage, symbol)
-                print(f"Leverage set (fallback): {symbol} → {leverage}x")
-            except Exception as e2:
-                print(f"Leverage fallback failed {symbol}: {e2}")
 
 def run():
     global open_signals, pair_bias, tp_anchors
