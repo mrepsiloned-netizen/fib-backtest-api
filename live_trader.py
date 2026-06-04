@@ -229,15 +229,12 @@ def get_bybit_balance(bybit):
         print(f"Balance fetch error: {e}")
         return None
 
-def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance):
+def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance, leverage=10):
     """Place limit order on Bybit with SL and TP"""
     try:
         risk_amt = balance * risk_pct
         risk_pp  = abs(entry - sl)
         if risk_pp <= 0: return None
-
-        # Qty = risk amount / risk per unit
-        qty_raw = risk_amt / risk_pp
 
         # Symbol-specific minimum qty and precision
         MIN_QTY = {
@@ -256,38 +253,51 @@ def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance
             "BNB/USDT": 2,  "INJ/USDT": 3,
         }
 
-        min_qty   = MIN_QTY.get(symbol, 0.01)
-        qty_prec  = QTY_PRECISION.get(symbol, 2)
-        px_prec   = PRICE_PRECISION.get(symbol, 2)
+        min_qty  = MIN_QTY.get(symbol, 0.01)
+        qty_prec = QTY_PRECISION.get(symbol, 2)
+        px_prec  = PRICE_PRECISION.get(symbol, 2)
 
-        qty = max(round(qty_raw, qty_prec), min_qty)
+        # Qty based on risk amount and SL distance
+        qty_from_risk = risk_amt / risk_pp
 
-        # Check notional value (Bybit min ~$1 for most pairs)
+        # Cap qty so required margin (notional / leverage) <= balance * 0.95
+        max_notional = balance * leverage * 0.95   # 95% of leveraged buying power
+        qty_from_margin = max_notional / entry
+
+        qty_raw = min(qty_from_risk, qty_from_margin)
+        qty     = max(round(qty_raw, qty_prec), min_qty)
+
         notional = qty * entry
-        if notional < 1.0:
-            qty = round(1.0 / entry + min_qty, qty_prec)
+        margin   = notional / leverage
 
-        # Round prices to correct precision
+        print(f"Order sizing: risk_amt=${risk_amt:.2f} qty={qty} notional=${notional:.2f} margin=${margin:.2f} leverage={leverage}x")
+
+        # Safety check — margin must not exceed 90% of balance
+        if margin > balance * 0.90:
+            print(f"Margin ${margin:.2f} exceeds 90% of balance ${balance:.2f}, skipping")
+            send_telegram(f"⚠️ <b>ORDER SKIPPED</b> — {symbol}\nMargin required ${margin:.2f} > 90% of balance ${balance:.2f}")
+            return None
+
+        # Round prices
         entry_r = round(entry, px_prec)
         sl_r    = round(sl,    px_prec)
         tp_r    = round(tp,    px_prec)
 
-        # Bybit: TP for SHORT must be below entry, SL must be above
-        # Validate prices make sense
+        # Validate prices
         side = "buy" if direction == "LONG" else "sell"
         if direction == "SHORT":
             if tp_r >= entry_r:
-                print(f"TP price invalid for SHORT: tp={tp_r} >= entry={entry_r}, skipping")
+                print(f"TP invalid for SHORT: tp={tp_r} >= entry={entry_r}, skipping")
                 return None
             if sl_r <= entry_r:
-                print(f"SL price invalid for SHORT: sl={sl_r} <= entry={entry_r}, skipping")
+                print(f"SL invalid for SHORT: sl={sl_r} <= entry={entry_r}, skipping")
                 return None
         else:
             if tp_r <= entry_r:
-                print(f"TP price invalid for LONG: tp={tp_r} <= entry={entry_r}, skipping")
+                print(f"TP invalid for LONG: tp={tp_r} <= entry={entry_r}, skipping")
                 return None
             if sl_r >= entry_r:
-                print(f"SL price invalid for LONG: sl={sl_r} >= entry={entry_r}, skipping")
+                print(f"SL invalid for LONG: sl={sl_r} >= entry={entry_r}, skipping")
                 return None
 
         order = bybit.create_order(
@@ -301,7 +311,7 @@ def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance
                 "takeProfit": {"triggerPrice": tp_r, "type": "limit", "price": tp_r},
             }
         )
-        print(f"Order placed: {direction} {symbol} qty={qty} entry={entry_r} sl={sl_r} tp={tp_r} notional=${notional:.2f}")
+        print(f"✅ Order placed: {direction} {symbol} qty={qty} entry={entry_r} sl={sl_r} tp={tp_r} margin=${margin:.2f}")
         return order
     except Exception as e:
         print(f"Order placement error: {e}")
@@ -591,7 +601,7 @@ Check open positions on Bybit and close manually if needed.""")
                             order = place_limit_order(
                                 bybit, symbol, signal["direction"],
                                 signal["entry"], signal["sl"], signal["tp"],
-                                RISK_PCT, real_balance
+                                RISK_PCT, real_balance, leverage=10
                             )
 
                             if order:
