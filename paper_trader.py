@@ -36,6 +36,7 @@ SIGNAL_COOLDOWNS = {
 START_BALANCE = 100.0
 RISK_PCT      = 0.02
 FIB_LEVEL     = 0.618
+MAX_CONSEC_LOSSES = 10  # circuit breaker — stop bot after this many consecutive losses
 
 # ── WATCHLIST ─────────────────────────────────────────────
 WATCHLIST = [
@@ -325,13 +326,25 @@ def run():
     last_signal = {}
     last_scan   = {}
     last_daily  = 0
-    last_heartbeat = 0
+    last_heartbeat  = 0
+    consec_losses   = 0   # consecutive loss counter across all pairs
 
     while True:
         try:
             now     = time.time()
             now_utc = datetime.now(timezone.utc)
             now_str = now_utc.strftime("%H:%M:%S")
+
+            # ── CIRCUIT BREAKER ───────────────────────────
+            if consec_losses >= MAX_CONSEC_LOSSES:
+                send_telegram(f"""🛑 <b>CIRCUIT BREAKER TRIGGERED</b>
+
+{consec_losses} consecutive losses across all pairs.
+Bot has stopped scanning. Manual restart required.
+
+Review strategy before resuming.""")
+                print(f"[{now_str}] 🛑 Circuit breaker triggered — {consec_losses} consecutive losses. Bot stopped.")
+                break
 
             # Daily summary at 8AM UTC
             if now_utc.hour==8 and now_utc.minute<1 and now-last_daily>3600:
@@ -482,24 +495,24 @@ def run():
 
                         # After TP: set N=1 anchor state so next scan finds next HH/LL
                         if won:
-                            pair_bias[key] = None  # reset bias — stay same direction
-                            # Use P2 of the completed trade as anchor base
-                            # For bull: track new HH from TP level upward
-                            # For bear: track new LL from TP level downward
+                            pair_bias[key] = None
                             anchor_price = exit_price
                             tp_anchors[key] = {
-                                "direction": sig["structure"],  # bull or bear
+                                "direction": sig["structure"],
                                 "from_price": sig["p2"] if "p2" in sig else anchor_price,
                                 "candidate":  anchor_price,
                                 "candles_since": 0
                             }
+                            consec_losses = 0  # reset on win
                             print(f"[{now_str}] TP hit — watching for next N=1 anchor from ${anchor_price:.4f}: {sig['symbol']} {sig['timeframe']}")
                         else:
-                            # SL hit: flip bias
                             flipped = "bull" if sig["structure"]=="bear" else "bear"
                             pair_bias[key] = flipped
                             if key in tp_anchors: del tp_anchors[key]
-                            print(f"[{now_str}] SL hit — bias flipped to {flipped}: {sig['symbol']} {sig['timeframe']}")
+                            consec_losses += 1  # increment on loss
+                            print(f"[{now_str}] SL hit — bias flipped to {flipped}: {sig['symbol']} {sig['timeframe']} (consec losses: {consec_losses}/{MAX_CONSEC_LOSSES})")
+                            if consec_losses >= MAX_CONSEC_LOSSES:
+                                send_telegram(f"🚨 <b>WARNING</b> — {consec_losses} consecutive losses. Circuit breaker will trigger next loop.")
 
                 except Exception as e:
                     print(f"Check error {key}: {e}")
