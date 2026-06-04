@@ -443,21 +443,24 @@ def set_leverage_all(bybit, leverage=100):
     """Set leverage and isolated margin for all watchlist pairs on Bybit."""
     for watch in WATCHLIST:
         symbol = watch["symbol"]
+        # Convert symbol format ETH/USDT → ETHUSDT for Bybit v5
+        symbol_v5 = symbol.replace("/", "")
         try:
-            # Switch to isolated margin mode first
-            bybit.set_margin_mode("isolated", symbol, params={"leverage": leverage})
-            print(f"Margin mode set: {symbol} → isolated")
-        except Exception as e:
-            print(f"Margin mode set failed {symbol}: {e}")
-        try:
-            # Set leverage
-            bybit.set_leverage(leverage, symbol, params={
+            bybit.private_post_v5_position_set_leverage({
+                "category": "linear",
+                "symbol": symbol_v5,
                 "buyLeverage": str(leverage),
-                "sellLeverage": str(leverage)
+                "sellLeverage": str(leverage),
             })
             print(f"Leverage set: {symbol} → {leverage}x")
         except Exception as e:
             print(f"Leverage set failed {symbol}: {e}")
+            # Fallback to ccxt method
+            try:
+                bybit.set_leverage(leverage, symbol)
+                print(f"Leverage set (fallback): {symbol} → {leverage}x")
+            except Exception as e2:
+                print(f"Leverage fallback failed {symbol}: {e2}")
 
 def run():
     global open_signals, pair_bias, tp_anchors
