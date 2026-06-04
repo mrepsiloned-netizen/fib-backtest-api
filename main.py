@@ -922,6 +922,7 @@ def process_request(req: BacktestRequest):
                     "period":f"{req.start_date} → {req.end_date}",
                     "risk_method":req.risk_method,"risk_pct":req.risk_pct*100,
                     "pivot_n":req.pivot_n,"rr":req.rr,"fib_level":req.fib_level,
+                    "engine":req.engine,"entry_mode":req.entry_mode,
                     "stats":cached_stats,"equity_curve":[],"trades":[],
                 }
 
@@ -964,14 +965,16 @@ def process_request(req: BacktestRequest):
             "symbol":req.symbol,"timeframe":req.timeframe,
             "period":f"{req.start_date} → {req.end_date}",
             "risk_method":req.risk_method,"risk_pct":round(risk_pct*100,2),
-            "pivot_n":req.pivot_n,"rr":req.rr,"fib_level":req.fib_level,"stats":stats,
-            "equity_curve":eq_curve,"trades":trades[-50:],
+            "pivot_n":req.pivot_n,"rr":req.rr,"fib_level":req.fib_level,
+            "engine":req.engine,"entry_mode":req.entry_mode,
+            "stats":stats,"equity_curve":eq_curve,"trades":trades[-50:],
         }
     except Exception as e:
         return {
             "success":False,"error":str(e),
             "symbol":req.symbol,"timeframe":req.timeframe,
-            "risk_method":req.risk_method,"pivot_n":req.pivot_n,"rr":req.rr
+            "risk_method":req.risk_method,"pivot_n":req.pivot_n,"rr":req.rr,
+            "engine":req.engine,"entry_mode":req.entry_mode
         }
 
 # ── ROUTES ────────────────────────────────────────────────
