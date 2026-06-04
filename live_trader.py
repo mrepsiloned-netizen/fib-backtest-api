@@ -293,6 +293,9 @@ def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance
             if sl_r >= entry_r:
                 print(f"SL invalid for LONG: sl={sl_r} >= entry={entry_r}"); return None
 
+        # positionIdx: 0 = one-way mode (default for most accounts)
+        position_idx = 0
+
         # UTA Bybit v5 order params
         symbol_v5 = symbol.replace("/", "")
         order = bybit.private_post_v5_order_create({
@@ -309,6 +312,7 @@ def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance
             "slTriggerBy":      "LastPrice",
             "reduceOnly":       False,
             "closeOnTrigger":   False,
+            "positionIdx":      position_idx,
         })
         print(f"✅ Order placed: {direction} {symbol} qty={qty} entry={entry_r} sl={sl_r} tp={tp_r} margin=${margin:.2f}")
         return order
