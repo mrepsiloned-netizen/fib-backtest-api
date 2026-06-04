@@ -309,6 +309,7 @@ def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance
             params={
                 "stopLoss":   {"triggerPrice": sl_r, "type": "limit", "price": sl_r},
                 "takeProfit": {"triggerPrice": tp_r, "type": "limit", "price": tp_r},
+                "leverage":   str(leverage),
             }
         )
         print(f"✅ Order placed: {direction} {symbol} qty={qty} entry={entry_r} sl={sl_r} tp={tp_r} margin=${margin:.2f}")
@@ -439,11 +440,21 @@ pair_bias    = {}  # key: symbol_timeframe → "bull" | "bear" | None
 tp_anchors   = {}  # key: symbol_timeframe → N=1 anchor tracking after TP
 
 def set_leverage_all(bybit, leverage=100):
-    """Set leverage for all watchlist pairs on Bybit."""
+    """Set leverage and isolated margin for all watchlist pairs on Bybit."""
     for watch in WATCHLIST:
         symbol = watch["symbol"]
         try:
-            bybit.set_leverage(leverage, symbol, params={"buyLeverage": str(leverage), "sellLeverage": str(leverage)})
+            # Switch to isolated margin mode first
+            bybit.set_margin_mode("isolated", symbol, params={"leverage": leverage})
+            print(f"Margin mode set: {symbol} → isolated")
+        except Exception as e:
+            print(f"Margin mode set failed {symbol}: {e}")
+        try:
+            # Set leverage
+            bybit.set_leverage(leverage, symbol, params={
+                "buyLeverage": str(leverage),
+                "sellLeverage": str(leverage)
+            })
             print(f"Leverage set: {symbol} → {leverage}x")
         except Exception as e:
             print(f"Leverage set failed {symbol}: {e}")
