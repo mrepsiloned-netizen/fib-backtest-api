@@ -36,6 +36,7 @@ SIGNAL_COOLDOWNS = {
 
 RISK_PCT  = 0.02   # 2% risk per trade
 FIB_LEVEL = 0.618
+MAX_CONSEC_LOSSES = 10  # circuit breaker — stop bot after this many consecutive losses
 MODE      = "LIVE"  # change to "PAPER" to revert to paper mode
 
 # ── WATCHLIST — Single primary strategy ────
@@ -234,23 +235,73 @@ def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance
         risk_amt = balance * risk_pct
         risk_pp  = abs(entry - sl)
         if risk_pp <= 0: return None
-        qty = round(risk_amt / risk_pp, 6)
 
+        # Qty = risk amount / risk per unit
+        qty_raw = risk_amt / risk_pp
+
+        # Symbol-specific minimum qty and precision
+        MIN_QTY = {
+            "ETH/USDT": 0.01,  "BTC/USDT": 0.001,
+            "XRP/USDT": 1.0,   "SOL/USDT": 0.1,
+            "BNB/USDT": 0.01,  "INJ/USDT": 0.1,
+        }
+        QTY_PRECISION = {
+            "ETH/USDT": 2,  "BTC/USDT": 3,
+            "XRP/USDT": 0,  "SOL/USDT": 1,
+            "BNB/USDT": 2,  "INJ/USDT": 1,
+        }
+        PRICE_PRECISION = {
+            "ETH/USDT": 2,  "BTC/USDT": 1,
+            "XRP/USDT": 4,  "SOL/USDT": 2,
+            "BNB/USDT": 2,  "INJ/USDT": 3,
+        }
+
+        min_qty   = MIN_QTY.get(symbol, 0.01)
+        qty_prec  = QTY_PRECISION.get(symbol, 2)
+        px_prec   = PRICE_PRECISION.get(symbol, 2)
+
+        qty = max(round(qty_raw, qty_prec), min_qty)
+
+        # Check notional value (Bybit min ~$1 for most pairs)
+        notional = qty * entry
+        if notional < 1.0:
+            qty = round(1.0 / entry + min_qty, qty_prec)
+
+        # Round prices to correct precision
+        entry_r = round(entry, px_prec)
+        sl_r    = round(sl,    px_prec)
+        tp_r    = round(tp,    px_prec)
+
+        # Bybit: TP for SHORT must be below entry, SL must be above
+        # Validate prices make sense
         side = "buy" if direction == "LONG" else "sell"
+        if direction == "SHORT":
+            if tp_r >= entry_r:
+                print(f"TP price invalid for SHORT: tp={tp_r} >= entry={entry_r}, skipping")
+                return None
+            if sl_r <= entry_r:
+                print(f"SL price invalid for SHORT: sl={sl_r} <= entry={entry_r}, skipping")
+                return None
+        else:
+            if tp_r <= entry_r:
+                print(f"TP price invalid for LONG: tp={tp_r} <= entry={entry_r}, skipping")
+                return None
+            if sl_r >= entry_r:
+                print(f"SL price invalid for LONG: sl={sl_r} >= entry={entry_r}, skipping")
+                return None
 
-        # Place limit entry order
         order = bybit.create_order(
             symbol=symbol,
             type="limit",
             side=side,
             amount=qty,
-            price=entry,
+            price=entry_r,
             params={
-                "stopLoss":   {"triggerPrice": sl,  "type": "limit", "price": sl},
-                "takeProfit": {"triggerPrice": tp,  "type": "limit", "price": tp},
+                "stopLoss":   {"triggerPrice": sl_r, "type": "limit", "price": sl_r},
+                "takeProfit": {"triggerPrice": tp_r, "type": "limit", "price": tp_r},
             }
         )
-        print(f"Order placed: {direction} {symbol} qty={qty} entry={entry} sl={sl} tp={tp}")
+        print(f"Order placed: {direction} {symbol} qty={qty} entry={entry_r} sl={sl_r} tp={tp_r} notional=${notional:.2f}")
         return order
     except Exception as e:
         print(f"Order placement error: {e}")
@@ -408,7 +459,8 @@ def run():
     last_signal    = {}
     last_scan      = {}
     last_daily     = 0
-    last_heartbeat = 0
+    last_heartbeat  = 0
+    consec_losses   = 0   # consecutive loss counter across all pairs
     bybit_fail_count = 0
 
     while True:
@@ -416,6 +468,18 @@ def run():
             now     = time.time()
             now_utc = datetime.now(timezone.utc)
             now_str = now_utc.strftime("%H:%M:%S")
+
+            # ── CIRCUIT BREAKER ───────────────────────────
+            if consec_losses >= MAX_CONSEC_LOSSES:
+                send_telegram(f"""🛑 <b>CIRCUIT BREAKER TRIGGERED</b> — LIVE
+
+{consec_losses} consecutive losses across all pairs.
+<b>Bot has stopped. No more orders will be placed.</b>
+Manual restart required after review.
+
+Check open positions on Bybit and close manually if needed.""")
+                print(f"[{now_str}] 🛑 Circuit breaker — {consec_losses} consecutive losses. Bot stopped.")
+                break
 
             # Daily summary at 8AM UTC
             if now_utc.hour==8 and now_utc.minute<1 and now-last_daily>3600:
@@ -615,12 +679,16 @@ def run():
                                     "candidate":  anchor_price,
                                     "candles_since": 0
                                 }
+                                consec_losses = 0  # reset on win
                                 print(f"[{now_str}] TP hit — watching for next N=1 anchor from ${anchor_price:.4f}: {symbol} {timeframe}")
                             else:
                                 flipped = "bull" if sig["structure"]=="bear" else "bear"
                                 pair_bias[key] = flipped
                                 if key in tp_anchors: del tp_anchors[key]
-                                print(f"[{now_str}] SL hit — bias flipped to {flipped}: {symbol} {timeframe}")
+                                consec_losses += 1  # increment on loss
+                                print(f"[{now_str}] SL hit — bias flipped to {flipped}: {symbol} {timeframe} (consec losses: {consec_losses}/{MAX_CONSEC_LOSSES})")
+                                if consec_losses >= MAX_CONSEC_LOSSES:
+                                    send_telegram(f"🚨 <b>WARNING — LIVE</b> — {consec_losses} consecutive losses. Circuit breaker will trigger.")
 
                 except Exception as e:
                     print(f"Monitor error {key}: {e}")
