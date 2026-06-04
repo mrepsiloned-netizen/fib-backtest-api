@@ -49,6 +49,7 @@ class BacktestRequest(BaseModel):
     stop_buffer_pct: float = 0.001
     k_stale: int = 0
     entry_mode: str = "rejection"  # touch | rejection | reclaim
+    engine: str = "structure"      # classic | classic_v2 | structure
 
 class BatchRequest(BaseModel):
     configs: List[BacktestRequest]
@@ -60,6 +61,8 @@ class CompareRequest(BaseModel):
     risk_methods: List[str] = ["fixed"]
     rr_ratios: List[float] = [2.0, 3.0]
     fib_levels: List[float] = [0.618]
+    engines: List[str] = ["structure"]
+    entry_modes: List[str] = ["rejection"]
     period_a_start: str = "2025-01-01"
     period_a_end: str = "2026-01-01"
     period_b_start: str = "2026-01-01"
@@ -240,7 +243,7 @@ def find_pivots(highs, lows, N):
 
 
 # ── BACKTEST CORE ─────────────────────────────────────────
-def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection"):
+def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection", engine="structure"):
     """
     BOS-based Fibonacci pullback backtest — proper state machine.
 
@@ -633,12 +636,234 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
         return direction_trades
 
-    # Run both directions and merge chronologically
-    bull_trades = run_direction("bull")
-    bear_trades = run_direction("bear")
-    all_trades  = sorted(bull_trades + bear_trades, key=lambda t: t["entry_time"])
+    # ── CLASSIC ENGINE ─────────────────────────────────────
+    def run_classic(v2=False):
+        """
+        Classic engine: P1 = confirmed pivot, P3 = first close beyond P1 (fixed),
+        P2 = min/max close between P1 and P3, fib static.
+        v2 adds: re-base on new pivot above P3, k_stale cancel.
+        """
+        nonlocal equity
+        trades_out = []
+        MIN_RANGE  = min_swing_pct
+        N_min      = 3
 
-    # Re-number and recalculate equity sequentially
+        highs_  = np.array([c[2] for c in candles])
+        lows_   = np.array([c[3] for c in candles])
+        closes_ = np.array([c[4] for c in candles])
+        opens_  = np.array([c[1] for c in candles])
+
+        pivot_highs_ = {p["idx"]: p["price"] for p in pivots if p["type"] == "H"}
+        pivot_lows_  = {p["idx"]: p["price"] for p in pivots if p["type"] == "L"}
+
+        def build_setups():
+            setups = []
+            # LONG: pivot HIGH → first close above = P3
+            for p1 in [p for p in pivots if p["type"] == "H"]:
+                p1_idx = p1["idx"]; p1_price = p1["price"]
+                for ci in range(p1_idx + 1, n - 1):
+                    if closes_[ci] > p1_price:
+                        if ci - p1_idx < N_min: break
+                        p3_idx = ci; p3_close = closes_[ci]
+                        p2 = float(min(closes_[p1_idx:p3_idx + 1]))
+                        rng = p3_close - p2
+                        if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: break
+                        setups.append({"st":"bull","p1_idx":p1_idx,"p1_price":p1_price,
+                            "p2":p2,"p3_idx":p3_idx,"p3_close":p3_close,
+                            "rng":rng,"fib618":p2 + rng * fib_level,"sl":p2})
+                        break
+                    if lows_[ci] < p1_price * 0.90: break
+            # SHORT: pivot LOW → first close below = P3
+            for p1 in [p for p in pivots if p["type"] == "L"]:
+                p1_idx = p1["idx"]; p1_price = p1["price"]
+                for ci in range(p1_idx + 1, n - 1):
+                    if closes_[ci] < p1_price:
+                        if ci - p1_idx < N_min: break
+                        p3_idx = ci; p3_close = closes_[ci]
+                        p2 = float(max(closes_[p1_idx:p3_idx + 1]))
+                        rng = p2 - p3_close
+                        if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: break
+                        setups.append({"st":"bear","p1_idx":p1_idx,"p1_price":p1_price,
+                            "p2":p2,"p3_idx":p3_idx,"p3_close":p3_close,
+                            "rng":rng,"fib618":p2 - rng * fib_level,"sl":p2})
+                        break
+                    if highs_[ci] > p1_price * 1.10: break
+            setups.sort(key=lambda x: x["p3_idx"])
+            return setups
+
+        all_setups   = build_setups()
+        setup_idx    = 0
+        active       = None
+        last_p3_idx  = -1
+        ci           = 1
+
+        while ci < n - 1:
+            # Load next setup if none active
+            if active is None:
+                while setup_idx < len(all_setups):
+                    s = all_setups[setup_idx]; setup_idx += 1
+                    if s["p3_idx"] <= last_p3_idx: continue
+                    active = s
+                    ci = s["p3_idx"] + 1
+                    break
+                if active is None: break
+
+            st     = active["st"]
+            fib618 = active["fib618"]
+            sl_lvl = active["sl"]
+            p2     = active["p2"]
+            p3_idx = active["p3_idx"]
+            p1_idx = active["p1_idx"]
+            p1_price = active["p1_price"]
+
+            if ci >= n - 1: break
+
+            c_low   = lows_[ci]
+            c_high  = highs_[ci]
+            c_close = closes_[ci]
+
+            # ── classic_v2 additions ──────────────────────
+            if v2:
+                # 1. K stale cancel
+                if k_stale > 0 and (ci - p3_idx) > k_stale:
+                    active = None; ci += 1; continue
+
+                # 2. New confirmed pivot above P3 → re-base
+                if st == "bull" and ci in pivot_highs_:
+                    new_ph = pivot_highs_[ci]
+                    if new_ph > active["p3_close"]:
+                        new_p2  = float(min(closes_[p3_idx:ci + 1]))
+                        new_rng = new_ph - new_p2
+                        if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
+                            active["p2"]      = new_p2
+                            active["p3_idx"]  = ci
+                            active["p3_close"]= new_ph
+                            active["rng"]     = new_rng
+                            active["fib618"]  = new_p2 + new_rng * fib_level
+                            active["sl"]      = new_p2
+                            fib618 = active["fib618"]
+                            sl_lvl = active["sl"]
+                            p2     = active["p2"]
+                            p3_idx = ci
+                        ci += 1; continue
+
+                if st == "bear" and ci in pivot_lows_:
+                    new_pl = pivot_lows_[ci]
+                    if new_pl < active["p3_close"]:
+                        new_p2  = float(max(closes_[p3_idx:ci + 1]))
+                        new_rng = new_p2 - new_pl
+                        if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
+                            active["p2"]      = new_p2
+                            active["p3_idx"]  = ci
+                            active["p3_close"]= new_pl
+                            active["rng"]     = new_rng
+                            active["fib618"]  = new_p2 - new_rng * fib_level
+                            active["sl"]      = new_p2
+                            fib618 = active["fib618"]
+                            sl_lvl = active["sl"]
+                            p2     = active["p2"]
+                            p3_idx = ci
+                        ci += 1; continue
+
+            # Invalidation: close below P2
+            if st == "bull" and c_low < p2:
+                active = None; ci += 1; continue
+            if st == "bear" and c_high > p2:
+                active = None; ci += 1; continue
+
+            # Entry trigger (same entry_mode logic)
+            triggered   = False
+            entry_price = None
+            if entry_mode == "touch":
+                if st == "bull" and c_low <= fib618:
+                    triggered = True; entry_price = float(opens_[ci+1]) if ci+1 < n else None
+                elif st == "bear" and c_high >= fib618:
+                    triggered = True; entry_price = float(opens_[ci+1]) if ci+1 < n else None
+            elif entry_mode == "rejection":
+                if st == "bull" and c_low <= fib618 and c_close > fib618:
+                    triggered = True; entry_price = float(opens_[ci+1]) if ci+1 < n else None
+                elif st == "bear" and c_high >= fib618 and c_close < fib618:
+                    triggered = True; entry_price = float(opens_[ci+1]) if ci+1 < n else None
+            elif entry_mode == "reclaim":
+                if not active.get("c_watch"):
+                    if st == "bull" and c_close < fib618: active["c_watch"] = ci
+                    elif st == "bear" and c_close > fib618: active["c_watch"] = ci
+                else:
+                    if (ci - active["c_watch"]) <= 2:
+                        if st == "bull" and c_close > fib618:
+                            triggered = True; entry_price = c_close; active["c_watch"] = None
+                        elif st == "bear" and c_close < fib618:
+                            triggered = True; entry_price = c_close; active["c_watch"] = None
+                    else:
+                        active["c_watch"] = None
+
+            if not triggered or entry_price is None:
+                ci += 1; continue
+
+            # Enter trade
+            if ci + 1 >= n: break
+            entry  = entry_price
+            sl_lvl = p2 - (p2 * stop_buffer_pct) if st == "bull" else p2 + (p2 * stop_buffer_pct)
+            rpp    = abs(entry - sl_lvl)
+            if rpp <= 0: active = None; ci += 1; continue
+            tp  = entry + rpp * rr if st == "bull" else entry - rpp * rr
+            pos = (equity * risk_pct) / rpp
+
+            xc = xp = xr = None
+            for xi in range(ci + 2, min(ci + max_hold, n)):
+                if st == "bull":
+                    if lows_[xi]  <= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
+                    if highs_[xi] >= tp:     xp = tp;     xr = "TP"; xc = xi; break
+                else:
+                    if highs_[xi] >= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
+                    if lows_[xi]  <= tp:     xp = tp;     xr = "TP"; xc = xi; break
+
+            if xc is None:
+                xc = min(ci + max_hold, n - 1)
+                xp = float(closes_[xc]); xr = "TIMEOUT"
+
+            pnl    = (xp - entry) * pos if st == "bull" else (entry - xp) * pos
+            equity += pnl
+            won     = xr == "TP"
+            last_p3_idx = p3_idx
+
+            trades_out.append({
+                "id":         0,
+                "direction":  "LONG" if st == "bull" else "SHORT",
+                "p1_time":    timestamps[p1_idx] if p1_idx < n else None,
+                "entry_time": timestamps[ci + 1] if ci + 1 < n else timestamps[ci],
+                "exit_time":  timestamps[xc],
+                "entry":      round(entry, 6),
+                "sl":         round(sl_lvl, 6),
+                "tp":         round(tp, 6),
+                "exit_price": round(xp, 6),
+                "result":     xr,
+                "pnl":        round(pnl, 4),
+                "equity":     round(equity, 4),
+                "won":        won,
+                "p1":         round(p1_price, 6),
+                "p2":         round(p2, 6),
+                "p3":         round(active["p3_close"], 6),
+                "fib_entry":  round(fib618, 6),
+            })
+
+            active = None
+            ci = xc + 1
+
+        return trades_out
+
+    # ── ROUTE BY ENGINE ────────────────────────────────────
+    if engine == "classic":
+        all_trades = run_classic(v2=False)
+    elif engine == "classic_v2":
+        all_trades = run_classic(v2=True)
+    else:
+        # structure engine — run both directions, merge chronologically
+        bull_trades = run_direction("bull")
+        bear_trades = run_direction("bear")
+        all_trades  = sorted(bull_trades + bear_trades, key=lambda t: t["entry_time"])
+
+    # Re-number sequentially
     equity = 100.0
     for i, t in enumerate(all_trades):
         t["id"] = i + 1
@@ -708,7 +933,7 @@ def process_request(req: BacktestRequest):
 
         trades_fixed=run_backtest_core(candles, pivots, 0.02, req.rr, req.fib_level,
                                         req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
-                                        req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode)
+                                        req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine)
         stats_fixed=calc_stats(trades_fixed, days)
 
         risk_pct=req.risk_pct
@@ -719,7 +944,7 @@ def process_request(req: BacktestRequest):
 
         trades=run_backtest_core(candles, pivots, risk_pct, req.rr, req.fib_level,
                                   req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
-                                  req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode)
+                                  req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine)
         stats=calc_stats(trades, days)
 
         if SUPABASE_URL and stats:
@@ -878,12 +1103,15 @@ async def compare(req: CompareRequest):
                 for risk in req.risk_methods:
                     for rr in req.rr_ratios:
                         for fib in req.fib_levels:
-                            base={"symbol":sym,"timeframe":tf,"pivot_n":pn,
-                                  "risk_method":risk,"risk_pct":0.02,"rr":rr,
-                                  "fib_level":fib,"max_bars":200,"max_hold":200,
-                                  "recency_bars":50,"one_per_pair":True}
-                            configs_a.append(BacktestRequest(**{**base,"start_date":req.period_a_start,"end_date":req.period_a_end}))
-                            configs_b.append(BacktestRequest(**{**base,"start_date":req.period_b_start,"end_date":req.period_b_end}))
+                            for eng in req.engines:
+                                for em in req.entry_modes:
+                                    base={"symbol":sym,"timeframe":tf,"pivot_n":pn,
+                                          "risk_method":risk,"risk_pct":0.02,"rr":rr,
+                                          "fib_level":fib,"max_bars":200,"max_hold":200,
+                                          "recency_bars":50,"one_per_pair":True,
+                                          "engine":eng,"entry_mode":em}
+                                    configs_a.append(BacktestRequest(**{**base,"start_date":req.period_a_start,"end_date":req.period_a_end}))
+                                    configs_b.append(BacktestRequest(**{**base,"start_date":req.period_b_start,"end_date":req.period_b_end}))
 
     loop=asyncio.get_event_loop()
     results_a=list(await asyncio.gather(*[loop.run_in_executor(executor, process_request, cfg) for cfg in configs_a]))
@@ -901,7 +1129,9 @@ async def compare(req: CompareRequest):
         combined.append({
             "symbol":a["symbol"],"timeframe":a["timeframe"],
             "risk":a["risk_method"],"pivot_n":a["pivot_n"],"rr":a["rr"],
-            "fib_level":a.get("fib_level", 0.618),
+            "fib_level":a.get("fib_level",0.618),
+            "engine":a.get("engine","—"),
+            "entry_mode":a.get("entry_mode","—"),
             "period_a_return":round(sa["total_return"],2),
             "period_b_return":round(sb["total_return"],2),
             "period_a_dd":round(sa["max_drawdown"],2),
