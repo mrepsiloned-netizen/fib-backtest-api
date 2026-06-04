@@ -593,6 +593,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                 direction_trades.append({
                     "id":         0,
                     "direction":  "LONG" if st == "bull" else "SHORT",
+                    "p1_time":    timestamps[p1_idx] if p1_idx < n else None,
                     "entry_time": timestamps[ci + 1] if ci + 1 < n else timestamps[ci],
                     "exit_time":  timestamps[xc],
                     "entry":      round(entry, 6),
