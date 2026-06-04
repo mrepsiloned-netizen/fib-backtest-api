@@ -456,9 +456,19 @@ def set_leverage_all(bybit, leverage=100):
             })
             print(f"Leverage set: {symbol} → {leverage}x")
         except Exception as e:
-            # UTA may already have leverage set — not a blocking error
             print(f"Leverage note {symbol}: {e}")
 
+def switch_to_oneway(bybit):
+    """Switch all USDT perp pairs to one-way position mode."""
+    try:
+        bybit.private_post_v5_position_switch_mode({
+            "category":   "linear",
+            "coin":       "USDT",
+            "mode":       0,        # 0 = one-way, 3 = hedge
+        })
+        print("Position mode: switched to one-way")
+    except Exception as e:
+        print(f"Position mode switch note: {e}")
 
 def run():
     global open_signals, pair_bias, tp_anchors
@@ -475,7 +485,8 @@ def run():
 
     print(f"Bybit balance: ${real_balance:.2f} USDT")
 
-    # Set leverage for all pairs
+    # Switch to one-way mode and set leverage
+    switch_to_oneway(bybit)
     set_leverage_all(bybit, leverage=100)
 
     acc = init_account(real_balance)
