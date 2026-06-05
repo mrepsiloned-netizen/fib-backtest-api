@@ -1,7 +1,15 @@
 # ============================================================
-# FIB LIVE TRADER v1
-# Real execution on Bybit — based on Paper Trader v5
-# KuCoin for data, Bybit for execution
+# FIB LIVE TRADER v2
+# Changes from v1:
+#   - Engine: structure (BOS state machine) replaces original triplet
+#   - Pairs: XLM, DOGE, ADA, TRX, ARB, XRP (drop ETH, BTC)
+#   - Removed N=1 anchor tracking (unvalidated, not in backtest)
+#   - Leverage: 10x (was 100x) — clears min notional, fees manageable
+#   - defaultType: linear (was spot) — required for USDT perpetuals
+#   - SL/TP monitoring: candle wick-based (was ticker last price)
+#   - Position sizing: updated for new pairs min qty
+#   - DORMANT MODE: order placement still disabled by default
+#     Set LIVE_MODE = True to enable real orders
 # ============================================================
 
 import ccxt
@@ -26,66 +34,92 @@ SUPABASE_HEADERS = {
 }
 
 SCAN_INTERVALS = {
-    "1m":15,"5m":300,"15m":900,
-    "1h":3600,"4h":14400,"1d":86400,
+    "1m":15, "5m":300, "15m":900,
+    "1h":3600, "4h":14400, "1d":86400,
 }
 SIGNAL_COOLDOWNS = {
-    "1m":60,"5m":300,"15m":900,
-    "1h":3600,"4h":14400,"1d":86400,
+    "1m":60, "5m":300, "15m":900,
+    "1h":3600, "4h":14400, "1d":86400,
 }
 
-RISK_PCT  = 0.02   # 2% risk per trade
-FIB_LEVEL = 0.618
-MAX_CONSEC_LOSSES = 10  # circuit breaker — stop bot after this many consecutive losses
-MODE      = "LIVE"  # change to "PAPER" to revert to paper mode
+RISK_PCT          = 0.02
+LEVERAGE          = 10   # 10x — clears min notional, keeps fees ~0.75% of risk
+MAX_CONSEC_LOSSES = 10
+LIVE_MODE         = False  # Set True to enable real order placement
 
-# ── WATCHLIST — Single primary strategy ────
+# ── WATCHLIST ─────────────────────────────────────────────────
 WATCHLIST = [
-    {"symbol":"ETH/USDT","timeframe":"1m","pivot_n":8,"rr":2.0,"fib_level":0.618,"label":"⚡ ETH 1M"},
-    {"symbol":"XRP/USDT","timeframe":"1m","pivot_n":8,"rr":2.0,"fib_level":0.618,"label":"⚡ XRP 1M"},
-    {"symbol":"BTC/USDT","timeframe":"1m","pivot_n":8,"rr":1.5,"fib_level":0.618,"label":"⚡ BTC 1M"},
+    {"symbol":"XLM/USDT",  "timeframe":"1m", "pivot_n":8, "rr":2.0, "fib_level":0.5,   "label":"⭐ XLM 1M"},
+    {"symbol":"DOGE/USDT", "timeframe":"1m", "pivot_n":8, "rr":2.0, "fib_level":0.5,   "label":"🐶 DOGE 1M"},
+    {"symbol":"ADA/USDT",  "timeframe":"1m", "pivot_n":5, "rr":1.5, "fib_level":0.5,   "label":"🔵 ADA 1M"},
+    {"symbol":"TRX/USDT",  "timeframe":"1m", "pivot_n":8, "rr":2.0, "fib_level":0.5,   "label":"🔺 TRX 1M"},
+    {"symbol":"ARB/USDT",  "timeframe":"1m", "pivot_n":8, "rr":2.0, "fib_level":0.618, "label":"⚙️ ARB 1M"},
+    {"symbol":"XRP/USDT",  "timeframe":"1m", "pivot_n":5, "rr":4.0, "fib_level":0.618, "label":"💧 XRP 1M"},
 ]
 
-# ── SUPABASE ──────────────────────────────────────────────
+# Min qty and precision per pair (Bybit perpetual)
+MIN_QTY = {
+    "XLM/USDT": 1.0, "DOGE/USDT": 1.0, "ADA/USDT": 1.0,
+    "TRX/USDT": 1.0, "ARB/USDT":  1.0, "XRP/USDT": 1.0,
+}
+QTY_PRECISION = {
+    "XLM/USDT": 0, "DOGE/USDT": 0, "ADA/USDT": 0,
+    "TRX/USDT": 0, "ARB/USDT":  0, "XRP/USDT": 0,
+}
+PRICE_PRECISION = {
+    "XLM/USDT": 5, "DOGE/USDT": 5, "ADA/USDT": 4,
+    "TRX/USDT": 4, "ARB/USDT":  4, "XRP/USDT": 4,
+}
+
+# ── SUPABASE ──────────────────────────────────────────────────
 def get_account():
     try:
-        res = httpx.get(f"{SUPABASE_URL}/rest/v1/live_account?id=eq.1&select=*", headers=SUPABASE_HEADERS, timeout=10)
-        if res.status_code==200 and res.json(): return res.json()[0]
-    except Exception as e: print(f"Get account error: {e}")
+        res = httpx.get(f"{SUPABASE_URL}/rest/v1/live_account?id=eq.1&select=*",
+                        headers=SUPABASE_HEADERS, timeout=10)
+        if res.status_code == 200 and res.json():
+            return res.json()[0]
+    except Exception as e:
+        print(f"Get account error: {e}")
     return None
 
 def init_account(start_balance):
     try:
         existing = get_account()
         if existing: return existing
-        row = {"id":1,"balance":start_balance,"total_trades":0,"wins":0,"losses":0,
-               "total_pnl":0.0,"peak_balance":start_balance,"max_drawdown":0.0,
-               "start_balance":start_balance,
-               "created_at":datetime.now(timezone.utc).isoformat()}
-        httpx.post(f"{SUPABASE_URL}/rest/v1/live_account", json=row, headers=SUPABASE_HEADERS, timeout=10)
+        row = {
+            "id": 1, "balance": start_balance, "total_trades": 0,
+            "wins": 0, "losses": 0, "total_pnl": 0.0,
+            "peak_balance": start_balance, "max_drawdown": 0.0,
+            "start_balance": start_balance,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        httpx.post(f"{SUPABASE_URL}/rest/v1/live_account",
+                   json=row, headers=SUPABASE_HEADERS, timeout=10)
         return row
     except Exception as e:
         print(f"Init account error: {e}")
-        return {"balance":start_balance,"total_trades":0,"wins":0,"losses":0,
-                "total_pnl":0.0,"peak_balance":start_balance,"max_drawdown":0.0,"start_balance":start_balance}
+        return {"balance": start_balance, "total_trades": 0, "wins": 0, "losses": 0,
+                "total_pnl": 0.0, "peak_balance": start_balance, "max_drawdown": 0.0,
+                "start_balance": start_balance}
 
 def update_account(balance, won, pnl):
     try:
-        acc = get_account()
+        acc    = get_account()
         if not acc: return None
         peak   = max(acc["peak_balance"], balance)
-        dd     = round((peak-balance)/peak*100, 2)
+        dd     = round((peak - balance) / peak * 100, 2)
         max_dd = max(acc["max_drawdown"], dd)
         updates = {
-            "balance":       round(balance,4),
-            "total_trades":  acc["total_trades"]+1,
-            "wins":          acc["wins"]+(1 if won else 0),
-            "losses":        acc["losses"]+(0 if won else 1),
-            "total_pnl":     round(acc["total_pnl"]+pnl,4),
-            "peak_balance":  round(peak,4),
-            "max_drawdown":  max_dd,
+            "balance":      round(balance, 4),
+            "total_trades": acc["total_trades"] + 1,
+            "wins":         acc["wins"] + (1 if won else 0),
+            "losses":       acc["losses"] + (0 if won else 1),
+            "total_pnl":    round(acc["total_pnl"] + pnl, 4),
+            "peak_balance": round(peak, 4),
+            "max_drawdown": max_dd,
         }
-        httpx.patch(f"{SUPABASE_URL}/rest/v1/live_account?id=eq.1", json=updates, headers=SUPABASE_HEADERS, timeout=10)
+        httpx.patch(f"{SUPABASE_URL}/rest/v1/live_account?id=eq.1",
+                    json=updates, headers=SUPABASE_HEADERS, timeout=10)
         return {**acc, **updates}
     except Exception as e:
         print(f"Update account error: {e}")
@@ -94,84 +128,93 @@ def update_account(balance, won, pnl):
 def log_trade(trade_data):
     try:
         httpx.post(f"{SUPABASE_URL}/rest/v1/live_trades", json=trade_data,
-                   headers={**SUPABASE_HEADERS,"Prefer":"return=minimal"}, timeout=10)
-    except Exception as e: print(f"Log trade error: {e}")
+                   headers={**SUPABASE_HEADERS, "Prefer": "return=minimal"}, timeout=10)
+    except Exception as e:
+        print(f"Log trade error: {e}")
 
 def get_today_trades():
     try:
-        since = (datetime.now(timezone.utc)-timedelta(hours=24)).isoformat()
-        res = httpx.get(f"{SUPABASE_URL}/rest/v1/live_trades?created_at=gte.{since}&select=*&order=created_at.desc", headers=SUPABASE_HEADERS, timeout=10)
-        if res.status_code==200: return res.json()
-    except Exception as e: print(f"Get trades error: {e}")
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        res   = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/live_trades?created_at=gte.{since}&select=*&order=created_at.desc",
+            headers=SUPABASE_HEADERS, timeout=10)
+        if res.status_code == 200: return res.json()
+    except Exception as e:
+        print(f"Get trades error: {e}")
     return []
 
-# ── TELEGRAM ──────────────────────────────────────────────
+# ── TELEGRAM ──────────────────────────────────────────────────
 def send_telegram(message):
     try:
-        httpx.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                   json={"chat_id":TELEGRAM_CHAT_ID,"text":message,"parse_mode":"HTML"}, timeout=10)
-    except Exception as e: print(f"Telegram error: {e}")
+        httpx.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+            timeout=10)
+    except Exception as e:
+        print(f"Telegram error: {e}")
 
 def send_entry(symbol, timeframe, signal, label, acc):
     balance   = acc["balance"]
-    risk_amt  = round(balance*RISK_PCT, 4)
-    risk_pp   = abs(signal["entry"]-signal["sl"])
-    pos_size  = round(risk_amt/risk_pp, 6) if risk_pp>0 else 0
-    pos_value = round(pos_size*signal["entry"], 2)
-    sl_loss   = round(balance-risk_amt, 2)
-    tp_gain   = round(balance+risk_amt*signal["rr"], 2)
+    risk_amt  = round(balance * RISK_PCT, 4)
+    risk_pp   = abs(signal["entry"] - signal["sl"])
+    pos_size  = round(risk_amt / risk_pp, 6) if risk_pp > 0 else 0
+    pos_value = round(pos_size * signal["entry"], 2)
+    sl_loss   = round(balance - risk_amt, 2)
+    tp_gain   = round(balance + risk_amt * signal["rr"], 2)
     direction = signal["direction"]
-    emoji     = "🟢" if direction=="LONG" else "🔴"
-    arrow     = "📈" if direction=="LONG" else "📉"
+    emoji     = "🟢" if direction == "LONG" else "🔴"
+    arrow     = "📈" if direction == "LONG" else "📉"
     now_str   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     start_bal = acc.get("start_balance", balance)
-    total_ret = round((balance-start_bal)/start_bal*100, 2) if start_bal>0 else 0
-    wr        = round(acc["wins"]/acc["total_trades"]*100,1) if acc["total_trades"]>0 else 0
+    total_ret = round((balance - start_bal) / start_bal * 100, 2) if start_bal > 0 else 0
+    wr        = round(acc["wins"] / acc["total_trades"] * 100, 1) if acc["total_trades"] > 0 else 0
 
-    send_telegram(f"""{emoji} <b>🔴 LIVE ORDER PLACED — {symbol} {timeframe.upper()}</b> {arrow}
+    mode_tag = "💰 <b>LIVE TRADE</b>" if LIVE_MODE else "⏸ DORMANT (no order placed)"
+
+    send_telegram(f"""{emoji} <b>LIVE ORDER — {symbol} {timeframe.upper()}</b> {arrow}
 <b>{label}</b>
 
 <b>Direction:</b> {direction}
-<b>Structure:</b> {"LH→LL→LH" if signal["structure"]=="bear" else "HL→HH→HL"}
+<b>Structure:</b> {"BOS Bear" if signal["structure"]=="bear" else "BOS Bull"}
 
 <b>Entry:</b>  ${signal["entry"]}
 <b>SL:</b>     ${signal["sl"]} (-{abs(signal["entry"]-signal["sl"])/signal["entry"]*100:.2f}%)
 <b>TP:</b>     ${signal["tp"]} (+{abs(signal["tp"]-signal["entry"])/signal["entry"]*100:.2f}%)
 <b>RR:</b>     1:{signal["rr"]}R
+<b>Leverage:</b> {LEVERAGE}x
 
 <b>Account:</b>   ${balance:.2f}
 <b>Risk:</b>      {RISK_PCT*100:.0f}% = ${risk_amt:.2f}
 <b>Position:</b>  {pos_size} {symbol.split('/')[0]} (${pos_value:.2f})
-<b>If SL hit:</b> Balance → ${sl_loss:.2f} (-${risk_amt:.2f})
-<b>If TP hit:</b> Balance → ${tp_gain:.2f} (+${round(risk_amt*signal["rr"],2):.2f})
+<b>If SL hit:</b> ${sl_loss:.2f} (-${risk_amt:.2f})
+<b>If TP hit:</b> ${tp_gain:.2f} (+${round(risk_amt*signal["rr"],2):.2f})
 
 <b>Stats:</b> {acc["total_trades"]} trades · {acc["wins"]}W {acc["losses"]}L · {wr}% WR
 <b>Total return:</b> {"+'" if total_ret>=0 else ""}{total_ret}%
 ⏰ {now_str}
-💰 <b>LIVE TRADE — Real money</b>""")
+{mode_tag}""")
 
 def send_exit(symbol, timeframe, signal, exit_price, won, pnl, acc):
-    emoji   = "✅" if won else "❌"
-    result  = "TAKE PROFIT" if won else "STOP LOSS"
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    emoji     = "✅" if won else "❌"
+    result    = "TAKE PROFIT" if won else "STOP LOSS"
+    now_str   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     start_bal = acc.get("start_balance", acc["balance"])
-    total_ret = round((acc["balance"]-start_bal)/start_bal*100, 2) if start_bal>0 else 0
-    wr = round(acc["wins"]/acc["total_trades"]*100,1) if acc["total_trades"]>0 else 0
+    total_ret = round((acc["balance"] - start_bal) / start_bal * 100, 2) if start_bal > 0 else 0
+    wr        = round(acc["wins"] / acc["total_trades"] * 100, 1) if acc["total_trades"] > 0 else 0
 
-    send_telegram(f"""{emoji} <b>🔴 LIVE TRADE CLOSED — {symbol} {timeframe.upper()}</b>
+    send_telegram(f"""{emoji} <b>LIVE TRADE CLOSED — {symbol} {timeframe.upper()}</b>
 
-<b>Result:</b> {result} {"✅" if won else "❌"}
+<b>Result:</b>    {result}
 <b>Direction:</b> {signal["direction"]}
 
-<b>Entry:</b>  ${signal["entry"]}
-<b>Exit:</b>   ${exit_price:.6f}
-<b>P&L:</b>    {"+'" if pnl>=0 else ""}${pnl:.4f}
-<b>RR:</b>     {signal["rr"]}R {"achieved ✅" if won else "missed ❌"}
+<b>Entry:</b>   ${signal["entry"]}
+<b>Exit:</b>    ${exit_price:.6f}
+<b>P&L:</b>     {"+'" if pnl>=0 else ""}${pnl:.4f}
+<b>RR:</b>      {signal["rr"]}R {"achieved ✅" if won else "missed ❌"}
 
-<b>Previous balance:</b> ${round(acc["balance"]-pnl,2):.2f}
-<b>Current balance:</b>  ${acc["balance"]:.2f}
-<b>Total return:</b>     {"+'" if total_ret>=0 else ""}{total_ret}%
-<b>Max drawdown:</b>     -{acc["max_drawdown"]:.2f}%
+<b>Balance:</b>      ${acc["balance"]:.2f}
+<b>Total return:</b> {"+'" if total_ret>=0 else ""}{total_ret}%
+<b>Max drawdown:</b> -{acc["max_drawdown"]:.2f}%
 
 <b>All time:</b> {acc["total_trades"]} trades · {acc["wins"]}W {acc["losses"]}L · {wr}% WR
 ⏰ {now_str}
@@ -182,17 +225,18 @@ def send_daily_summary(open_signals):
         acc    = get_account()
         trades = get_today_trades()
         if not acc: return
-        today_pnl  = sum(t.get("pnl",0) for t in trades)
+        today_pnl  = sum(t.get("pnl", 0) for t in trades)
         today_wins = sum(1 for t in trades if t.get("won"))
         today_loss = sum(1 for t in trades if not t.get("won"))
-        total_ret  = round((acc["balance"]-START_BALANCE)/START_BALANCE*100, 2)
-        wr         = round(acc["wins"]/acc["total_trades"]*100,1) if acc["total_trades"]>0 else 0
+        start_bal  = acc.get("start_balance", acc["balance"])
+        total_ret  = round((acc["balance"] - start_bal) / start_bal * 100, 2) if start_bal > 0 else 0
+        wr         = round(acc["wins"] / acc["total_trades"] * 100, 1) if acc["total_trades"] > 0 else 0
         now_str    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         open_str   = ""
         if open_signals:
             open_str = "\n\n<b>Open positions:</b>"
-            for key,sig in open_signals.items():
-                open_str += f"\n• {sig.get('symbol','?')} {sig.get('timeframe','?').upper()} {sig['direction']} @ ${sig['entry']}"
+            for key, sig in open_signals.items():
+                open_str += f"\n• {sig.get('symbol','?')} {sig['direction']} @ ${sig['entry']}"
         send_telegram(f"""📊 <b>DAILY REPORT — {now_str}</b>
 
 <b>Today:</b> {len(trades)} trades · {today_wins}W {today_loss}L
@@ -203,128 +247,99 @@ def send_daily_summary(open_signals):
 <b>Max drawdown:</b>    -{acc["max_drawdown"]:.2f}%
 
 <b>All time:</b> {acc["total_trades"]} trades · {acc["wins"]}W {acc["losses"]}L · {wr}% WR{open_str}""")
-    except Exception as e: print(f"Daily summary error: {e}")
+    except Exception as e:
+        print(f"Daily summary error: {e}")
 
-# ── EXCHANGE ──────────────────────────────────────────────
+# ── EXCHANGE ──────────────────────────────────────────────────
 def get_data_exchange():
     return ccxt.kucoin({"enableRateLimit": True})
 
 def get_bybit():
     return ccxt.bybit({
-        "apiKey":    BYBIT_API_KEY,
-        "secret":    BYBIT_SECRET,
+        "apiKey":          BYBIT_API_KEY,
+        "secret":          BYBIT_SECRET,
         "enableRateLimit": True,
-        "options":   {"defaultType": "spot"},
+        "options": {
+            "defaultType": "linear",  # USDT perpetual futures
+        },
     })
 
 def fetch_candles(exchange, symbol, timeframe, limit=300):
     return exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
 
 def get_bybit_balance(bybit):
-    """Get real USDT balance from Bybit"""
+    """Get available USDT from Bybit UTA."""
     try:
-        bal = bybit.fetch_balance()
+        bal = bybit.fetch_balance({"type": "unified"})
         return float(bal["USDT"]["free"])
     except Exception as e:
         print(f"Balance fetch error: {e}")
         return None
 
-def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance, leverage=100):
-    """DORMANT MODE — order placement disabled."""
-    print(f"[DORMANT] Order blocked: {direction} {symbol} entry={entry} sl={sl} tp={tp}")
-    return None
+def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance):
+    """
+    Place limit order on Bybit with SL/TP attached.
+    DORMANT unless LIVE_MODE = True.
+    """
+    if not LIVE_MODE:
+        print(f"[DORMANT] Order blocked: {direction} {symbol} entry={entry:.6f} sl={sl:.6f} tp={tp:.6f}")
+        return None
+
     try:
-        risk_amt = balance * risk_pct
-        risk_pp  = abs(entry - sl)
+        risk_amt  = balance * risk_pct
+        risk_pp   = abs(entry - sl)
         if risk_pp <= 0: return None
 
-        # Symbol-specific precision
-        MIN_QTY = {
-            "ETH/USDT": 0.01,  "BTC/USDT": 0.001,
-            "XRP/USDT": 1.0,   "SOL/USDT": 0.1,
-            "BNB/USDT": 0.01,  "INJ/USDT": 0.1,
-        }
-        QTY_PRECISION = {
-            "ETH/USDT": 2,  "BTC/USDT": 3,
-            "XRP/USDT": 0,  "SOL/USDT": 1,
-            "BNB/USDT": 2,  "INJ/USDT": 1,
-        }
-        PRICE_PRECISION = {
-            "ETH/USDT": 2,  "BTC/USDT": 1,
-            "XRP/USDT": 4,  "SOL/USDT": 2,
-            "BNB/USDT": 2,  "INJ/USDT": 3,
-        }
+        min_qty   = MIN_QTY.get(symbol, 1.0)
+        qty_prec  = QTY_PRECISION.get(symbol, 0)
+        px_prec   = PRICE_PRECISION.get(symbol, 4)
 
-        min_qty  = MIN_QTY.get(symbol, 0.01)
-        qty_prec = QTY_PRECISION.get(symbol, 2)
-        px_prec  = PRICE_PRECISION.get(symbol, 2)
-
-        # UTA initial margin = notional / leverage
-        # Keep position small — use 10% of balance max per trade at 100x
-        # This ensures initial margin stays well within available balance
-        max_notional = balance * leverage * 0.05  # only 5% of buying power
-        qty_from_risk   = risk_amt / risk_pp
-        qty_from_margin = max_notional / entry
-        qty_raw = min(qty_from_risk, qty_from_margin)
-        qty     = max(round(qty_raw, qty_prec), min_qty)
-
-        # Enforce $5 minimum notional
+        # Position size from risk
+        qty_raw  = (risk_amt / risk_pp) * LEVERAGE
+        qty      = max(round(qty_raw, qty_prec), min_qty)
         notional = qty * entry
-        if notional < 5.0:
-            qty      = max(round(5.0 / entry, qty_prec), min_qty)
-            notional = qty * entry
 
-        margin = notional / leverage
-        print(f"Order sizing: risk_amt=${risk_amt:.2f} qty={qty} notional=${notional:.2f} margin=${margin:.2f} leverage={leverage}x")
+        print(f"Order: {direction} {symbol} qty={qty} notional=${notional:.4f} "
+              f"margin=${notional/LEVERAGE:.4f} entry={entry:.6f} sl={sl:.6f} tp={tp:.6f}")
 
-        # Round prices
+        # Price validation
         entry_r = round(entry, px_prec)
         sl_r    = round(sl,    px_prec)
         tp_r    = round(tp,    px_prec)
 
-        # Price validation
-        side = "buy" if direction == "LONG" else "sell"
         if direction == "SHORT":
-            if tp_r >= entry_r:
-                print(f"TP invalid for SHORT: tp={tp_r} >= entry={entry_r}"); return None
-            if sl_r <= entry_r:
-                print(f"SL invalid for SHORT: sl={sl_r} <= entry={entry_r}"); return None
+            if tp_r >= entry_r: print(f"TP invalid SHORT: tp={tp_r} >= entry={entry_r}"); return None
+            if sl_r <= entry_r: print(f"SL invalid SHORT: sl={sl_r} <= entry={entry_r}"); return None
         else:
-            if tp_r <= entry_r:
-                print(f"TP invalid for LONG: tp={tp_r} <= entry={entry_r}"); return None
-            if sl_r >= entry_r:
-                print(f"SL invalid for LONG: sl={sl_r} >= entry={entry_r}"); return None
+            if tp_r <= entry_r: print(f"TP invalid LONG: tp={tp_r} <= entry={entry_r}"); return None
+            if sl_r >= entry_r: print(f"SL invalid LONG: sl={sl_r} >= entry={entry_r}"); return None
 
-        # positionIdx: 0 = one-way mode (default for most accounts)
-        position_idx = 0
-
-        # UTA Bybit v5 order params
         symbol_v5 = symbol.replace("/", "")
         order = bybit.private_post_v5_order_create({
-            "category":         "linear",
-            "symbol":           symbol_v5,
-            "side":             "Buy" if direction == "LONG" else "Sell",
-            "orderType":        "Limit",
-            "qty":              str(qty),
-            "price":            str(entry_r),
-            "timeInForce":      "GTC",
-            "takeProfit":       str(tp_r),
-            "stopLoss":         str(sl_r),
-            "tpTriggerBy":      "LastPrice",
-            "slTriggerBy":      "LastPrice",
-            "reduceOnly":       False,
-            "closeOnTrigger":   False,
-            "positionIdx":      position_idx,
+            "category":       "linear",
+            "symbol":         symbol_v5,
+            "side":           "Buy" if direction == "LONG" else "Sell",
+            "orderType":      "Limit",
+            "qty":            str(qty),
+            "price":          str(entry_r),
+            "timeInForce":    "GTC",
+            "takeProfit":     str(tp_r),
+            "stopLoss":       str(sl_r),
+            "tpTriggerBy":    "LastPrice",
+            "slTriggerBy":    "LastPrice",
+            "reduceOnly":     False,
+            "closeOnTrigger": False,
+            "positionIdx":    0,  # one-way mode
         })
-        print(f"✅ Order placed: {direction} {symbol} qty={qty} entry={entry_r} sl={sl_r} tp={tp_r} margin=${margin:.2f}")
+        print(f"✅ Order placed: {direction} {symbol} qty={qty} entry={entry_r} sl={sl_r} tp={tp_r}")
         return order
+
     except Exception as e:
-        print(f"Order placement error: {e}")
-        send_telegram(f"⚠️ <b>ORDER FAILED</b> — {symbol} {direction}\nError: {e}")
+        print(f"Order error: {e}")
+        send_telegram(f"⚠️ <b>ORDER FAILED</b> — {symbol} {direction}\nError: {str(e)[:200]}")
         return None
 
 def cancel_order(bybit, symbol, order_id):
-    """Cancel an open limit order"""
     try:
         bybit.cancel_order(order_id, symbol)
         print(f"Order cancelled: {order_id}")
@@ -332,154 +347,163 @@ def cancel_order(bybit, symbol, order_id):
         print(f"Cancel error: {e}")
 
 def check_order_status(bybit, symbol, order_id):
-    """Check if limit order filled, cancelled, or still open"""
     try:
         order = bybit.fetch_order(order_id, symbol)
-        return order["status"]  # 'open', 'closed', 'canceled'
+        return order["status"]
     except Exception as e:
         print(f"Order status error: {e}")
         return None
 
 def emergency_stop(bybit, open_signals):
-    """Cancel all open orders and alert on Bybit auth failure"""
-    send_telegram("🚨 <b>EMERGENCY STOP</b> — Bybit auth error detected\nCancelling all open orders...")
+    send_telegram("🚨 <b>EMERGENCY STOP</b> — Bybit auth failure. Cancelling all open orders.")
     for key, sig in open_signals.items():
         if sig.get("order_id"):
             cancel_order(bybit, sig["symbol"], sig["order_id"])
     open_signals.clear()
 
+# ── PIVOT DETECTION ───────────────────────────────────────────
 def find_pivots(candles, N):
-    """Pivot detection — N candles left and right."""
-    highs = np.array([c[2] for c in candles])
-    lows  = np.array([c[3] for c in candles])
-    closes= np.array([c[4] for c in candles])
+    highs  = np.array([c[2] for c in candles])
+    lows   = np.array([c[3] for c in candles])
+    closes = np.array([c[4] for c in candles])
+    n      = len(candles) - 1  # exclude live candle
     pivots = []
-    for i in range(N, len(candles)-N):
+    for i in range(N, n - N):
         if highs[i] == max(highs[i-N:i+N+1]):
-            pivots.append({"idx":i,"type":"H","price":float(highs[i]),"close":float(closes[i])})
+            pivots.append({"idx": i, "type": "H", "price": float(highs[i]), "close": float(closes[i])})
         elif lows[i] == min(lows[i-N:i+N+1]):
-            pivots.append({"idx":i,"type":"L","price":float(lows[i]),"close":float(closes[i])})
+            pivots.append({"idx": i, "type": "L", "price": float(lows[i]),  "close": float(closes[i])})
     deduped = []
     for p in pivots:
-        if not deduped: deduped.append(p); continue
+        if not deduped:
+            deduped.append(p); continue
         last = deduped[-1]
-        if last["type"]==p["type"]:
-            if p["type"]=="H" and p["price"]>last["price"]: deduped[-1]=p
-            elif p["type"]=="L" and p["price"]<last["price"]: deduped[-1]=p
-        else: deduped.append(p)
+        if last["type"] == p["type"]:
+            if p["type"] == "H" and p["price"] > last["price"]: deduped[-1] = p
+            elif p["type"] == "L" and p["price"] < last["price"]: deduped[-1] = p
+        else:
+            deduped.append(p)
     return deduped
 
-
-def detect_signal(candles, pivots, rr, fib_level=0.618):
+# ── STRUCTURE ENGINE SIGNAL DETECTION ────────────────────────
+def detect_signal(candles, pivots, rr, fib_level=0.5, min_swing_pct=0.002, stop_buffer_pct=0.001):
     """
-    Original v6 logic — P1→P2→P3 triplet pattern.
-
-    BEAR: P1(H) → P2(L) → P3(H) where P3 < P1 (lower high)
-          Fib drawn P1→P2, entry at fib_level retracement, SHORT
-    BULL: P1(L) → P2(H) → P3(L) where P3 > P1 (higher low)
-          Fib drawn P1→P2, entry at fib_level retracement, LONG
-
-    Uses candles[-2] (last closed candle) — ignores live candle[-1].
+    Structure engine — matches backtest structure engine.
+    BULL: BOS up (new pivot HIGH > prev pivot HIGH) → fib pullback → LONG
+    BEAR: BOS down (new pivot LOW < prev pivot LOW) → fib rally → SHORT
+    Uses candles[-2] as last closed candle.
     """
-    if len(candles) < 20 or len(pivots) < 3: return None
+    if len(candles) < 50 or len(pivots) < 4: return None
 
     highs = np.array([c[2] for c in candles])
     lows  = np.array([c[3] for c in candles])
-    n     = len(candles)
 
-    # Use last closed candle (ignore live)
     c_high = highs[-2]
     c_low  = lows[-2]
-    ci     = n - 2
 
-    # Scan pivot triplets — most recent first
-    for pi in range(len(pivots)-1, 1, -1):
-        p1, p2, p3 = pivots[pi-2], pivots[pi-1], pivots[pi]
+    best_bull = None
+    best_bear = None
 
-        if p3["idx"] >= ci: continue
+    for pi in range(1, len(pivots)):
+        p_prev = pivots[pi - 1]
+        p_curr = pivots[pi]
 
-        st = None
-        if (p1["type"]=="H" and p2["type"]=="L" and
-            p3["type"]=="H" and p3["price"] < p1["price"]):
-            st = "bear"
-        elif (p1["type"]=="L" and p2["type"]=="H" and
-              p3["type"]=="L" and p3["price"] > p1["price"]):
-            st = "bull"
-        if not st: continue
+        # Bull BOS
+        if (p_curr["type"] == "H" and p_prev["type"] == "H" and
+                p_curr["price"] > p_prev["price"]):
+            p2  = float(min(lows[p_prev["idx"]:p_curr["idx"] + 1]))
+            p3  = p_curr["price"]
+            rng = p3 - p2
+            if rng > 0 and rng / max(p2, 1) >= min_swing_pct:
+                fe = p3 - rng * fib_level
+                sl = p2 - p2 * stop_buffer_pct
+                if c_low >= sl:
+                    best_bull = {"p2": p2, "p3": p3, "fib_entry": fe, "sl": sl}
 
-        fh  = p1["price"] if st=="bear" else p2["price"]
-        fl  = p2["price"] if st=="bear" else p1["price"]
-        rng = fh - fl
-        if rng <= 0: continue
+        # Bear BOS
+        if (p_curr["type"] == "L" and p_prev["type"] == "L" and
+                p_curr["price"] < p_prev["price"]):
+            p2  = float(max(highs[p_prev["idx"]:p_curr["idx"] + 1]))
+            p3  = p_curr["price"]
+            rng = p2 - p3
+            if rng > 0 and rng / max(p2, 1) >= min_swing_pct:
+                fe = p3 + rng * fib_level
+                sl = p2 + p2 * stop_buffer_pct
+                if c_high <= sl:
+                    best_bear = {"p2": p2, "p3": p3, "fib_entry": fe, "sl": sl}
 
-        fib_entry = fl + rng * fib_level if st=="bear" else fh - rng * fib_level
-        sl        = fh + rng * 0.02      if st=="bear" else fl - rng * 0.02
-        rpp       = abs(fib_entry - sl)
-        if rpp <= 0: continue
-        tp        = fib_entry - rpp * rr if st=="bear" else fib_entry + rpp * rr
-
-        if st == "bear" and c_high > fh: continue
-        if st == "bull" and c_low  < fl: continue
-
-        if st == "bear" and c_high >= fib_entry:
-            return {
-                "structure": "bear", "direction": "SHORT",
-                "entry": round(fib_entry, 6), "sl": round(sl, 6), "tp": round(tp, 6),
-                "p1": round(p1["price"], 6), "p2": round(p2["price"], 6),
-                "p3": round(p3["price"], 6), "current": round(c_high, 6), "rr": rr
-            }
-        if st == "bull" and c_low <= fib_entry:
+    if best_bull:
+        fe  = best_bull["fib_entry"]
+        sl  = best_bull["sl"]
+        rpp = abs(fe - sl)
+        if rpp > 0 and c_low <= fe:
+            tp = fe + rpp * rr
             return {
                 "structure": "bull", "direction": "LONG",
-                "entry": round(fib_entry, 6), "sl": round(sl, 6), "tp": round(tp, 6),
-                "p1": round(p1["price"], 6), "p2": round(p2["price"], 6),
-                "p3": round(p3["price"], 6), "current": round(c_low, 6), "rr": rr
+                "entry": round(fe, 6), "sl": round(sl, 6), "tp": round(tp, 6),
+                "p2": round(best_bull["p2"], 6), "p3": round(best_bull["p3"], 6),
+                "current": round(c_low, 6), "rr": rr
+            }
+
+    if best_bear:
+        fe  = best_bear["fib_entry"]
+        sl  = best_bear["sl"]
+        rpp = abs(fe - sl)
+        if rpp > 0 and c_high >= fe:
+            tp = fe - rpp * rr
+            return {
+                "structure": "bear", "direction": "SHORT",
+                "entry": round(fe, 6), "sl": round(sl, 6), "tp": round(tp, 6),
+                "p2": round(best_bear["p2"], 6), "p3": round(best_bear["p3"], 6),
+                "current": round(c_high, 6), "rr": rr
             }
 
     return None
 
-# ── MAIN LOOP ─────────────────────────────────────────────
-open_signals = {}  # key: symbol_timeframe
-pair_bias    = {}  # key: symbol_timeframe → "bull" | "bear" | None
-tp_anchors   = {}  # key: symbol_timeframe → N=1 anchor tracking after TP
-
-def set_leverage_all(bybit, leverage=100):
-    """Set leverage for all watchlist pairs - UTA compatible (no margin mode switch)."""
+# ── LEVERAGE SETUP ────────────────────────────────────────────
+def set_leverage_all(bybit, leverage=10):
     for watch in WATCHLIST:
         symbol    = watch["symbol"]
         symbol_v5 = symbol.replace("/", "")
-        lev_str   = str(leverage)
         try:
             bybit.private_post_v5_position_set_leverage({
-                "category":    "linear",
-                "symbol":      symbol_v5,
-                "buyLeverage": lev_str,
-                "sellLeverage":lev_str,
+                "category":     "linear",
+                "symbol":       symbol_v5,
+                "buyLeverage":  str(leverage),
+                "sellLeverage": str(leverage),
             })
             print(f"Leverage set: {symbol} → {leverage}x")
         except Exception as e:
             print(f"Leverage note {symbol}: {e}")
 
 def switch_to_oneway(bybit):
-    """Switch all USDT perp pairs to one-way position mode."""
     try:
         bybit.private_post_v5_position_switch_mode({
-            "category":   "linear",
-            "coin":       "USDT",
-            "mode":       0,        # 0 = one-way, 3 = hedge
+            "category": "linear",
+            "coin":     "USDT",
+            "mode":     0,  # 0 = one-way
         })
-        print("Position mode: switched to one-way")
+        print("Position mode: one-way")
     except Exception as e:
-        print(f"Position mode switch note: {e}")
+        print(f"Position mode note: {e}")
 
+# ── MAIN LOOP ─────────────────────────────────────────────────
 def run():
-    global open_signals, pair_bias, tp_anchors
-    print("⏸ Fib Live Trader v1 starting — DORMANT MODE (no orders)")
+    open_signals     = {}
+    pair_bias        = {}
+    last_signal      = {}
+    last_scan        = {}
+    last_daily       = 0
+    last_heartbeat   = 0
+    consec_losses    = 0
+    bybit_fail_count = 0
+
+    mode_str = "LIVE 💰" if LIVE_MODE else "DORMANT ⏸ (no orders)"
+    print(f"⚙️ Fib Live Trader v2 starting — {mode_str}")
 
     data_exchange = get_data_exchange()
     bybit         = get_bybit()
 
-    # Get real balance from Bybit
     real_balance = get_bybit_balance(bybit)
     if not real_balance:
         send_telegram("🚨 <b>STARTUP FAILED</b> — Cannot fetch Bybit balance. Check API keys.")
@@ -487,30 +511,25 @@ def run():
 
     print(f"Bybit balance: ${real_balance:.2f} USDT")
 
-    # Switch to one-way mode and set leverage
     switch_to_oneway(bybit)
-    set_leverage_all(bybit, leverage=100)
+    set_leverage_all(bybit, leverage=LEVERAGE)
 
     acc = init_account(real_balance)
 
-    watchlist_str = "\n".join([f"• {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R — {w['label']}" for w in WATCHLIST])
-    send_telegram(f"""💰 <b>Fib Live Trader v1 STARTED</b>
+    watchlist_str = "\n".join([
+        f"• {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R fib={w['fib_level']} — {w['label']}"
+        for w in WATCHLIST
+    ])
+    send_telegram(f"""⚙️ <b>Fib Live Trader v2 STARTED</b>
 
-<b>Bybit Balance:</b> ${real_balance:.2f} USDT
-<b>Risk per trade:</b> {RISK_PCT*100:.0f}%
-<b>Leverage:</b> 100x (auto-set)
+<b>Mode:</b>     {mode_str}
+<b>Engine:</b>   Structure (BOS)
+<b>Balance:</b>  ${real_balance:.2f} USDT
+<b>Risk:</b>     {RISK_PCT*100:.0f}% per trade
+<b>Leverage:</b> {LEVERAGE}x
 
 <b>Watchlist:</b>
-{watchlist_str}
-
-⏸ <b>DORMANT MODE — No orders will be placed</b>""")
-
-    last_signal    = {}
-    last_scan      = {}
-    last_daily     = 0
-    last_heartbeat  = 0
-    consec_losses   = 0   # consecutive loss counter across all pairs
-    bybit_fail_count = 0
+{watchlist_str}""")
 
     while True:
         try:
@@ -518,32 +537,41 @@ def run():
             now_utc = datetime.now(timezone.utc)
             now_str = now_utc.strftime("%H:%M:%S")
 
-            # ── CIRCUIT BREAKER ───────────────────────────
+            # Circuit breaker
             if consec_losses >= MAX_CONSEC_LOSSES:
-                send_telegram(f"""🛑 <b>CIRCUIT BREAKER TRIGGERED</b> — LIVE
-
-{consec_losses} consecutive losses across all pairs.
-<b>Bot has stopped. No more orders will be placed.</b>
-Manual restart required after review.
-
-Check open positions on Bybit and close manually if needed.""")
-                print(f"[{now_str}] 🛑 Circuit breaker — {consec_losses} consecutive losses. Bot stopped.")
+                send_telegram(
+                    f"🛑 <b>CIRCUIT BREAKER — LIVE</b>\n"
+                    f"{consec_losses} consecutive losses. Bot stopped.\n"
+                    f"Check open positions on Bybit manually."
+                )
+                print(f"[{now_str}] 🛑 Circuit breaker. Bot stopped.")
                 break
 
-            # Daily summary at 8AM UTC
-            if now_utc.hour==8 and now_utc.minute<1 and now-last_daily>3600:
+            # Daily summary 8AM UTC
+            if now_utc.hour == 8 and now_utc.minute < 1 and now - last_daily > 3600:
                 send_daily_summary(open_signals)
                 last_daily = now
 
-            # Hourly heartbeat — sync balance from Bybit
-            if now-last_heartbeat>3600:
+            # Hourly heartbeat — sync real balance
+            if now - last_heartbeat > 3600:
                 real_balance = get_bybit_balance(bybit)
                 if real_balance:
                     bybit_fail_count = 0
-                    acc = get_account() or acc
-                    total_ret = round((acc["balance"]-acc.get("start_balance",acc["balance"]))/acc.get("start_balance",acc["balance"])*100,2)
-                    open_str = f"\nOpen positions: {len(open_signals)}" + ("" if not open_signals else "\n"+"\n".join([f"• {s.get('symbol','?')} {s.get('timeframe','?').upper()} {s['direction']} @ ${s['entry']}" for s in open_signals.values()]))
-                    send_telegram(f"💓 <b>Bot Alive — LIVE</b> — {now_utc.strftime('%H:%M UTC')}\nBybit Balance: ${real_balance:.2f} USDT\nBot Tracking: ${acc['balance']:.2f} ({'+' if total_ret>=0 else ''}{total_ret}%)\nScanning {len(WATCHLIST)} pairs{open_str}")
+                    acc       = get_account() or acc
+                    start_bal = acc.get("start_balance", acc["balance"])
+                    total_ret = round((acc["balance"] - start_bal) / start_bal * 100, 2) if start_bal > 0 else 0
+                    open_str  = f"\nOpen: {len(open_signals)}"
+                    if open_signals:
+                        open_str += "\n" + "\n".join(
+                            [f"• {s.get('symbol','?')} {s['direction']} @ ${s['entry']}"
+                             for s in open_signals.values()]
+                        )
+                    send_telegram(
+                        f"💓 <b>Bot Alive — LIVE</b> — {now_utc.strftime('%H:%M UTC')}\n"
+                        f"Bybit: ${real_balance:.2f} · Tracking: ${acc['balance']:.2f} "
+                        f"({'+' if total_ret>=0 else ''}{total_ret}%)\n"
+                        f"Scanning {len(WATCHLIST)} pairs{open_str}"
+                    )
                 else:
                     bybit_fail_count += 1
                     if bybit_fail_count >= 3:
@@ -551,201 +579,181 @@ Check open positions on Bybit and close manually if needed.""")
                         return
                 last_heartbeat = now
 
-            # Scan watchlist for new signals
+            # Scan watchlist
             for watch in WATCHLIST:
                 symbol    = watch["symbol"]
                 timeframe = watch["timeframe"]
                 pivot_n   = watch["pivot_n"]
                 rr        = watch["rr"]
+                fib_level = watch.get("fib_level", 0.5)
                 label     = watch["label"]
-                fib_level = watch.get("fib_level", 0.618)
-                key            = f"{symbol}_{timeframe}"
-                scan_interval  = SCAN_INTERVALS.get(timeframe, 60)
-                sig_cooldown   = SIGNAL_COOLDOWNS.get(timeframe, 1800)
+                key           = f"{symbol}_{timeframe}"
+                scan_interval = SCAN_INTERVALS.get(timeframe, 60)
+                sig_cooldown  = SIGNAL_COOLDOWNS.get(timeframe, 60)
 
-                if now-last_scan.get(key,0)<scan_interval: continue
-                last_scan[key]=now
+                if now - last_scan.get(key, 0) < scan_interval: continue
+                last_scan[key] = now
 
                 try:
                     candles = fetch_candles(data_exchange, symbol, timeframe, limit=300)
-                    if not candles or len(candles)<50: continue
+                    if not candles or len(candles) < 50: continue
 
                     pivots = find_pivots(candles, pivot_n)
                     signal = detect_signal(candles, pivots, rr, fib_level)
 
-                    # N=1 anchor tracking after TP — use candle high/low
-                    if key in tp_anchors and key not in open_signals:
-                        anchor = tp_anchors[key]
-                        try:
-                            ohlcv_anchor = data_exchange.fetch_ohlcv(symbol, timeframe, limit=2)
-                            if ohlcv_anchor:
-                                c = ohlcv_anchor[-1]
-                                c_h = c[2]; c_l = c[3]
-                                anchor["candles_since"] = anchor.get("candles_since", 0) + 1
-                                if anchor["direction"] == "bull":
-                                    if c_h > anchor["candidate"]:
-                                        anchor["candidate"] = c_h
-                                    else:
-                                        new_p3 = anchor["candidate"]
-                                        new_p2 = anchor["from_price"]
-                                        rng    = new_p3 - new_p2
-                                        if rng > 0 and rng/max(new_p2,1) >= 0.003:
-                                            print(f"[{now_str}] N=1 HH confirmed @ ${new_p3:.4f}")
-                                        del tp_anchors[key]
-                                else:
-                                    if c_l < anchor["candidate"]:
-                                        anchor["candidate"] = c_l
-                                    else:
-                                        new_p3 = anchor["candidate"]
-                                        new_p2 = anchor["from_price"]
-                                        rng    = new_p2 - new_p3
-                                        if rng > 0 and rng/max(new_p2,1) >= 0.003:
-                                            print(f"[{now_str}] N=1 LL confirmed @ ${new_p3:.4f}")
-                                        del tp_anchors[key]
-                                if anchor.get("candles_since", 0) >= 50:
-                                    if key in tp_anchors: del tp_anchors[key]
-                        except Exception as e:
-                            print(f"[{now_str}] Anchor error {key}: {e}")
-
                     # Bias filter
                     current_bias = pair_bias.get(key)
-                    signal_dir   = signal["structure"] if signal else None
-                    if signal and current_bias and current_bias != signal_dir:
-                        print(f"[{now_str}] Bias skip: {symbol} {timeframe} signal={signal_dir} bias={current_bias}")
+                    if signal and current_bias and current_bias != signal["structure"]:
+                        print(f"[{now_str}] Bias skip: {symbol} signal={signal['structure']} bias={current_bias}")
                         signal = None
 
                     if signal and key not in open_signals:
-                        if now-last_signal.get(key,0)>sig_cooldown:
-                            # Sync real balance before placing order
+                        if now - last_signal.get(key, 0) > sig_cooldown:
                             real_balance = get_bybit_balance(bybit)
                             if not real_balance:
-                                print(f"Cannot get balance, skipping {symbol}")
+                                print(f"[{now_str}] Cannot get balance, skipping {symbol}")
                                 continue
 
-                            # Place real order on Bybit
                             order = place_limit_order(
                                 bybit, symbol, signal["direction"],
                                 signal["entry"], signal["sl"], signal["tp"],
-                                RISK_PCT, real_balance, leverage=100
+                                RISK_PCT, real_balance
                             )
 
-                            if order:
-                                acc = get_account() or acc
-                                send_entry(symbol, timeframe, signal, label, acc)
-                                last_signal[key] = now
-                                open_signals[key] = {
-                                    **signal,
-                                    "symbol":     symbol,
-                                    "timeframe":  timeframe,
-                                    "label":      label,
-                                    "entry_time": now,
-                                    "order_id":   order["id"],
-                                    "order_status": "open",
-                                    "balance_at_entry": real_balance,
-                                }
-                                print(f"[{now_str}] ✅ LIVE ORDER: {symbol} {timeframe} {signal['direction']} @ {signal['entry']}")
+                            # In DORMANT mode order=None but we still log the signal
+                            acc = get_account() or acc
+                            send_entry(symbol, timeframe, signal, label, acc)
+                            last_signal[key] = now
+                            open_signals[key] = {
+                                **signal,
+                                "symbol":           symbol,
+                                "timeframe":        timeframe,
+                                "label":            label,
+                                "entry_time":       now,
+                                "order_id":         order["id"] if order else None,
+                                "order_status":     "open" if order else "dormant",
+                                "balance_at_entry": real_balance,
+                            }
+                            print(f"[{now_str}] {'✅ ORDER' if order else '⏸ SIGNAL'}: "
+                                  f"{symbol} {signal['direction']} @ {signal['entry']}")
                     else:
-                        print(f"[{now_str}] No signal: {symbol} {timeframe} N={pivot_n} {rr}R")
+                        print(f"[{now_str}] No signal: {symbol} {timeframe} N={pivot_n}")
 
                     time.sleep(0.3)
 
                 except Exception as e:
-                    print(f"[{now_str}] Scan error {symbol} {timeframe}: {e}")
+                    print(f"[{now_str}] Scan error {symbol}: {e}")
                     time.sleep(2)
 
-            # Monitor open positions
+            # Monitor open positions — wick-based on last CLOSED candle
             closed = []
             for key, sig in open_signals.items():
                 try:
-                    order_id = sig.get("order_id")
-                    symbol   = sig["symbol"]
+                    symbol    = sig["symbol"]
+                    timeframe = sig["timeframe"]
 
-                    # Check if limit order filled
-                    if sig.get("order_status") == "open" and order_id:
-                        status = check_order_status(bybit, symbol, order_id)
+                    # If real order — check fill status first
+                    if LIVE_MODE and sig.get("order_status") == "open" and sig.get("order_id"):
+                        status = check_order_status(bybit, symbol, sig["order_id"])
                         if status == "canceled":
-                            # Order expired or cancelled — remove from tracking
-                            print(f"[{now_str}] Order cancelled/expired: {symbol}")
-                            send_telegram(f"⚠️ <b>ORDER EXPIRED</b> — {symbol} {sig['timeframe'].upper()}\nLimit order at ${sig['entry']} never filled.")
+                            print(f"[{now_str}] Order cancelled: {symbol}")
+                            send_telegram(f"⚠️ <b>ORDER EXPIRED</b> — {symbol}\nLimit @ ${sig['entry']} never filled.")
                             closed.append(key)
                             continue
                         elif status == "closed":
                             sig["order_status"] = "filled"
                             print(f"[{now_str}] Order filled: {symbol} @ {sig['entry']}")
 
-                    # If filled — monitor SL/TP via ticker
-                    if sig.get("order_status") == "filled":
-                        ticker    = bybit.fetch_ticker(symbol)
-                        price     = ticker["last"]
-                        direction = sig["direction"]
-                        won=False; hit=False; exit_price=price
+                    # Skip monitoring if dormant or unfilled
+                    if not LIVE_MODE and sig.get("order_status") == "dormant":
+                        # Still monitor via candle for paper-like tracking
+                        pass
+                    elif LIVE_MODE and sig.get("order_status") != "filled":
+                        continue
 
-                        if direction=="LONG":
-                            if price<=sig["sl"]: won=False;hit=True;exit_price=sig["sl"]
-                            elif price>=sig["tp"]: won=True;hit=True;exit_price=sig["tp"]
-                        else:
-                            if price>=sig["sl"]: won=False;hit=True;exit_price=sig["sl"]
-                            elif price<=sig["tp"]: won=True;hit=True;exit_price=sig["tp"]
+                    # Check SL/TP using candle wick — same as backtest
+                    ohlcv = data_exchange.fetch_ohlcv(symbol, timeframe, limit=2)
+                    if not ohlcv: continue
+                    candle    = ohlcv[-2]  # last CLOSED candle
+                    c_high    = candle[2]
+                    c_low     = candle[3]
+                    direction = sig["direction"]
+                    won = False; hit = False; exit_price = None
 
-                        if hit:
-                            # Sync real balance after close
+                    if direction == "LONG":
+                        if c_low  <= sig["sl"]:  won = False; hit = True; exit_price = sig["sl"]
+                        elif c_high >= sig["tp"]: won = True;  hit = True; exit_price = sig["tp"]
+                    else:
+                        if c_high >= sig["sl"]:  won = False; hit = True; exit_price = sig["sl"]
+                        elif c_low  <= sig["tp"]: won = True;  hit = True; exit_price = sig["tp"]
+
+                    if hit:
+                        if LIVE_MODE:
                             real_balance = get_bybit_balance(bybit)
-                            bal_at_entry = sig.get("balance_at_entry", real_balance)
+                            new_bal      = real_balance if real_balance else None
+                        else:
+                            bal_at_entry = sig.get("balance_at_entry", acc["balance"])
                             risk_amt     = bal_at_entry * RISK_PCT
-                            risk_pp      = abs(sig["entry"]-sig["sl"])
-                            pos_size     = risk_amt/risk_pp if risk_pp>0 else 0
-                            pnl          = round((sig["entry"]-exit_price)*pos_size if direction=="SHORT" else (exit_price-sig["entry"])*pos_size, 4)
-                            new_bal      = real_balance if real_balance else round((acc["balance"] or bal_at_entry)+pnl, 4)
+                            risk_pp      = abs(sig["entry"] - sig["sl"])
+                            pos_size     = risk_amt / risk_pp if risk_pp > 0 else 0
+                            pnl_calc     = (
+                                (sig["entry"] - exit_price) * pos_size if direction == "SHORT"
+                                else (exit_price - sig["entry"]) * pos_size
+                            )
+                            new_bal = round((acc["balance"] if acc else bal_at_entry) + pnl_calc, 4)
 
-                            acc = update_account(new_bal, won, pnl)
+                        pnl = round(
+                            (sig["entry"] - exit_price) * (
+                                sig.get("balance_at_entry", 100) * RISK_PCT / abs(sig["entry"] - sig["sl"])
+                            ) if direction == "SHORT" else (exit_price - sig["entry"]) * (
+                                sig.get("balance_at_entry", 100) * RISK_PCT / abs(sig["entry"] - sig["sl"])
+                            ), 4
+                        )
 
-                            log_trade({
-                                "symbol":    sig["symbol"],
-                                "timeframe": sig["timeframe"],
-                                "direction": direction,
-                                "entry":     sig["entry"],
-                                "exit_price":exit_price,
-                                "sl":        sig["sl"],
-                                "tp":        sig["tp"],
-                                "rr":        sig["rr"],
-                                "pnl":       pnl,
-                                "won":       won,
-                                "balance":   new_bal,
-                                "label":     sig["label"],
-                                "created_at":datetime.now(timezone.utc).isoformat(),
-                            })
+                        acc = update_account(new_bal, won, pnl)
 
-                            send_exit(sig["symbol"], sig["timeframe"], sig, exit_price, won, pnl, acc)
-                            closed.append(key)
-                            print(f"[{now_str}] {'✅TP' if won else '❌SL'}: {symbol} PnL=${pnl}")
+                        log_trade({
+                            "symbol":      symbol,
+                            "timeframe":   timeframe,
+                            "direction":   direction,
+                            "entry_price": sig["entry"],
+                            "exit_price":  exit_price,
+                            "sl_price":    sig["sl"],
+                            "tp_price":    sig["tp"],
+                            "rr":          sig["rr"],
+                            "pnl":         pnl,
+                            "won":         won,
+                            "balance_after": new_bal,
+                            "label":       sig["label"],
+                            "result":      "TP" if won else "SL",
+                            "created_at":  datetime.now(timezone.utc).isoformat(),
+                        })
 
-                            if won:
-                                pair_bias[key] = None
-                                anchor_price = exit_price
-                                tp_anchors[key] = {
-                                    "direction": sig["structure"],
-                                    "from_price": sig["p2"] if "p2" in sig else anchor_price,
-                                    "candidate":  anchor_price,
-                                    "candles_since": 0
-                                }
-                                consec_losses = 0  # reset on win
-                                print(f"[{now_str}] TP hit — watching for next N=1 anchor from ${anchor_price:.4f}: {symbol} {timeframe}")
-                            else:
-                                flipped = "bull" if sig["structure"]=="bear" else "bear"
-                                pair_bias[key] = flipped
-                                if key in tp_anchors: del tp_anchors[key]
-                                consec_losses += 1  # increment on loss
-                                print(f"[{now_str}] SL hit — bias flipped to {flipped}: {symbol} {timeframe} (consec losses: {consec_losses}/{MAX_CONSEC_LOSSES})")
-                                if consec_losses >= MAX_CONSEC_LOSSES:
-                                    send_telegram(f"🚨 <b>WARNING — LIVE</b> — {consec_losses} consecutive losses. Circuit breaker will trigger.")
+                        send_exit(symbol, timeframe, sig, exit_price, won, pnl, acc)
+                        closed.append(key)
+                        print(f"[{now_str}] {'✅TP' if won else '❌SL'}: {symbol} PnL=${pnl}")
+
+                        if won:
+                            pair_bias[key] = None
+                            consec_losses  = 0
+                        else:
+                            flipped        = "bull" if sig["structure"] == "bear" else "bear"
+                            pair_bias[key] = flipped
+                            consec_losses += 1
+                            print(f"[{now_str}] SL — bias → {flipped} ({consec_losses}/{MAX_CONSEC_LOSSES})")
+                            if consec_losses >= MAX_CONSEC_LOSSES:
+                                send_telegram(
+                                    f"🚨 <b>WARNING — LIVE</b> — {consec_losses} consecutive losses. "
+                                    f"Circuit breaker triggers next loop."
+                                )
 
                 except Exception as e:
-                    print(f"Monitor error {key}: {e}")
+                    print(f"[{now_str}] Monitor error {key}: {e}")
 
             for key in closed:
                 del open_signals[key]
 
-            time.sleep(30)
+            time.sleep(15)
 
         except KeyboardInterrupt:
             print("Bot stopped")
@@ -754,5 +762,5 @@ Check open positions on Bybit and close manually if needed.""")
             print(f"Main loop error: {e}")
             time.sleep(60)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     run()
