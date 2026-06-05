@@ -1,14 +1,12 @@
 # ============================================================
-# FIB BACKTEST API — FastAPI Backend v7
-# Live-realism fixes (original engine):
-#   1. Pivot confirmation lag: entry search starts p3_idx + N + 1
-#      (backtest now simulates the N-candle wait required to confirm
-#       a pivot in real-time, matching live bot behaviour)
-#   2. Entry price: opens[ec+1] (next candle open after fib touch)
-#      instead of exact fib618 — matches live market-order fill
-#   3. PnL uses actual_entry not fib618 for both legs
-#   4. SL/TP: checked on wick (high/low) each candle — no close needed
-#      This was already correct; documented here for clarity
+# FIB BACKTEST API — FastAPI Backend v8
+# All engines now consistent with live trading:
+#   - Pairs: XRP, DOGE, TRX, XLM, ADA, ARB (low price, high volume)
+#   - Touch mode: fills at exact fib618 (limit order on Bybit)
+#   - Rejection/Reclaim: fills at next candle open
+#   - Fees on notional: 0.02% entry, 0.02% TP exit, 0.055% SL exit
+#   - All engines (original/classic/classic_v2/structure) fee-adjusted
+#   - Pivot confirmation lag on original engine
 # ============================================================
 
 from fastapi import FastAPI, BackgroundTasks
@@ -39,7 +37,7 @@ HEADERS = {
 
 # ── MODELS ────────────────────────────────────────────────
 class BacktestRequest(BaseModel):
-    symbol: str = "INJ/USDT"
+    symbol: str = "XRP/USDT"
     timeframe: str = "4h"
     start_date: str = "2025-01-01"
     end_date: str = "2026-01-01"
@@ -62,7 +60,7 @@ class BatchRequest(BaseModel):
     configs: List[BacktestRequest]
 
 class CompareRequest(BaseModel):
-    symbols: List[str] = ["INJ/USDT","BTC/USDT","ETH/USDT"]
+    symbols: List[str] = ["XRP/USDT","DOGE/USDT","TRX/USDT","XLM/USDT","ADA/USDT","ARB/USDT"]
     timeframes: List[str] = ["4h"]
     pivot_ns: List[int] = [5]
     risk_methods: List[str] = ["fixed"]
@@ -635,10 +633,10 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                 if entry_mode == "touch":
                     if st == "bull" and c_low <= fib_entry:
                         triggered = True
-                        entry_price = float(opens[ci + 1]) if ci + 1 < n else None
+                        entry_price = fib_entry  # limit order fills exactly
                     elif st == "bear" and c_high >= fib_entry:
                         triggered = True
-                        entry_price = float(opens[ci + 1]) if ci + 1 < n else None
+                        entry_price = fib_entry
 
                 elif entry_mode == "rejection":
                     if st == "bull" and c_low <= fib_entry and c_close > fib_entry:
@@ -671,20 +669,22 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                     ci += 1
                     continue
 
-                if ci + 1 >= n:
+                if entry_mode != "touch" and ci + 1 >= n:
                     break
 
+                entry_candle = ci if entry_mode == "touch" else ci + 1
                 entry   = entry_price
                 sl_lvl  = p2 - (p2 * stop_buffer_pct) if st == "bull" else p2 + (p2 * stop_buffer_pct)
                 rpp     = abs(entry - sl_lvl)
                 if rpp <= 0:
                     ci += 1; continue
 
-                tp  = entry + rpp * rr if st == "bull" else entry - rpp * rr
-                pos = (equity * risk_pct) / rpp
+                tp       = entry + rpp * rr if st == "bull" else entry - rpp * rr
+                pos      = (equity * risk_pct) / rpp
+                notional = pos * entry
 
                 xc = xp = xr = None
-                for xi in range(ci + 2, min(ci + max_hold, n)):
+                for xi in range(entry_candle + 1, min(entry_candle + max_hold, n)):
                     if st == "bull":
                         if lows[xi]  <= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
                         if highs[xi] >= tp:      xp = tp;     xr = "TP"; xc = xi; break
@@ -693,25 +693,31 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                         if lows[xi]  <= tp:      xp = tp;     xr = "TP"; xc = xi; break
 
                 if xc is None:
-                    xc = min(ci + max_hold, n - 1)
+                    xc = min(entry_candle + max_hold, n - 1)
                     xp = float(closes[xc])
                     xr = "TIMEOUT"
 
-                pnl    = (xp - entry) * pos if st == "bull" else (entry - xp) * pos
-                equity += pnl
-                won     = xr == "TP"
+                gross_pnl = (xp - entry) * pos if st == "bull" else (entry - xp) * pos
+                won       = xr == "TP"
+                fee_entry = notional * 0.0002
+                fee_exit  = notional * 0.0002 if won else notional * 0.00055
+                total_fee = fee_entry + fee_exit
+                pnl       = gross_pnl - total_fee
+                equity   += pnl
 
                 direction_trades.append({
                     "id":         0,
                     "direction":  "LONG" if st == "bull" else "SHORT",
                     "p1_time":    timestamps[p1_idx] if p1_idx < n else None,
-                    "entry_time": timestamps[ci + 1] if ci + 1 < n else timestamps[ci],
+                    "entry_time": timestamps[entry_candle],
                     "exit_time":  timestamps[xc],
                     "entry":      round(entry, 6),
                     "sl":         round(sl_lvl, 6),
                     "tp":         round(tp, 6),
                     "exit_price": round(xp, 6),
                     "result":     xr,
+                    "gross_pnl":  round(gross_pnl, 4),
+                    "fee":        round(total_fee, 4),
                     "pnl":        round(pnl, 4),
                     "equity":     round(equity, 4),
                     "won":        won,
@@ -869,9 +875,9 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
             entry_price = None
             if entry_mode == "touch":
                 if st == "bull" and c_low <= fib618:
-                    triggered = True; entry_price = float(opens_[ci+1]) if ci+1 < n else None
+                    triggered = True; entry_price = fib618  # limit order fills exactly
                 elif st == "bear" and c_high >= fib618:
-                    triggered = True; entry_price = float(opens_[ci+1]) if ci+1 < n else None
+                    triggered = True; entry_price = fib618
             elif entry_mode == "rejection":
                 if st == "bull" and c_low <= fib618 and c_close > fib618:
                     triggered = True; entry_price = float(opens_[ci+1]) if ci+1 < n else None
@@ -893,16 +899,18 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
             if not triggered or entry_price is None:
                 ci += 1; continue
 
-            if ci + 1 >= n: break
+            if entry_mode != "touch" and ci + 1 >= n: break
+            entry_candle = ci if entry_mode == "touch" else ci + 1
             entry  = entry_price
             sl_lvl = p2 - (p2 * stop_buffer_pct) if st == "bull" else p2 + (p2 * stop_buffer_pct)
             rpp    = abs(entry - sl_lvl)
             if rpp <= 0: active = None; ci += 1; continue
-            tp  = entry + rpp * rr if st == "bull" else entry - rpp * rr
-            pos = (equity * risk_pct) / rpp
+            tp       = entry + rpp * rr if st == "bull" else entry - rpp * rr
+            pos      = (equity * risk_pct) / rpp
+            notional = pos * entry
 
             xc = xp = xr = None
-            for xi in range(ci + 2, min(ci + max_hold, n)):
+            for xi in range(entry_candle + 1, min(entry_candle + max_hold, n)):
                 if st == "bull":
                     if lows_[xi]  <= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
                     if highs_[xi] >= tp:     xp = tp;     xr = "TP"; xc = xi; break
@@ -911,25 +919,31 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                     if lows_[xi]  <= tp:     xp = tp;     xr = "TP"; xc = xi; break
 
             if xc is None:
-                xc = min(ci + max_hold, n - 1)
+                xc = min(entry_candle + max_hold, n - 1)
                 xp = float(closes_[xc]); xr = "TIMEOUT"
 
-            pnl    = (xp - entry) * pos if st == "bull" else (entry - xp) * pos
-            equity += pnl
-            won     = xr == "TP"
+            gross_pnl = (xp - entry) * pos if st == "bull" else (entry - xp) * pos
+            won       = xr == "TP"
+            fee_entry = notional * 0.0002
+            fee_exit  = notional * 0.0002 if won else notional * 0.00055
+            total_fee = fee_entry + fee_exit
+            pnl       = gross_pnl - total_fee
+            equity   += pnl
             last_p3_idx = p3_idx
 
             trades_out.append({
                 "id":         0,
                 "direction":  "LONG" if st == "bull" else "SHORT",
                 "p1_time":    timestamps[p1_idx] if p1_idx < n else None,
-                "entry_time": timestamps[ci + 1] if ci + 1 < n else timestamps[ci],
+                "entry_time": timestamps[entry_candle],
                 "exit_time":  timestamps[xc],
                 "entry":      round(entry, 6),
                 "sl":         round(sl_lvl, 6),
                 "tp":         round(tp, 6),
                 "exit_price": round(xp, 6),
                 "result":     xr,
+                "gross_pnl":  round(gross_pnl, 4),
+                "fee":        round(total_fee, 4),
                 "pnl":        round(pnl, 4),
                 "equity":     round(equity, 4),
                 "won":        won,
@@ -1114,11 +1128,11 @@ def process_request(req: BacktestRequest):
 # ── ROUTES ────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "Fib Backtest API v7", "rules": "pivot_lag+next_open_entry+wick_SLTP"}
+    return {"status": "Fib Backtest API v8", "rules": "all_engines_fees+touch_limit+new_pairs"}
 
 @app.get("/pairs")
 def get_pairs():
-    return {"pairs": ["INJ/USDT","BTC/USDT","ETH/USDT","SOL/USDT","BNB/USDT","XRP/USDT"]}
+    return {"pairs": ["XRP/USDT","DOGE/USDT","TRX/USDT","XLM/USDT","ADA/USDT","ARB/USDT"]}
 
 @app.get("/cache-status")
 def cache_status():
