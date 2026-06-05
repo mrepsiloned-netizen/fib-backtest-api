@@ -341,9 +341,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
             fib618 = fl + rng * fib_level if st=="bear" else fh - rng * fib_level
             sl_lvl = fh + rng * 0.02      if st=="bear" else fl - rng * 0.02
 
-            # FIX 1: Start entry search N candles after P3 to simulate
-            # pivot confirmation lag (live bot cannot know P3 is a pivot
-            # until N candles have closed to its right)
+            # Pivot confirmation lag — can only know P3 is a pivot
+            # after N candles have closed to its right
             search_start = p3["idx"] + N + 1
 
             # Find candle where price touches fib618
@@ -357,20 +356,33 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                     if lows_[ci] <= fib618: ec = ci; break
             if ec is None: continue
 
-            # FIX 2: Enter at open of next candle (market order fill)
-            if ec + 1 >= n: continue
-            actual_entry = float(opens[ec + 1])
+            # Entry price:
+            #   touch     — limit order sitting at fib618, fills exactly there
+            #   rejection — needs candle close confirmation, enter next open
+            #   reclaim   — needs candle close confirmation, enter next open
+            if entry_mode == "touch":
+                actual_entry = fib618
+                entry_candle_idx = ec
+            else:
+                if ec + 1 >= n: continue
+                actual_entry = float(opens[ec + 1])
+                entry_candle_idx = ec + 1
 
-            # FIX 3: Position sizing and PnL use actual_entry
+            # Position sizing and PnL use actual_entry
             rpp = abs(actual_entry - sl_lvl)
             if rpp <= 0: continue
 
             tp  = actual_entry + rpp * rr if st == "bull" else actual_entry - rpp * rr
             pos = (equity * risk_pct) / rpp
 
+            # Notional position size = pos * actual_entry (used for fee calc)
+            notional = pos * actual_entry
+
             # Find exit — SL/TP checked on wick, SL first (conservative)
+            # Exit starts one candle after entry candle
             xc = xp = xr = None
-            for ci in range(ec + 2, min(ec + max_hold, n)):
+            exit_start = entry_candle_idx + 1
+            for ci in range(exit_start, min(exit_start + max_hold, n)):
                 if st == "bear":
                     if highs_[ci] >= sl_lvl: xp = sl_lvl; xr = "SL"; xc = ci; break
                     if lows_[ci]  <= tp:     xp = tp;     xr = "TP"; xc = ci; break
@@ -379,9 +391,19 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                     if highs_[ci] >= tp:     xp = tp;     xr = "TP"; xc = ci; break
             if xc is None: continue
 
-            pnl    = (actual_entry - xp) * pos if st == "bear" else (xp - actual_entry) * pos
+            gross_pnl = (actual_entry - xp) * pos if st == "bear" else (xp - actual_entry) * pos
+            won       = xr == "TP"
+
+            # Bybit fees on notional:
+            #   Entry: limit order  = 0.02% maker
+            #   TP exit: limit/maker = 0.02%
+            #   SL exit: stop-market = 0.055% taker
+            fee_entry = notional * 0.0002
+            fee_exit  = notional * 0.0002 if won else notional * 0.00055
+            total_fee = fee_entry + fee_exit
+            pnl       = gross_pnl - total_fee
+
             equity += pnl
-            won     = xr == "TP"
             bias_o  = None if won else ("bull" if st=="bear" else "bear")
             used    = p3["idx"]
 
@@ -389,20 +411,22 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                 "id":         0,
                 "direction":  "LONG" if st=="bull" else "SHORT",
                 "p1_time":    timestamps[p1["idx"]],
-                "entry_time": timestamps[ec + 1],
+                "entry_time": timestamps[entry_candle_idx],
                 "exit_time":  timestamps[xc],
                 "entry":      round(actual_entry, 6),
                 "sl":         round(sl_lvl, 6),
                 "tp":         round(tp, 6),
                 "exit_price": round(xp, 6),
                 "result":     xr,
+                "gross_pnl":  round(gross_pnl, 4),
+                "fee":        round(total_fee, 4),
                 "pnl":        round(pnl, 4),
                 "equity":     round(equity, 4),
                 "won":        won,
                 "p1":         round(p1["price"], 6),
                 "p2":         round(p2["price"], 6),
                 "p3":         round(p3["price"], 6),
-                "fib_entry":  round(fib618, 6),   # planned level, for reference
+                "fib_entry":  round(fib618, 6),
             })
 
         return orig_trades
@@ -948,6 +972,7 @@ def calc_stats(trades, days):
     final  = trades[-1]["equity"]
     tr     = (final - 100) / 100 * 100
     wr     = len(wins) / len(trades) * 100
+    total_fees = sum(t.get("fee", 0) for t in trades)
     peak   = 100; mdd = 0
     for t in trades:
         if t["equity"] > peak: peak = t["equity"]
@@ -983,6 +1008,7 @@ def calc_stats(trades, days):
         "max_consec_losses":max_cl,
         "kelly_full":       round(kf, 3),
         "kelly_half":       round(kf / 2, 3),
+        "total_fees":       round(total_fees, 4),
     }
 
 
