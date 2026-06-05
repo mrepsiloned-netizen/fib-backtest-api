@@ -230,7 +230,9 @@ def get_bybit_balance(bybit):
         return None
 
 def place_limit_order(bybit, symbol, direction, entry, sl, tp, risk_pct, balance, leverage=100):
-    """Place limit order on Bybit UTA with SL and TP."""
+    """DORMANT MODE — order placement disabled."""
+    print(f"[DORMANT] Order blocked: {direction} {symbol} entry={entry} sl={sl} tp={tp}")
+    return None
     try:
         risk_amt = balance * risk_pct
         risk_pp  = abs(entry - sl)
@@ -472,7 +474,7 @@ def switch_to_oneway(bybit):
 
 def run():
     global open_signals, pair_bias, tp_anchors
-    print("💰 Fib Live Trader v1 starting...")
+    print("⏸ Fib Live Trader v1 starting — DORMANT MODE (no orders)")
 
     data_exchange = get_data_exchange()
     bybit         = get_bybit()
@@ -501,7 +503,7 @@ def run():
 <b>Watchlist:</b>
 {watchlist_str}
 
-🔴 <b>LIVE MODE — Real money</b>""")
+⏸ <b>DORMANT MODE — No orders will be placed</b>""")
 
     last_signal    = {}
     last_scan      = {}
