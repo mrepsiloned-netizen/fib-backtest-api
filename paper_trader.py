@@ -355,11 +355,9 @@ def detect_signal(candles, pivots, rr):
 
 # ── MAIN LOOP ─────────────────────────────────────────────
 open_signals = {}  # key: symbol_timeframe (one per pair+tf combo)
-pair_bias    = {}  # key: symbol_timeframe → "bull" | "bear" | None
-tp_anchors   = {}  # key: symbol_timeframe → N=1 anchor tracking after TP
 
 def run():
-    global open_signals, pair_bias, tp_anchors
+    global open_signals
     print("🤖 Fib Paper Trader v5 starting...")
     acc = init_account()
     watchlist_str = "\n".join([f"• {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R — {w['label']}" for w in WATCHLIST])
@@ -418,60 +416,6 @@ def run():
                     pivots = find_pivots(candles, pivot_n)
                     signal = detect_signal(candles, pivots, rr)
 
-                    # N=1 anchor tracking after TP — use candle high/low
-                    if key in tp_anchors and key not in open_signals:
-                        anchor = tp_anchors[key]
-                        try:
-                            ohlcv_anchor = exchange.fetch_ohlcv(symbol, timeframe, limit=2)
-                            if ohlcv_anchor:
-                                c = ohlcv_anchor[-1]
-                                c_h = c[2]; c_l = c[3]
-                                anchor["candles_since"] = anchor.get("candles_since", 0) + 1
-                                if anchor["direction"] == "bull":
-                                    if c_h > anchor["candidate"]:
-                                        anchor["candidate"] = c_h  # new HH candidate
-                                    else:
-                                        # N=1 confirmed — HH locked
-                                        new_p3  = anchor["candidate"]
-                                        new_p2  = anchor["from_price"]
-                                        rng     = new_p3 - new_p2
-                                        MIN_R   = 0.003
-                                        if rng > 0 and rng / max(new_p2, 1) >= MIN_R:
-                                            new_fib = new_p2 + rng * FIB_LEVEL
-                                            # Store as pending fib for next detect_signal
-                                            tp_anchors[key]["confirmed"] = True
-                                            tp_anchors[key]["fib618"]    = new_fib
-                                            tp_anchors[key]["sl"]        = new_p2
-                                            print(f"[{now_str}] N=1 HH confirmed @ ${new_p3:.4f} fib618=${new_fib:.4f}")
-                                        del tp_anchors[key]
-                                else:
-                                    if c_l < anchor["candidate"]:
-                                        anchor["candidate"] = c_l  # new LL candidate
-                                    else:
-                                        # N=1 confirmed — LL locked
-                                        new_p3  = anchor["candidate"]
-                                        new_p2  = anchor["from_price"]
-                                        rng     = new_p2 - new_p3
-                                        MIN_R   = 0.003
-                                        if rng > 0 and rng / max(new_p2, 1) >= MIN_R:
-                                            new_fib = new_p2 - rng * FIB_LEVEL
-                                            tp_anchors[key]["confirmed"] = True
-                                            tp_anchors[key]["fib618"]    = new_fib
-                                            tp_anchors[key]["sl"]        = new_p2
-                                            print(f"[{now_str}] N=1 LL confirmed @ ${new_p3:.4f} fib618=${new_fib:.4f}")
-                                        del tp_anchors[key]
-                                if anchor.get("candles_since", 0) >= 50:
-                                    if key in tp_anchors: del tp_anchors[key]
-                        except Exception as e:
-                            print(f"[{now_str}] Anchor error {key}: {e}")
-
-                    # Bias filter — skip if direction conflicts with current bias
-                    current_bias = pair_bias.get(key)
-                    signal_dir   = signal["structure"] if signal else None
-                    if signal and current_bias and current_bias != signal_dir:
-                        print(f"[{now_str}] Bias skip: {symbol} {timeframe} signal={signal_dir} bias={current_bias}")
-                        signal = None
-
                     if signal and key not in open_signals:
                         if now-last_signal.get(key,0)>interval:
                             acc = init_account()
@@ -488,34 +432,30 @@ def run():
                     print(f"[{now_str}] Error {symbol} {timeframe}: {e}")
                     time.sleep(2)
 
-            # Check SL/TP on open signals — using candle high/low (catches wicks)
+            # Check SL/TP on open signals
             closed=[]
             for key,sig in open_signals.items():
                 try:
-                    ohlcv     = exchange.fetch_ohlcv(sig["symbol"], sig["timeframe"], limit=2)
-                    if not ohlcv: continue
-                    candle    = ohlcv[-1]
-                    c_high    = candle[2]
-                    c_low     = candle[3]
+                    ticker    = exchange.fetch_ticker(sig["symbol"])
+                    price     = ticker["last"]
                     direction = sig["direction"]
-                    won=False; hit=False; exit_price=None
+                    won=False; hit=False; exit_price=price
 
                     if direction=="LONG":
-                        if c_low<=sig["sl"]:   won=False; hit=True; exit_price=sig["sl"]
-                        elif c_high>=sig["tp"]: won=True;  hit=True; exit_price=sig["tp"]
+                        if price<=sig["sl"]: won=False;hit=True;exit_price=sig["sl"]
+                        elif price>=sig["tp"]: won=True;hit=True;exit_price=sig["tp"]
                     else:
-                        if c_high>=sig["sl"]:  won=False; hit=True; exit_price=sig["sl"]
-                        elif c_low<=sig["tp"]:  won=True;  hit=True; exit_price=sig["tp"]
+                        if price>=sig["sl"]: won=False;hit=True;exit_price=sig["sl"]
+                        elif price<=sig["tp"]: won=True;hit=True;exit_price=sig["tp"]
 
                     if hit:
-                        acc          = init_account()
-                        entry_bal    = sig.get("entry_balance", acc["balance"])
-                        risk_amt     = entry_bal * RISK_PCT
-                        risk_pp      = abs(sig["entry"]-sig["sl"])
-                        pos_size     = risk_amt/risk_pp if risk_pp>0 else 0
-                        pnl          = round((sig["entry"]-exit_price)*pos_size if direction=="SHORT" else (exit_price-sig["entry"])*pos_size, 4)
-                        new_bal      = round(acc["balance"]+pnl, 4)
-                        acc          = update_account(new_bal, won, pnl)
+                        acc     = init_account()
+                        risk_amt= acc["balance"]*RISK_PCT
+                        risk_pp = abs(sig["entry"]-sig["sl"])
+                        pos_size= risk_amt/risk_pp if risk_pp>0 else 0
+                        pnl     = round((sig["entry"]-exit_price)*pos_size if direction=="SHORT" else (exit_price-sig["entry"])*pos_size, 4)
+                        new_bal = round(acc["balance"]+pnl, 4)
+                        acc     = update_account(new_bal, won, pnl)
 
                         log_trade({
                             "symbol":sig["symbol"],"timeframe":sig["timeframe"],
@@ -529,27 +469,6 @@ def run():
                         send_exit(sig["symbol"],sig["timeframe"],sig,exit_price,won,pnl,acc)
                         closed.append(key)
                         print(f"[{now_str}] {'✅TP' if won else '❌SL'}: {sig['symbol']} {sig['timeframe']} PnL=${pnl}")
-
-                        # After TP: set N=1 anchor state so next scan finds next HH/LL
-                        if won:
-                            pair_bias[key] = None  # reset bias — stay same direction
-                            # Use P2 of the completed trade as anchor base
-                            # For bull: track new HH from TP level upward
-                            # For bear: track new LL from TP level downward
-                            anchor_price = exit_price
-                            tp_anchors[key] = {
-                                "direction": sig["structure"],  # bull or bear
-                                "from_price": sig["p2"] if "p2" in sig else anchor_price,
-                                "candidate":  anchor_price,
-                                "candles_since": 0
-                            }
-                            print(f"[{now_str}] TP hit — watching for next N=1 anchor from ${anchor_price:.4f}: {sig['symbol']} {sig['timeframe']}")
-                        else:
-                            # SL hit: flip bias
-                            flipped = "bull" if sig["structure"]=="bear" else "bear"
-                            pair_bias[key] = flipped
-                            if key in tp_anchors: del tp_anchors[key]
-                            print(f"[{now_str}] SL hit — bias flipped to {flipped}: {sig['symbol']} {sig['timeframe']}")
 
                 except Exception as e:
                     print(f"Check error {key}: {e}")
