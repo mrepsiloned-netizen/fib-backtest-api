@@ -1283,3 +1283,20 @@ def journal():
         return {"success":True,"account":account,"trades":trades}
     except Exception as e:
         return {"success":False,"error":str(e)}
+
+@app.get("/live-journal")
+def live_journal():
+    try:
+        acc_res = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/live_account?id=eq.1&select=*",
+            headers=HEADERS, timeout=10
+        )
+        trades_res = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/live_trades?select=*&order=created_at.desc&limit=500",
+            headers=HEADERS, timeout=10
+        )
+        account = acc_res.json()[0] if acc_res.status_code==200 and acc_res.json() else None
+        trades  = trades_res.json() if trades_res.status_code==200 else []
+        return {"success":True,"account":account,"trades":trades}
+    except Exception as e:
+        return {"success":False,"error":str(e)}
