@@ -106,7 +106,7 @@ def get_cached_candles(symbol, timeframe, start_ms, end_ms):
 def save_candles(symbol, timeframe, candles):
     try:
         url = f"{SUPABASE_URL}/rest/v1/candles"
-        save_headers = {**HEADERS, "Prefer": "resolution=merge-duplicates"}
+        save_headers = {**HEADERS, "Prefer": "return=minimal,resolution=ignore-duplicates"}
         for i in range(0, len(candles), 500):
             batch = candles[i:i+500]
             rows = [{"symbol":symbol,"timeframe":timeframe,"ts":c[0],"open":float(c[1]),"high":float(c[2]),"low":float(c[3]),"close":float(c[4]),"volume":float(c[5])} for c in batch]
