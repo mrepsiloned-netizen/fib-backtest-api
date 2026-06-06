@@ -55,6 +55,9 @@ class BacktestRequest(BaseModel):
     k_stale: int = 0
     entry_mode: str = "rejection"  # touch | rejection | reclaim
     engine: str = "original"      # original | classic | classic_v2 | structure
+    use_ema_filter: bool = False   # True = only trade in EMA trend direction
+    ema_fast: int = 34             # fast EMA period
+    ema_slow: int = 55             # slow EMA period
 
 class BatchRequest(BaseModel):
     configs: List[BacktestRequest]
@@ -251,7 +254,7 @@ def find_pivots(highs, lows, N):
 
 
 # ── BACKTEST CORE ─────────────────────────────────────────
-def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection", engine="structure"):
+def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection", engine="structure", use_ema_filter=False, ema_fast=34, ema_slow=55):
     """
     Dispatches to the appropriate engine.
     Original engine has live-realism fixes applied (v7).
@@ -269,6 +272,28 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
     if n < 50 or len(pivots) < 2:
         return trades
+
+    # ── EMA FILTER ────────────────────────────────────────────
+    # Compute EMA fast and slow on close prices
+    # ema_trend[i] = "bull" if ema_fast > ema_slow, "bear" if ema_fast < ema_slow
+    def calc_ema(arr, period):
+        ema = np.zeros(len(arr))
+        k   = 2 / (period + 1)
+        ema[0] = arr[0]
+        for i in range(1, len(arr)):
+            ema[i] = arr[i] * k + ema[i-1] * (1 - k)
+        return ema
+
+    ema_f = calc_ema(closes, ema_fast) if use_ema_filter else None
+    ema_s = calc_ema(closes, ema_slow) if use_ema_filter else None
+
+    def ema_allows(idx, direction):
+        """Return True if EMA filter allows this trade direction at candle idx."""
+        if not use_ema_filter: return True
+        if idx >= n: return False
+        if direction == "bull": return ema_f[idx] > ema_s[idx]
+        if direction == "bear": return ema_f[idx] < ema_s[idx]
+        return True
 
     def is_pivot_high(idx):
         return any(p["idx"] == idx and p["type"] == "H" for p in pivots)
@@ -329,6 +354,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
             if not st: continue
             if p3["idx"] <= used: continue
             if bias_o and bias_o != st: continue
+            # EMA filter — only trade in trend direction
+            if not ema_allows(p3["idx"], st): continue
 
             # Fib calculation
             fh  = p1["price"] if st=="bear" else p2["price"]
@@ -1060,10 +1087,17 @@ def process_request(req: BacktestRequest):
         days   = (candles[-1][0] - candles[0][0]) // 86400000
 
         # Run fixed 2% first (needed for Kelly calculation)
+        ema_kwargs = dict(
+            use_ema_filter=req.use_ema_filter,
+            ema_fast=req.ema_fast,
+            ema_slow=req.ema_slow,
+        )
+
         trades_fixed = run_backtest_core(
             candles, pivots, 0.02, req.rr, req.fib_level,
             req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
-            req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine
+            req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
+            **ema_kwargs
         )
         stats_fixed = calc_stats(trades_fixed, days)
 
@@ -1076,7 +1110,8 @@ def process_request(req: BacktestRequest):
         trades = run_backtest_core(
             candles, pivots, risk_pct, req.rr, req.fib_level,
             req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
-            req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine
+            req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
+            **ema_kwargs
         )
         stats = calc_stats(trades, days)
 
@@ -1107,6 +1142,9 @@ def process_request(req: BacktestRequest):
             "fib_level":   req.fib_level,
             "engine":      req.engine,
             "entry_mode":  req.entry_mode,
+            "use_ema_filter": req.use_ema_filter,
+            "ema_fast":    req.ema_fast,
+            "ema_slow":    req.ema_slow,
             "stats":       stats,
             "equity_curve":eq_curve,
             "trades":      trades[-50:],
