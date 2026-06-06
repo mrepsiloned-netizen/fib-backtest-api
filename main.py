@@ -1570,6 +1570,8 @@ def process_request(req: BacktestRequest):
             "use_ema_filter": req.use_ema_filter,
             "ema_fast":    req.ema_fast,
             "ema_slow":    req.ema_slow,
+            "adx_period":  req.adx_period,
+            "adx_threshold": req.adx_threshold,
             "stats":       stats,
             "equity_curve":eq_curve,
             "trades":      trades[-50:],
