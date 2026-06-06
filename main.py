@@ -58,6 +58,7 @@ class BacktestRequest(BaseModel):
     use_ema_filter: bool = False   # True = only trade in EMA trend direction
     ema_fast: int = 34             # fast EMA period
     ema_slow: int = 55             # slow EMA period
+    atr_mult: float = 1.5          # ATR multiplier for breakout SL
 
 class BatchRequest(BaseModel):
     configs: List[BacktestRequest]
@@ -254,7 +255,7 @@ def find_pivots(highs, lows, N):
 
 
 # ── BACKTEST CORE ─────────────────────────────────────────
-def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection", engine="structure", use_ema_filter=False, ema_fast=34, ema_slow=55):
+def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection", engine="structure", use_ema_filter=False, ema_fast=34, ema_slow=55, atr_mult=1.5):
     """
     Dispatches to the appropriate engine.
     Original engine has live-realism fixes applied (v7).
@@ -985,6 +986,332 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
         return trades_out
 
+    # ── PULLBACK ENGINE ───────────────────────────────────
+    def run_pullback():
+        """
+        Method 1 — Pullback (Fib Retracement)
+
+        LONG:
+          - Find P1 = pivot HIGH (highest HIGH, N candles each side)
+          - When any candle HIGH > P1 → P3 = that candle HIGH (breakout confirmed)
+          - P2 = lowest LOW between P1 and P3 (updates as P3 moves)
+          - P3 updates each candle CLOSE if new HIGH > current P3
+          - Fib entry = P2 + (P3 - P2) * fib_level
+          - SL = P1 high (original pivot high that was broken)
+          - TP = entry + RR * (entry - SL)
+          - Reset if candle LOW < P1 (structure broken) or SL/TP hit
+
+        SHORT = exact mirror using pivot LOWs and candle lows.
+        """
+        nonlocal equity
+        pt = []
+
+        def run_direction_pb(st):
+            nonlocal equity
+            dir_trades = []
+            p1_idx = None; p1_price = None
+            p3_price = None; p2_price = None
+            fib_e = None; sl_lvl = None
+            armed = False
+            in_trade = False
+            entry_price = tp = None
+            entry_idx = None
+
+            ci = N
+            while ci < n - 1:
+                c_high  = highs[ci]
+                c_low   = lows[ci]
+
+                # ── RESET CHECK ─────────────────────────────
+                if armed and not in_trade:
+                    if st == "bull" and c_low < p1_price:
+                        # Price broke below P1 — structure invalid, restart
+                        p1_idx = None; p1_price = None
+                        p3_price = None; p2_price = None
+                        fib_e = None; sl_lvl = None
+                        armed = False
+                        ci += 1; continue
+                    if st == "bear" and c_high > p1_price:
+                        p1_idx = None; p1_price = None
+                        p3_price = None; p2_price = None
+                        fib_e = None; sl_lvl = None
+                        armed = False
+                        ci += 1; continue
+
+                # ── FIND P1 ─────────────────────────────────
+                if p1_idx is None:
+                    # Look for confirmed pivot in past
+                    if st == "bull":
+                        # P1 = candle whose HIGH is highest in [ci-N, ci+N]
+                        # Since we need N to the right, check ci-N
+                        check = ci - N
+                        if check >= N:
+                            window_highs = highs[check-N:check+N+1]
+                            if len(window_highs) == 2*N+1 and highs[check] == max(window_highs):
+                                p1_idx = check
+                                p1_price = float(highs[check])
+                    else:
+                        check = ci - N
+                        if check >= N:
+                            window_lows = lows[check-N:check+N+1]
+                            if len(window_lows) == 2*N+1 and lows[check] == min(window_lows):
+                                p1_idx = check
+                                p1_price = float(lows[check])
+                    ci += 1; continue
+
+                # ── P3 DETECTION AND UPDATE ──────────────────
+                # Wait for candle close before updating P3
+                # (ci is a closed candle in backtest — each loop step is one closed candle)
+                if not armed:
+                    if st == "bull" and c_high > p1_price:
+                        # Breakout — P3 formed or updated
+                        if p3_price is None or c_high > p3_price:
+                            p3_price = float(c_high)
+                            p2_price = float(min(lows[p1_idx:ci+1]))
+                            rng = p3_price - p2_price
+                            if rng > 0:
+                                fib_e   = p2_price + rng * fib_level
+                                sl_lvl  = p1_price
+                                armed   = True
+                    elif st == "bear" and c_low < p1_price:
+                        if p3_price is None or c_low < p3_price:
+                            p3_price = float(c_low)
+                            p2_price = float(max(highs[p1_idx:ci+1]))
+                            rng = p2_price - p3_price
+                            if rng > 0:
+                                fib_e   = p2_price - rng * fib_level
+                                sl_lvl  = p1_price
+                                armed   = True
+                else:
+                    # Already armed — update P3 if new extreme (wait for candle close)
+                    if st == "bull" and c_high > p3_price:
+                        p3_price = float(c_high)
+                        p2_price = float(min(lows[p1_idx:ci+1]))
+                        rng = p3_price - p2_price
+                        if rng > 0:
+                            fib_e  = p2_price + rng * fib_level
+                            sl_lvl = p1_price
+                    elif st == "bear" and c_low < p3_price:
+                        p3_price = float(c_low)
+                        p2_price = float(max(highs[p1_idx:ci+1]))
+                        rng = p2_price - p3_price
+                        if rng > 0:
+                            fib_e  = p2_price - rng * fib_level
+                            sl_lvl = p1_price
+
+                # ── EMA FILTER ───────────────────────────────
+                if armed and not in_trade:
+                    if not ema_allows(ci, st):
+                        ci += 1; continue
+
+                # ── ENTRY TRIGGER ────────────────────────────
+                if armed and not in_trade and fib_e is not None:
+                    triggered = False
+                    if entry_mode == "touch":
+                        if st == "bull" and c_low  <= fib_e: triggered = True
+                        if st == "bear" and c_high >= fib_e: triggered = True
+                    else:  # rejection
+                        if st == "bull" and c_low  <= fib_e and closes[ci] > fib_e: triggered = True
+                        if st == "bear" and c_high >= fib_e and closes[ci] < fib_e: triggered = True
+
+                    if triggered:
+                        entry_price = fib_e
+                        entry_idx   = ci
+                        rpp         = abs(entry_price - sl_lvl)
+                        if rpp <= 0: ci += 1; continue
+                        tp      = entry_price + rpp * rr if st == "bull" else entry_price - rpp * rr
+                        pos     = (equity * risk_pct) / rpp
+                        notional = pos * entry_price
+                        in_trade = True
+
+                # ── TRADE MONITOR ────────────────────────────
+                if in_trade:
+                    xp = xr = xc = None
+                    if st == "bull":
+                        if c_low  <= sl_lvl: xp = sl_lvl; xr = "SL"; xc = ci
+                        elif c_high >= tp:   xp = tp;     xr = "TP"; xc = ci
+                    else:
+                        if c_high >= sl_lvl: xp = sl_lvl; xr = "SL"; xc = ci
+                        elif c_low  <= tp:   xp = tp;     xr = "TP"; xc = ci
+
+                    if xr:
+                        gross_pnl = (xp - entry_price) * pos if st == "bull" else (entry_price - xp) * pos
+                        won       = xr == "TP"
+                        fee_entry = notional * 0.0002
+                        fee_exit  = notional * 0.0002 if won else notional * 0.00055
+                        total_fee = fee_entry + fee_exit
+                        pnl       = gross_pnl - total_fee
+                        equity   += pnl
+
+                        dir_trades.append({
+                            "id":         0,
+                            "direction":  "LONG" if st=="bull" else "SHORT",
+                            "p1_time":    timestamps[p1_idx],
+                            "entry_time": timestamps[entry_idx],
+                            "exit_time":  timestamps[xc],
+                            "entry":      round(entry_price, 6),
+                            "sl":         round(sl_lvl, 6),
+                            "tp":         round(tp, 6),
+                            "exit_price": round(xp, 6),
+                            "result":     xr,
+                            "gross_pnl":  round(gross_pnl, 4),
+                            "fee":        round(total_fee, 4),
+                            "pnl":        round(pnl, 4),
+                            "equity":     round(equity, 4),
+                            "won":        won,
+                            "p1":         round(p1_price, 6),
+                            "p2":         round(p2_price, 6),
+                            "p3":         round(p3_price, 6),
+                            "fib_entry":  round(fib_e, 6),
+                        })
+
+                        # Reset after trade
+                        p1_idx = None; p1_price = None
+                        p3_price = None; p2_price = None
+                        fib_e = None; sl_lvl = None
+                        armed = False; in_trade = False
+                        entry_price = tp = None; entry_idx = None
+
+                ci += 1
+            return dir_trades
+
+        bull_t = run_direction_pb("bull")
+        bear_t = run_direction_pb("bear")
+        return sorted(bull_t + bear_t, key=lambda t: t["entry_time"])
+
+    # ── BREAKOUT ENGINE ───────────────────────────────────
+    def run_breakout(atr_mult=1.5):
+        """
+        Method 2 — Breakout
+
+        LONG:
+          - Historical high = highest HIGH in last N candles
+          - Entry when candle HIGH breaks above historical high
+          - Touch: limit at breakout level
+          - Rejection: price closes above breakout level
+          - SL = entry - ATR(N) * atr_mult
+          - TP = entry + RR * (entry - SL)
+
+        SHORT = mirror using lowest LOW.
+        ATR period = N, multiplier = atr_mult variable.
+        """
+        nonlocal equity
+        dir_trades_all = []
+
+        def calc_atr(period):
+            atr_arr = np.zeros(n)
+            for i in range(1, n):
+                tr = max(
+                    highs[i] - lows[i],
+                    abs(highs[i] - closes[i-1]),
+                    abs(lows[i]  - closes[i-1])
+                )
+                if i < period:
+                    atr_arr[i] = tr
+                else:
+                    atr_arr[i] = (atr_arr[i-1] * (period-1) + tr) / period
+            return atr_arr
+
+        atr_vals = calc_atr(N)
+
+        def run_direction_bo(st):
+            nonlocal equity
+            dir_trades = []
+            in_trade   = False
+            entry_price = sl_lvl = tp = pos = notional = entry_idx = None
+
+            for ci in range(N + 1, n - 1):
+                c_high = highs[ci]
+                c_low  = lows[ci]
+
+                # EMA filter
+                if not in_trade and not ema_allows(ci, st):
+                    continue
+
+                if not in_trade:
+                    # Historical high/low = highest/lowest in last N candles (not including current)
+                    hist_high = float(max(highs[ci-N:ci]))
+                    hist_low  = float(min(lows[ci-N:ci]))
+                    atr       = atr_vals[ci]
+                    if atr <= 0: continue
+
+                    triggered = False
+                    ep        = None
+
+                    if st == "bull":
+                        if entry_mode == "touch" and c_high > hist_high:
+                            triggered = True; ep = hist_high
+                        elif entry_mode == "rejection" and closes[ci] > hist_high:
+                            triggered = True; ep = hist_high
+                    else:
+                        if entry_mode == "touch" and c_low < hist_low:
+                            triggered = True; ep = hist_low
+                        elif entry_mode == "rejection" and closes[ci] < hist_low:
+                            triggered = True; ep = hist_low
+
+                    if triggered and ep:
+                        sl_l   = ep - atr * atr_mult if st == "bull" else ep + atr * atr_mult
+                        rpp    = abs(ep - sl_l)
+                        if rpp <= 0: continue
+                        tp_l   = ep + rpp * rr if st == "bull" else ep - rpp * rr
+                        pos_l  = (equity * risk_pct) / rpp
+                        entry_price = ep
+                        sl_lvl      = sl_l
+                        tp          = tp_l
+                        pos         = pos_l
+                        notional    = pos * entry_price
+                        entry_idx   = ci
+                        in_trade    = True
+                    continue
+
+                # Monitor trade
+                xp = xr = xc = None
+                if st == "bull":
+                    if c_low  <= sl_lvl: xp = sl_lvl; xr = "SL"; xc = ci
+                    elif c_high >= tp:   xp = tp;     xr = "TP"; xc = ci
+                else:
+                    if c_high >= sl_lvl: xp = sl_lvl; xr = "SL"; xc = ci
+                    elif c_low  <= tp:   xp = tp;     xr = "TP"; xc = ci
+
+                if xr:
+                    gross_pnl = (xp - entry_price) * pos if st == "bull" else (entry_price - xp) * pos
+                    won       = xr == "TP"
+                    fee_entry = notional * 0.0002
+                    fee_exit  = notional * 0.0002 if won else notional * 0.00055
+                    total_fee = fee_entry + fee_exit
+                    pnl       = gross_pnl - total_fee
+                    equity   += pnl
+
+                    dir_trades.append({
+                        "id":         0,
+                        "direction":  "LONG" if st=="bull" else "SHORT",
+                        "p1_time":    timestamps[entry_idx],
+                        "entry_time": timestamps[entry_idx],
+                        "exit_time":  timestamps[xc],
+                        "entry":      round(entry_price, 6),
+                        "sl":         round(sl_lvl, 6),
+                        "tp":         round(tp, 6),
+                        "exit_price": round(xp, 6),
+                        "result":     xr,
+                        "gross_pnl":  round(gross_pnl, 4),
+                        "fee":        round(total_fee, 4),
+                        "pnl":        round(pnl, 4),
+                        "equity":     round(equity, 4),
+                        "won":        won,
+                        "p1":         round(hist_high if st=="bull" else hist_low, 6),
+                        "p2":         round(entry_price, 6),
+                        "p3":         round(entry_price, 6),
+                        "fib_entry":  round(entry_price, 6),
+                    })
+                    in_trade = False
+                    entry_price = sl_lvl = tp = pos = notional = entry_idx = None
+
+            return dir_trades
+
+        bull_t = run_direction_bo("bull")
+        bear_t = run_direction_bo("bear")
+        return sorted(bull_t + bear_t, key=lambda t: t["entry_time"])
+
     # ── ROUTE BY ENGINE ────────────────────────────────────
     if engine == "original":
         all_trades = run_original()
@@ -992,6 +1319,10 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
         all_trades = run_classic(v2=False)
     elif engine == "classic_v2":
         all_trades = run_classic(v2=True)
+    elif engine == "pullback":
+        all_trades = run_pullback()
+    elif engine == "breakout":
+        all_trades = run_breakout(atr_mult=atr_mult)
     else:
         # structure engine — run both directions, merge chronologically
         bull_trades = run_direction("bull")
@@ -1108,7 +1439,7 @@ def process_request(req: BacktestRequest):
             candles, pivots, 0.02, req.rr, req.fib_level,
             req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
             req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
-            **ema_kwargs
+            **ema_kwargs, atr_mult=req.atr_mult
         )
         stats_fixed = calc_stats(trades_fixed, days)
 
@@ -1122,7 +1453,7 @@ def process_request(req: BacktestRequest):
             candles, pivots, risk_pct, req.rr, req.fib_level,
             req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
             req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
-            **ema_kwargs
+            **ema_kwargs, atr_mult=req.atr_mult
         )
         stats = calc_stats(trades, days)
 
