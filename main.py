@@ -1703,6 +1703,45 @@ def clear_cache():
     _mem_cache.clear()
     return {"status": "Memory cache cleared"}
 
+class DeleteCandlesRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    start_date: str = "2025-01-01"
+    end_date: str = "now"
+
+@app.delete("/delete-candles")
+def delete_candles(req: DeleteCandlesRequest):
+    try:
+        now_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+        start_ms = int(datetime.strptime(req.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+        end_ms   = now_ms if req.end_date == "now" else int(datetime.strptime(req.end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+        # Delete from Supabase
+        query = (f"symbol=eq.{req.symbol}&timeframe=eq.{req.timeframe}"
+                 f"&ts=gte.{start_ms}&ts=lte.{end_ms}")
+        res = httpx.delete(
+            f"{SUPABASE_URL}/rest/v1/candles?{query}",
+            headers={**HEADERS, "Prefer": "return=representation"},
+            timeout=30
+        )
+
+        # Also clear memory cache keys matching this symbol+timeframe
+        keys_to_clear = [k for k in _mem_cache if k.startswith(f"{req.symbol}_{req.timeframe}")]
+        for k in keys_to_clear:
+            del _mem_cache[k]
+
+        deleted = len(res.json()) if res.status_code == 200 else 0
+        print(f"Deleted {deleted} candles for {req.symbol} {req.timeframe} — cleared {len(keys_to_clear)} memory cache keys")
+        return {
+            "success":  True,
+            "symbol":   req.symbol,
+            "timeframe":req.timeframe,
+            "deleted":  deleted,
+            "cache_cleared": len(keys_to_clear)
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 @app.get("/journal")
 def journal():
     try:
