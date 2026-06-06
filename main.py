@@ -290,11 +290,19 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
     ema_s = calc_ema(closes, ema_slow) if use_ema_filter else None
 
     def ema_allows(idx, direction):
-        """Return True if EMA filter allows this trade direction at candle idx."""
-        if not use_ema_filter: return True
+        """
+        Returns True if trade is allowed at candle idx.
+        Checks two independent filters — either can block a trade:
+          1. EMA trend filter (if use_ema_filter=True)
+          2. ADX trending filter (if adx_threshold > 0)
+        """
         if idx >= n: return False
-        if direction == "bull": return ema_f[idx] > ema_s[idx]
-        if direction == "bear": return ema_f[idx] < ema_s[idx]
+        # EMA trend direction filter
+        if use_ema_filter:
+            if direction == "bull" and ema_f[idx] <= ema_s[idx]: return False
+            if direction == "bear" and ema_f[idx] >= ema_s[idx]: return False
+        # ADX trending market filter — blocks all trades in ranging markets
+        if adx_threshold > 0 and adx_vals[idx] < adx_threshold: return False
         return True
 
     # ── ADX CALCULATION ───────────────────────────────────────
@@ -1494,30 +1502,7 @@ def process_request(req: BacktestRequest):
         except Exception:
             is_rolling = req.end_date == "now"
 
-        # Never use result cache for rolling/recent periods
-        if SUPABASE_URL and not is_rolling:
-            cached_stats = get_cached_result(
-                req.symbol, req.timeframe, req.pivot_n,
-                req.risk_method, req.rr, req.start_date, req.end_date, req.fib_level
-            )
-            if cached_stats:
-                return {
-                    "success":     True,
-                    "source":      "Cache (results DB)",
-                    "symbol":      req.symbol,
-                    "timeframe":   req.timeframe,
-                    "period":      f"{req.start_date} → {req.end_date}",
-                    "risk_method": req.risk_method,
-                    "risk_pct":    req.risk_pct * 100,
-                    "pivot_n":     req.pivot_n,
-                    "rr":          req.rr,
-                    "fib_level":   req.fib_level,
-                    "engine":      req.engine,
-                    "entry_mode":  req.entry_mode,
-                    "stats":       cached_stats,
-                    "equity_curve":[],
-                    "trades":      [],
-                }
+        # Result cache disabled — EMA/ADX/engine params not in key, causes stale results
 
         candles, source = fetch_candles(req.symbol, req.timeframe, req.start_date, req.end_date)
         highs  = np.array([c[2] for c in candles])
@@ -1557,9 +1542,7 @@ def process_request(req: BacktestRequest):
         )
         stats = calc_stats(trades, days)
 
-        if SUPABASE_URL and stats:
-            save_result(req.symbol, req.timeframe, req.pivot_n,
-                       req.risk_method, req.rr, req.start_date, req.end_date, stats, req.fib_level)
+        # Result saving disabled — see cache note above
 
         # Build equity curve — sample rate varies by timeframe
         eq_curve = []
