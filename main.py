@@ -58,7 +58,8 @@ class BacktestRequest(BaseModel):
     use_ema_filter: bool = False   # True = only trade in EMA trend direction
     ema_fast: int = 34             # fast EMA period
     ema_slow: int = 55             # slow EMA period
-    atr_mult: float = 1.5          # ATR multiplier for breakout SL
+    adx_period: int = 14           # ADX period for trend strength filter
+    adx_threshold: float = 25.0    # ADX minimum value to allow trades
 
 class BatchRequest(BaseModel):
     configs: List[BacktestRequest]
@@ -255,7 +256,7 @@ def find_pivots(highs, lows, N):
 
 
 # ── BACKTEST CORE ─────────────────────────────────────────
-def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection", engine="structure", use_ema_filter=False, ema_fast=34, ema_slow=55, atr_mult=1.5):
+def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection", engine="structure", use_ema_filter=False, ema_fast=34, ema_slow=55, adx_period=14, adx_threshold=25.0):
     """
     Dispatches to the appropriate engine.
     Original engine has live-realism fixes applied (v7).
@@ -295,6 +296,61 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
         if direction == "bull": return ema_f[idx] > ema_s[idx]
         if direction == "bear": return ema_f[idx] < ema_s[idx]
         return True
+
+    # ── ADX CALCULATION ───────────────────────────────────────
+    def calc_adx(period):
+        """Calculate ADX, +DI, -DI arrays."""
+        adx_arr  = np.zeros(n)
+        plus_di  = np.zeros(n)
+        minus_di = np.zeros(n)
+        tr_arr   = np.zeros(n)
+        plus_dm  = np.zeros(n)
+        minus_dm = np.zeros(n)
+
+        for i in range(1, n):
+            h_diff = highs[i] - highs[i-1]
+            l_diff = lows[i-1] - lows[i]
+            plus_dm[i]  = h_diff if h_diff > l_diff and h_diff > 0 else 0
+            minus_dm[i] = l_diff if l_diff > h_diff and l_diff > 0 else 0
+            tr_arr[i]   = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+
+        # Smooth with Wilder's method
+        sm_tr = sm_pdm = sm_mdm = 0.0
+        for i in range(1, period+1):
+            sm_tr  += tr_arr[i]
+            sm_pdm += plus_dm[i]
+            sm_mdm += minus_dm[i]
+
+        dx_arr = np.zeros(n)
+        for i in range(period+1, n):
+            sm_tr  = sm_tr  - sm_tr/period  + tr_arr[i]
+            sm_pdm = sm_pdm - sm_pdm/period + plus_dm[i]
+            sm_mdm = sm_mdm - sm_mdm/period + minus_dm[i]
+            pdi = (sm_pdm/sm_tr*100) if sm_tr > 0 else 0
+            mdi = (sm_mdm/sm_tr*100) if sm_tr > 0 else 0
+            plus_di[i]  = pdi
+            minus_di[i] = mdi
+            s = pdi + mdi
+            dx_arr[i]   = (abs(pdi-mdi)/s*100) if s > 0 else 0
+
+        # Smooth DX to get ADX
+        adx_sum = 0.0
+        start   = period * 2
+        for i in range(period+1, start+1):
+            adx_sum += dx_arr[i]
+        if start < n:
+            adx_arr[start] = adx_sum / period
+        for i in range(start+1, n):
+            adx_arr[i] = (adx_arr[i-1] * (period-1) + dx_arr[i]) / period
+
+        return adx_arr, plus_di, minus_di
+
+    adx_vals, plus_di_vals, minus_di_vals = calc_adx(adx_period)
+
+    def adx_trending(idx):
+        """Return True if ADX indicates trending market at candle idx."""
+        if idx >= n: return False
+        return adx_vals[idx] >= adx_threshold
 
     def is_pivot_high(idx):
         return any(p["idx"] == idx and p["type"] == "H" for p in pivots)
@@ -860,8 +916,29 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
                 if st == "bull" and ci in pivot_highs_:
                     new_ph = pivot_highs_[ci]
-                    if new_ph > active["p3_close"]:
-                        new_p2  = float(min(closes_[p3_idx:ci + 1]))
+                    # New high above P1 — cancel current structure, start fresh from new P1
+                    if new_ph > p1_price:
+                        active["p1_idx"]   = ci
+                        active["p1_price"] = new_ph
+                        active["p3_idx"]   = ci
+                        active["p3_close"] = new_ph
+                        new_p2 = float(min(lows_[p1_idx:ci + 1]))
+                        new_rng = new_ph - new_p2
+                        if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
+                            active["p2"]     = new_p2
+                            active["rng"]    = new_rng
+                            active["fib618"] = new_p2 + new_rng * fib_level
+                            active["sl"]     = new_p2
+                            fib618 = active["fib618"]
+                            sl_lvl = active["sl"]
+                            p2     = active["p2"]
+                            p1_idx = ci
+                            p1_price = new_ph
+                            p3_idx = ci
+                        ci += 1; continue
+                    # New high above P3 but below P1 — update P3, redraw fib
+                    elif new_ph > active["p3_close"]:
+                        new_p2  = float(min(lows_[p3_idx:ci + 1]))
                         new_rng = new_ph - new_p2
                         if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
                             active["p2"]      = new_p2
@@ -878,8 +955,29 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
                 if st == "bear" and ci in pivot_lows_:
                     new_pl = pivot_lows_[ci]
-                    if new_pl < active["p3_close"]:
-                        new_p2  = float(max(closes_[p3_idx:ci + 1]))
+                    # New low below P1 — cancel current structure, start fresh from new P1
+                    if new_pl < p1_price:
+                        active["p1_idx"]   = ci
+                        active["p1_price"] = new_pl
+                        active["p3_idx"]   = ci
+                        active["p3_close"] = new_pl
+                        new_p2 = float(max(highs_[p1_idx:ci + 1]))
+                        new_rng = new_p2 - new_pl
+                        if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
+                            active["p2"]     = new_p2
+                            active["rng"]    = new_rng
+                            active["fib618"] = new_p2 - new_rng * fib_level
+                            active["sl"]     = new_p2
+                            fib618 = active["fib618"]
+                            sl_lvl = active["sl"]
+                            p2     = active["p2"]
+                            p1_idx = ci
+                            p1_price = new_pl
+                            p3_idx = ci
+                        ci += 1; continue
+                    # New low below P3 but above P1 — update P3, redraw fib
+                    elif new_pl < active["p3_close"]:
+                        new_p2  = float(max(highs_[p3_idx:ci + 1]))
                         new_rng = new_p2 - new_pl
                         if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
                             active["p2"]      = new_p2
@@ -1189,137 +1287,124 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
         bear_t = run_direction_pb("bear")
         return sorted(bull_t + bear_t, key=lambda t: t["entry_time"])
 
-    # ── BREAKOUT ENGINE ───────────────────────────────────
-    def run_breakout(atr_mult=1.5):
+    # ── EMA CROSS ENGINE ──────────────────────────────────
+    def run_ema_cross():
         """
-        Method 2 — Breakout
+        EMA Cross Pullback Strategy:
 
-        LONG:
-          - Historical high = highest HIGH in last N candles
-          - Entry when candle HIGH breaks above historical high
-          - Touch: limit at breakout level
-          - Rejection: price closes above breakout level
-          - SL = entry - ATR(N) * atr_mult
-          - TP = entry + RR * (entry - SL)
+        LONG setup:
+          - Uptrend: close > EMA fast AND close > EMA slow AND EMA fast > EMA slow
+          - ADX >= threshold (trending, not ranging)
+          - Entry: candle LOW touches or dips below either EMA (fast or slow)
+                   AND candle closes back above the EMA it touched (rejection)
+          - SL: ATR(N) × 1.5 below entry
+          - TP: entry + RR × (entry - SL)
 
-        SHORT = mirror using lowest LOW.
-        ATR period = N, multiplier = atr_mult variable.
+        SHORT = exact mirror.
         """
         nonlocal equity
-        dir_trades_all = []
+        ec_trades = []
 
-        def calc_atr(period):
-            atr_arr = np.zeros(n)
-            for i in range(1, n):
-                tr = max(
-                    highs[i] - lows[i],
-                    abs(highs[i] - closes[i-1]),
-                    abs(lows[i]  - closes[i-1])
-                )
-                if i < period:
-                    atr_arr[i] = tr
-                else:
-                    atr_arr[i] = (atr_arr[i-1] * (period-1) + tr) / period
-            return atr_arr
-
-        atr_vals = calc_atr(N)
-
-        def run_direction_bo(st):
+        def run_direction_ec(st):
             nonlocal equity
             dir_trades = []
             in_trade   = False
-            entry_price = sl_lvl = tp = pos = notional = entry_idx = None
+            entry_p = sl_l = tp_l = pos_l = notional_l = entry_idx = None
 
-            for ci in range(N + 1, n - 1):
-                c_high = highs[ci]
-                c_low  = lows[ci]
+            # ATR for SL
+            atr_arr = np.zeros(n)
+            for i in range(1, n):
+                tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+                atr_arr[i] = (atr_arr[i-1] * (N-1) + tr) / N if i >= N else tr
 
-                # EMA filter
-                if not in_trade and not ema_allows(ci, st):
-                    continue
+            for ci in range(max(ema_slow, adx_period*2) + 1, n - 1):
+                c_high  = highs[ci]
+                c_low   = lows[ci]
+                c_close = closes[ci]
+                ef      = ema_f[ci] if ema_f is not None else None
+                es      = ema_s[ci] if ema_s is not None else None
+                if ef is None or es is None: continue
 
-                if not in_trade:
-                    # Historical high/low = highest/lowest in last N candles (not including current)
-                    hist_high = float(max(highs[ci-N:ci]))
-                    hist_low  = float(min(lows[ci-N:ci]))
-                    atr       = atr_vals[ci]
-                    if atr <= 0: continue
-
-                    triggered = False
-                    ep        = None
-
+                # Monitor open trade
+                if in_trade:
+                    xp = xr = xc = None
                     if st == "bull":
-                        if entry_mode == "touch" and c_high > hist_high:
-                            triggered = True; ep = hist_high
-                        elif entry_mode == "rejection" and closes[ci] > hist_high:
-                            triggered = True; ep = hist_high
+                        if c_low  <= sl_l: xp = sl_l; xr = "SL"; xc = ci
+                        elif c_high >= tp_l: xp = tp_l; xr = "TP"; xc = ci
                     else:
-                        if entry_mode == "touch" and c_low < hist_low:
-                            triggered = True; ep = hist_low
-                        elif entry_mode == "rejection" and closes[ci] < hist_low:
-                            triggered = True; ep = hist_low
+                        if c_high >= sl_l: xp = sl_l; xr = "SL"; xc = ci
+                        elif c_low  <= tp_l: xp = tp_l; xr = "TP"; xc = ci
 
-                    if triggered and ep:
-                        sl_l   = ep - atr * atr_mult if st == "bull" else ep + atr * atr_mult
-                        rpp    = abs(ep - sl_l)
-                        if rpp <= 0: continue
-                        tp_l   = ep + rpp * rr if st == "bull" else ep - rpp * rr
-                        pos_l  = (equity * risk_pct) / rpp
-                        entry_price = ep
-                        sl_lvl      = sl_l
-                        tp          = tp_l
-                        pos         = pos_l
-                        notional    = pos * entry_price
-                        entry_idx   = ci
-                        in_trade    = True
+                    if xr:
+                        gross_pnl = (xp - entry_p) * pos_l if st=="bull" else (entry_p - xp) * pos_l
+                        won       = xr == "TP"
+                        fee_e     = notional_l * 0.0002
+                        fee_x     = notional_l * 0.0002 if won else notional_l * 0.00055
+                        pnl       = gross_pnl - fee_e - fee_x
+                        equity   += pnl
+                        dir_trades.append({
+                            "id":0, "direction":"LONG" if st=="bull" else "SHORT",
+                            "p1_time":timestamps[entry_idx],
+                            "entry_time":timestamps[entry_idx],
+                            "exit_time":timestamps[xc],
+                            "entry":round(entry_p,6), "sl":round(sl_l,6), "tp":round(tp_l,6),
+                            "exit_price":round(xp,6), "result":xr,
+                            "gross_pnl":round(gross_pnl,4), "fee":round(fee_e+fee_x,4),
+                            "pnl":round(pnl,4), "equity":round(equity,4), "won":won,
+                            "p1":round(ef,6), "p2":round(es,6), "p3":round(c_close,6),
+                            "fib_entry":round(entry_p,6),
+                        })
+                        in_trade = False
+                        entry_p = sl_l = tp_l = pos_l = notional_l = entry_idx = None
                     continue
 
-                # Monitor trade
-                xp = xr = xc = None
+                # Check trend + ADX conditions
                 if st == "bull":
-                    if c_low  <= sl_lvl: xp = sl_lvl; xr = "SL"; xc = ci
-                    elif c_high >= tp:   xp = tp;     xr = "TP"; xc = ci
+                    uptrend = c_close > ef and c_close > es and ef > es
+                    if not uptrend: continue
                 else:
-                    if c_high >= sl_lvl: xp = sl_lvl; xr = "SL"; xc = ci
-                    elif c_low  <= tp:   xp = tp;     xr = "TP"; xc = ci
+                    downtrend = c_close < ef and c_close < es and ef < es
+                    if not downtrend: continue
 
-                if xr:
-                    gross_pnl = (xp - entry_price) * pos if st == "bull" else (entry_price - xp) * pos
-                    won       = xr == "TP"
-                    fee_entry = notional * 0.0002
-                    fee_exit  = notional * 0.0002 if won else notional * 0.00055
-                    total_fee = fee_entry + fee_exit
-                    pnl       = gross_pnl - total_fee
-                    equity   += pnl
+                if not adx_trending(ci): continue
 
-                    dir_trades.append({
-                        "id":         0,
-                        "direction":  "LONG" if st=="bull" else "SHORT",
-                        "p1_time":    timestamps[entry_idx],
-                        "entry_time": timestamps[entry_idx],
-                        "exit_time":  timestamps[xc],
-                        "entry":      round(entry_price, 6),
-                        "sl":         round(sl_lvl, 6),
-                        "tp":         round(tp, 6),
-                        "exit_price": round(xp, 6),
-                        "result":     xr,
-                        "gross_pnl":  round(gross_pnl, 4),
-                        "fee":        round(total_fee, 4),
-                        "pnl":        round(pnl, 4),
-                        "equity":     round(equity, 4),
-                        "won":        won,
-                        "p1":         round(hist_high if st=="bull" else hist_low, 6),
-                        "p2":         round(entry_price, 6),
-                        "p3":         round(entry_price, 6),
-                        "fib_entry":  round(entry_price, 6),
-                    })
-                    in_trade = False
-                    entry_price = sl_lvl = tp = pos = notional = entry_idx = None
+                # Entry trigger — candle LOW touches either EMA from above, closes back above
+                if st == "bull":
+                    touched_fast = c_low <= ef and c_close > ef
+                    touched_slow = c_low <= es and c_close > es
+                    if not (touched_fast or touched_slow): continue
+                    ep = ef if touched_fast else es
+                else:
+                    touched_fast = c_high >= ef and c_close < ef
+                    touched_slow = c_high >= es and c_close < es
+                    if not (touched_fast or touched_slow): continue
+                    ep = ef if touched_fast else es
+
+                atr    = atr_arr[ci]
+                if atr <= 0: continue
+                sl     = ep - atr * 1.5 if st=="bull" else ep + atr * 1.5
+                rpp    = abs(ep - sl)
+                if rpp <= 0: continue
+                tp     = ep + rpp * rr if st=="bull" else ep - rpp * rr
+                pos    = (equity * risk_pct) / rpp
+                notional = pos * ep
+
+                entry_p    = ep
+                sl_l       = sl
+                tp_l       = tp
+                pos_l      = pos
+                notional_l = notional
+                entry_idx  = ci
+                in_trade   = True
 
             return dir_trades
 
-        bull_t = run_direction_bo("bull")
-        bear_t = run_direction_bo("bear")
+        # EMA arrays must be computed — force them on
+        if ema_f is None or ema_s is None:
+            return []
+
+        bull_t = run_direction_ec("bull")
+        bear_t = run_direction_ec("bear")
         return sorted(bull_t + bear_t, key=lambda t: t["entry_time"])
 
     # ── ROUTE BY ENGINE ────────────────────────────────────
@@ -1330,9 +1415,11 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
     elif engine == "classic_v2":
         all_trades = run_classic(v2=True)
     elif engine == "pullback":
-        all_trades = run_pullback()
-    elif engine == "breakout":
-        all_trades = run_breakout(atr_mult=atr_mult)
+        all_trades = run_classic(v2=True)
+    elif engine == "bos_pivot":
+        all_trades = run_classic(v2=False)
+    elif engine == "ema_cross":
+        all_trades = run_ema_cross()
     else:
         # structure engine — run both directions, merge chronologically
         bull_trades = run_direction("bull")
@@ -1439,17 +1526,20 @@ def process_request(req: BacktestRequest):
         days   = (candles[-1][0] - candles[0][0]) // 86400000
 
         # Run fixed 2% first (needed for Kelly calculation)
+        # EMA cross engine always needs EMA computed — force use_ema_filter on
         ema_kwargs = dict(
-            use_ema_filter=req.use_ema_filter,
+            use_ema_filter=req.use_ema_filter or req.engine == "ema_cross",
             ema_fast=req.ema_fast,
             ema_slow=req.ema_slow,
+            adx_period=req.adx_period,
+            adx_threshold=req.adx_threshold,
         )
 
         trades_fixed = run_backtest_core(
             candles, pivots, 0.02, req.rr, req.fib_level,
             req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
             req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
-            **ema_kwargs, atr_mult=req.atr_mult
+            **ema_kwargs
         )
         stats_fixed = calc_stats(trades_fixed, days)
 
@@ -1463,7 +1553,7 @@ def process_request(req: BacktestRequest):
             candles, pivots, risk_pct, req.rr, req.fib_level,
             req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
             req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
-            **ema_kwargs, atr_mult=req.atr_mult
+            **ema_kwargs
         )
         stats = calc_stats(trades, days)
 
@@ -1518,7 +1608,7 @@ def process_request(req: BacktestRequest):
 # ── ROUTES ────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "Fib Backtest API v8", "rules": "all_engines_fees+touch_limit+new_pairs"}
+    return {"status": "Fib Backtest API v10", "rules": "ema_cross+adx+pullback_p1reset"}
 
 @app.get("/pairs")
 def get_pairs():
