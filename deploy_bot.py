@@ -23,13 +23,14 @@ TELEGRAM_API = f"https://api.telegram.org/bot{DEPLOY_BOT_TOKEN}"
 
 # File routing — maps filename to repo + path
 FILE_ROUTES = {
-    "index.html":       {"repo": "fib-backtest-ui",  "path": "index.html"},
-    "main.py":          {"repo": "fib-backtest-api", "path": "main.py"},
-    "paper_trader.py":  {"repo": "fib-backtest-api", "path": "paper_trader.py"},
-    "live_trader.py":   {"repo": "fib-backtest-api", "path": "live_trader.py"},
-    "deploy_bot.py":    {"repo": "fib-backtest-api", "path": "deploy_bot.py"},
-    "requirements.txt": {"repo": "fib-backtest-api", "path": "requirements.txt"},
-    "Procfile":         {"repo": "fib-backtest-api", "path": "Procfile"},
+    "index.html":        {"repo": "fib-backtest-ui",  "path": "index.html"},
+    "main.py":           {"repo": "fib-backtest-api", "path": "main.py"},
+    "paper_trader.py":   {"repo": "fib-backtest-api", "path": "paper_trader.py"},
+    "live_trader.py":    {"repo": "fib-backtest-api", "path": "live_trader.py"},
+    "deploy_bot.py":     {"repo": "fib-backtest-api", "path": "deploy_bot.py"},
+    "requirements.txt":  {"repo": "fib-backtest-api", "path": "requirements.txt"},
+    "Procfile":          {"repo": "fib-backtest-api", "path": "Procfile"},
+    "matrix_runner.py":  {"repo": "fib-backtest-api", "path": "matrix_runner.py"},
 }
 
 # ── TELEGRAM HELPERS ──────────────────────────────────────
@@ -127,13 +128,14 @@ Just send me any of these files and I'll push to GitHub automatically:
 📄 <code>deploy_bot.py</code> → fib-backtest-api
 📄 <code>requirements.txt</code> → fib-backtest-api
 📄 <code>Procfile</code> → fib-backtest-api
+📄 <code>matrix_runner.py</code> → fib-backtest-api
 
 <b>Commands:</b>
 /help — show this message
 /status — check GitHub repos
 /files — list deployable files
 
-Railway auto-deploys within 2 minutes of every push. GitHub Pages updates within 2 minutes for frontend files.""")
+Railway auto-deploys within 2 minutes of every push.""")
 
 def handle_status():
     send("⏳ Checking status...")
@@ -171,13 +173,11 @@ def handle_file(message):
 
     send(f"📥 Received <code>{filename}</code>\n⏳ Deploying to <b>{repo}</b>...")
 
-    # Download file
     content = download_file(file_id)
     if not content:
         send(f"❌ Failed to download {filename}")
         return
 
-    # Push to GitHub
     now_str    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     commit_msg = f"Deploy {filename} via Telegram — {now_str}"
     success, result = push_to_github(repo, path, content, commit_msg)
@@ -213,7 +213,6 @@ Send /help for instructions.""")
                 offset = update["update_id"] + 1
                 msg = update.get("message", {})
 
-                # Security — only respond to authorized chat
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if chat_id != str(DEPLOY_CHAT_ID):
                     print(f"Unauthorized: {chat_id}")
