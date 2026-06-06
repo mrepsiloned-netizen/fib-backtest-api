@@ -1056,9 +1056,18 @@ def calc_stats(trades, days):
 # ── PROCESS ONE REQUEST ───────────────────────────────────
 def process_request(req: BacktestRequest):
     try:
-        # Only use result cache for fixed historical periods (not "now")
-        # "now" is a moving target — always fetch fresh
-        if SUPABASE_URL and req.end_date != "now":
+        # Determine if this is a rolling/recent period
+        # Rolling = end_date is "now" OR start_date is within last 90 days
+        now_ts = datetime.now(timezone.utc)
+        try:
+            start_dt = datetime.strptime(req.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            days_ago = (now_ts - start_dt).days
+            is_rolling = req.end_date == "now" or days_ago <= 90
+        except Exception:
+            is_rolling = req.end_date == "now"
+
+        # Never use result cache for rolling/recent periods
+        if SUPABASE_URL and not is_rolling:
             cached_stats = get_cached_result(
                 req.symbol, req.timeframe, req.pivot_n,
                 req.risk_method, req.rr, req.start_date, req.end_date, req.fib_level
