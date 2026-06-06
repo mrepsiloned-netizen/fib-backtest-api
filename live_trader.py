@@ -401,18 +401,18 @@ def detect_signal(candles, pivots, rr, fib_level=0.5, min_swing_pct=0.002, stop_
     c_high = highs[-2]
     c_low  = lows[-2]
 
+    pivot_highs = [p for p in pivots if p["type"] == "H"]
+    pivot_lows  = [p for p in pivots if p["type"] == "L"]
+
     best_bull = None
     best_bear = None
 
-    for pi in range(1, len(pivots)):
-        p_prev = pivots[pi - 1]
-        p_curr = pivots[pi]
-
-        # Bull BOS
-        if (p_curr["type"] == "H" and p_prev["type"] == "H" and
-                p_curr["price"] > p_prev["price"]):
-            p2  = float(min(lows[p_prev["idx"]:p_curr["idx"] + 1]))
-            p3  = p_curr["price"]
+    for i in range(1, len(pivot_highs)):
+        p_prev_h = pivot_highs[i - 1]
+        p_curr_h = pivot_highs[i]
+        if p_curr_h["price"] > p_prev_h["price"]:
+            p2  = float(min(lows[p_prev_h["idx"]:p_curr_h["idx"] + 1]))
+            p3  = p_curr_h["price"]
             rng = p3 - p2
             if rng > 0 and rng / max(p2, 1) >= min_swing_pct:
                 fe = p3 - rng * fib_level
@@ -420,11 +420,12 @@ def detect_signal(candles, pivots, rr, fib_level=0.5, min_swing_pct=0.002, stop_
                 if c_low >= sl:
                     best_bull = {"p2": p2, "p3": p3, "fib_entry": fe, "sl": sl}
 
-        # Bear BOS
-        if (p_curr["type"] == "L" and p_prev["type"] == "L" and
-                p_curr["price"] < p_prev["price"]):
-            p2  = float(max(highs[p_prev["idx"]:p_curr["idx"] + 1]))
-            p3  = p_curr["price"]
+    for i in range(1, len(pivot_lows)):
+        p_prev_l = pivot_lows[i - 1]
+        p_curr_l = pivot_lows[i]
+        if p_curr_l["price"] < p_prev_l["price"]:
+            p2  = float(max(highs[p_prev_l["idx"]:p_curr_l["idx"] + 1]))
+            p3  = p_curr_l["price"]
             rng = p2 - p3
             if rng > 0 and rng / max(p2, 1) >= min_swing_pct:
                 fe = p3 + rng * fib_level
