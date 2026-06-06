@@ -1817,6 +1817,60 @@ def delete_candles(req: DeleteCandlesRequest):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+@app.get("/matrix-status")
+def matrix_status():
+    try:
+        res = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/matrix_status?id=eq.1&select=*",
+            headers=HEADERS, timeout=10
+        )
+        if res.status_code == 200 and res.json():
+            return {"success": True, **res.json()[0]}
+        return {"success": False, "status": "not_started", "completed": 0, "total": 0}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/matrix-results/export")
+def matrix_results_export(
+    min_return: float = 0,
+    min_sharpe: float = 0,
+    min_trades: int   = 0,
+    max_dd:     float = 100,
+    pair:       str   = "",
+    engine:     str   = "",
+    limit:      int   = 50000
+):
+    try:
+        filters = ["success=eq.true"]
+        if min_return > 0: filters.append(f"return_pct=gte.{min_return}")
+        if min_sharpe > 0: filters.append(f"sharpe=gte.{min_sharpe}")
+        if min_trades > 0: filters.append(f"trades=gte.{min_trades}")
+        if max_dd < 100:   filters.append(f"max_dd=lte.{max_dd}")
+        if pair:            filters.append(f"pair=eq.{pair}")
+        if engine:          filters.append(f"engine=eq.{engine}")
+        q = "&".join(filters) + f"&order=sharpe.desc&limit={limit}"
+        res = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/matrix_results?{q}&select=*",
+            headers=HEADERS, timeout=30
+        )
+        if res.status_code != 200:
+            return {"success": False, "error": res.text}
+        rows = res.json()
+        if not rows:
+            return {"success": True, "count": 0, "csv": ""}
+        # Build CSV
+        import io, csv as csv_mod
+        buf = io.StringIO()
+        fields = ["pair","timeframe","engine","entry_mode","pivot_n","rr","fib_level",
+                  "ema_pair","adx_min","return_pct","cagr","max_dd","sharpe",
+                  "profit_factor","win_rate","trades","avg_win","avg_loss","period_start","period_end"]
+        w = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+        return {"success": True, "count": len(rows), "csv": buf.getvalue()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 @app.get("/journal")
 def journal():
     try:
