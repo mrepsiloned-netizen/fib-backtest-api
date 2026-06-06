@@ -1021,11 +1021,11 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
             while ci < n - 1:
                 c_high  = highs[ci]
                 c_low   = lows[ci]
+                c_close = closes[ci]
 
                 # ── RESET CHECK ─────────────────────────────
                 if armed and not in_trade:
                     if st == "bull" and c_low < p1_price:
-                        # Price broke below P1 — structure invalid, restart
                         p1_idx = None; p1_price = None
                         p3_price = None; p2_price = None
                         fib_e = None; sl_lvl = None
@@ -1040,10 +1040,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
                 # ── FIND P1 ─────────────────────────────────
                 if p1_idx is None:
-                    # Look for confirmed pivot in past
                     if st == "bull":
-                        # P1 = candle whose HIGH is highest in [ci-N, ci+N]
-                        # Since we need N to the right, check ci-N
                         check = ci - N
                         if check >= N:
                             window_highs = highs[check-N:check+N+1]
@@ -1059,31 +1056,38 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                                 p1_price = float(lows[check])
                     ci += 1; continue
 
+                # ── SNAPSHOT FIB BEFORE P3 UPDATE ────────────
+                # Critical: snapshot the current fib level BEFORE updating P3
+                # Entry trigger checks against this snapshot so:
+                # - Touch: checks if wick reached the fib that was active THIS candle
+                # - Rejection: checks close against same fib level the wick touched
+                # This ensures Touch and Rejection produce genuinely different results
+                fib_snapshot = fib_e
+                sl_snapshot  = sl_lvl
+
                 # ── P3 DETECTION AND UPDATE ──────────────────
-                # Wait for candle close before updating P3
-                # (ci is a closed candle in backtest — each loop step is one closed candle)
+                # Each candle close is one opportunity to update P3
                 if not armed:
                     if st == "bull" and c_high > p1_price:
-                        # Breakout — P3 formed or updated
                         if p3_price is None or c_high > p3_price:
                             p3_price = float(c_high)
                             p2_price = float(min(lows[p1_idx:ci+1]))
                             rng = p3_price - p2_price
                             if rng > 0:
-                                fib_e   = p2_price + rng * fib_level
-                                sl_lvl  = p1_price
-                                armed   = True
+                                fib_e  = p2_price + rng * fib_level
+                                sl_lvl = p1_price
+                                armed  = True
                     elif st == "bear" and c_low < p1_price:
                         if p3_price is None or c_low < p3_price:
                             p3_price = float(c_low)
                             p2_price = float(max(highs[p1_idx:ci+1]))
                             rng = p2_price - p3_price
                             if rng > 0:
-                                fib_e   = p2_price - rng * fib_level
-                                sl_lvl  = p1_price
-                                armed   = True
+                                fib_e  = p2_price - rng * fib_level
+                                sl_lvl = p1_price
+                                armed  = True
                 else:
-                    # Already armed — update P3 if new extreme (wait for candle close)
+                    # Update P3 on new extreme — fib shifts for NEXT candle
                     if st == "bull" and c_high > p3_price:
                         p3_price = float(c_high)
                         p2_price = float(min(lows[p1_idx:ci+1]))
@@ -1104,20 +1108,26 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                     if not ema_allows(ci, st):
                         ci += 1; continue
 
-                # ── ENTRY TRIGGER ────────────────────────────
-                if armed and not in_trade and fib_e is not None:
+                # ── ENTRY TRIGGER — uses fib_snapshot ────────
+                # fib_snapshot = fib level BEFORE this candle's P3 update
+                # Ensures entry checks the level that was active when price touched it
+                # Touch:     wick reached snapshot fib → fill at that level
+                # Rejection: wick reached snapshot fib AND close back above it → fill
+                if armed and not in_trade and fib_snapshot is not None:
                     triggered = False
                     if entry_mode == "touch":
-                        if st == "bull" and c_low  <= fib_e: triggered = True
-                        if st == "bear" and c_high >= fib_e: triggered = True
+                        if st == "bull" and c_low  <= fib_snapshot: triggered = True
+                        if st == "bear" and c_high >= fib_snapshot: triggered = True
                     else:  # rejection
-                        if st == "bull" and c_low  <= fib_e and closes[ci] > fib_e: triggered = True
-                        if st == "bear" and c_high >= fib_e and closes[ci] < fib_e: triggered = True
+                        if st == "bull" and c_low  <= fib_snapshot and c_close > fib_snapshot: triggered = True
+                        if st == "bear" and c_high >= fib_snapshot and c_close < fib_snapshot: triggered = True
 
                     if triggered:
-                        entry_price = fib_e
+                        entry_price = fib_snapshot  # fill at the fib level that was active
+                        sl_price    = sl_snapshot if sl_snapshot else p1_price
                         entry_idx   = ci
-                        rpp         = abs(entry_price - sl_lvl)
+                        rpp         = abs(entry_price - sl_price)
+                        sl_lvl      = sl_price  # lock SL at snapshot value
                         if rpp <= 0: ci += 1; continue
                         tp      = entry_price + rpp * rr if st == "bull" else entry_price - rpp * rr
                         pos     = (equity * risk_pct) / rpp
