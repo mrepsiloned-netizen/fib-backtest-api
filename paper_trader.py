@@ -278,38 +278,57 @@ def detect_signal(candles, pivots, rr, fib_level=0.5, min_swing_pct=0.002, stop_
     c_high = highs[-2]
     c_low  = lows[-2]
 
+    # Separate pivot lists by type — alternating dedup means we need to
+    # compare H to previous H and L to previous L by skipping intervening pivots
+    pivot_highs = [p for p in pivots if p["type"] == "H"]
+    pivot_lows  = [p for p in pivots if p["type"] == "L"]
+
     best_bull = None
     best_bear = None
 
-    for pi in range(1, len(pivots)):
-        p_prev = pivots[pi - 1]
-        p_curr = pivots[pi]
+    # Bull BOS: find most recent pivot HIGH that exceeds the one before it
+    # Between two consecutive HIGHs, the LOW between them is P2 (swing low)
+    for i in range(1, len(pivot_highs)):
+        p_prev_h = pivot_highs[i - 1]
+        p_curr_h = pivot_highs[i]
 
-        # Bull BOS: consecutive pivot HIGHs, current > previous
-        if (p_curr["type"] == "H" and p_prev["type"] == "H" and
-                p_curr["price"] > p_prev["price"]):
-            p2  = float(min(lows[p_prev["idx"]:p_curr["idx"] + 1]))
-            p3  = p_curr["price"]
+        if p_curr_h["price"] > p_prev_h["price"]:
+            # P2 = lowest low between these two highs
+            p2  = float(min(lows[p_prev_h["idx"]:p_curr_h["idx"] + 1]))
+            p3  = p_curr_h["price"]
             rng = p3 - p2
             if rng > 0 and rng / max(p2, 1) >= min_swing_pct:
                 fe = p3 - rng * fib_level
                 sl = p2 - p2 * stop_buffer_pct
-                if c_low >= sl:  # structure still valid
-                    best_bull = {"p2": p2, "p3": p3, "fib_entry": fe, "sl": sl}
+                # Structure valid: price hasn't dropped below SL
+                if c_low >= sl:
+                    best_bull = {
+                        "p2": p2, "p3": p3, "fib_entry": fe, "sl": sl,
+                        "p_idx": p_curr_h["idx"]
+                    }
 
-        # Bear BOS: consecutive pivot LOWs, current < previous
-        if (p_curr["type"] == "L" and p_prev["type"] == "L" and
-                p_curr["price"] < p_prev["price"]):
-            p2  = float(max(highs[p_prev["idx"]:p_curr["idx"] + 1]))
-            p3  = p_curr["price"]
+    # Bear BOS: find most recent pivot LOW that breaks below the one before it
+    # Between two consecutive LOWs, the HIGH between them is P2 (swing high)
+    for i in range(1, len(pivot_lows)):
+        p_prev_l = pivot_lows[i - 1]
+        p_curr_l = pivot_lows[i]
+
+        if p_curr_l["price"] < p_prev_l["price"]:
+            # P2 = highest high between these two lows
+            p2  = float(max(highs[p_prev_l["idx"]:p_curr_l["idx"] + 1]))
+            p3  = p_curr_l["price"]
             rng = p2 - p3
             if rng > 0 and rng / max(p2, 1) >= min_swing_pct:
                 fe = p3 + rng * fib_level
                 sl = p2 + p2 * stop_buffer_pct
-                if c_high <= sl:  # structure still valid
-                    best_bear = {"p2": p2, "p3": p3, "fib_entry": fe, "sl": sl}
+                # Structure valid: price hasn't broken above SL
+                if c_high <= sl:
+                    best_bear = {
+                        "p2": p2, "p3": p3, "fib_entry": fe, "sl": sl,
+                        "p_idx": p_curr_l["idx"]
+                    }
 
-    # Bull — last closed candle LOW touched fib
+    # Bull — last closed candle LOW touched fib → LONG entry
     if best_bull:
         fe  = best_bull["fib_entry"]
         sl  = best_bull["sl"]
@@ -323,7 +342,7 @@ def detect_signal(candles, pivots, rr, fib_level=0.5, min_swing_pct=0.002, stop_
                 "current": round(c_low, 6), "rr": rr
             }
 
-    # Bear — last closed candle HIGH touched fib
+    # Bear — last closed candle HIGH touched fib → SHORT entry
     if best_bear:
         fe  = best_bear["fib_entry"]
         sl  = best_bear["sl"]
