@@ -1913,6 +1913,50 @@ def matrix_status():
     except Exception as e:
         return {"success": False, "error": str(e), "is_running": _matrix_running}
 
+@app.get("/matrix-results/all")
+def matrix_results_all():
+    """Export ALL results with no filters — raw dump."""
+    from fastapi.responses import StreamingResponse
+    import io, csv as csv_mod
+
+    fields = ["pair","timeframe","engine","entry_mode","pivot_n","rr","fib_level",
+              "ema_pair","adx_min","return_pct","cagr","max_dd","sharpe","profit_factor",
+              "win_rate","trades","wins","losses","avg_win","avg_loss","kelly_full",
+              "total_fees","period_start","period_end"]
+
+    def generate():
+        buf = io.StringIO()
+        w   = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        yield buf.getvalue()
+
+        offset = 0
+        while True:
+            try:
+                q   = f"order=sharpe.desc&limit=5000&offset={offset}&select={','.join(fields)}"
+                res = httpx.get(
+                    f"{SUPABASE_URL}/rest/v1/matrix_results?{q}",
+                    headers=HEADERS, timeout=60
+                )
+                if res.status_code != 200: break
+                rows = res.json()
+                if not rows: break
+                buf = io.StringIO()
+                w   = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+                w.writerows(rows)
+                yield buf.getvalue()
+                if len(rows) < 5000: break
+                offset += 5000
+            except Exception as e:
+                print(f"Export error: {e}")
+                break
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=waddle_matrix_all.csv"}
+    )
+
 @app.get("/matrix-results/export")
 def matrix_results_export(
     min_return: float = 0,
