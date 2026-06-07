@@ -9,7 +9,7 @@
 #   - Pivot confirmation lag on original engine
 # ============================================================
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import ccxt
