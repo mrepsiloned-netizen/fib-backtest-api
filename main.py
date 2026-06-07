@@ -1817,6 +1817,42 @@ def delete_candles(req: DeleteCandlesRequest):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+# ── MATRIX RUNNER BACKGROUND THREAD ──────────────────────
+import threading
+
+_matrix_thread = None
+_matrix_running = False
+
+def _run_matrix_thread():
+    global _matrix_running
+    _matrix_running = True
+    try:
+        import importlib.util, sys, os
+        # Try to import matrix_runner from same directory
+        spec = importlib.util.spec_from_file_location(
+            "matrix_runner",
+            os.path.join(os.path.dirname(__file__), "matrix_runner.py")
+        )
+        if spec:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.main()
+        else:
+            print("matrix_runner.py not found")
+    except Exception as e:
+        print(f"Matrix runner error: {e}")
+    finally:
+        _matrix_running = False
+
+@app.post("/run-matrix")
+def run_matrix():
+    global _matrix_thread, _matrix_running
+    if _matrix_running:
+        return {"success": False, "message": "Matrix runner already running"}
+    _matrix_thread = threading.Thread(target=_run_matrix_thread, daemon=True)
+    _matrix_thread.start()
+    return {"success": True, "message": "Matrix runner started — check Runner tab for progress"}
+
 @app.get("/matrix-status")
 def matrix_status():
     try:
