@@ -1949,9 +1949,10 @@ def matrix_results_all():
         while True:
             try:
                 q   = f"order=sharpe.desc&limit=5000&offset={offset}&select={','.join(fields)}"
+                export_headers = {**HEADERS, "Range-Unit": "items", "Range": f"{offset}-{offset+4999}"}
                 res = httpx.get(
                     f"{SUPABASE_URL}/rest/v1/matrix_results?{q}",
-                    headers=HEADERS, timeout=60
+                    headers=export_headers, timeout=60
                 )
                 if res.status_code != 200: break
                 rows = res.json()
