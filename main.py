@@ -1930,8 +1930,8 @@ def matrix_status():
 
 @app.get("/matrix-results/all")
 def matrix_results_all():
-    """Export ALL results with no filters — raw dump."""
-    from fastapi.responses import StreamingResponse
+    """Export ALL results — fetches all pages from Supabase and returns complete CSV."""
+    from fastapi.responses import Response
     import io, csv as csv_mod
 
     fields = ["pair","timeframe","engine","entry_mode","pivot_n","rr","fib_level",
@@ -1939,36 +1939,47 @@ def matrix_results_all():
               "win_rate","trades","wins","losses","avg_win","avg_loss","kelly_full",
               "total_fees","period_start","period_end"]
 
-    def generate():
-        buf = io.StringIO()
-        w   = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
-        w.writeheader()
-        yield buf.getvalue()
-
-        offset = 0
-        while True:
-            try:
-                q   = f"order=sharpe.desc&limit=5000&offset={offset}&select={','.join(fields)}"
-                export_headers = {**HEADERS, "Range-Unit": "items", "Range": f"{offset}-{offset+4999}"}
-                res = httpx.get(
-                    f"{SUPABASE_URL}/rest/v1/matrix_results?{q}",
-                    headers=export_headers, timeout=60
-                )
-                if res.status_code != 200: break
-                rows = res.json()
-                if not rows: break
-                buf = io.StringIO()
-                w   = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
-                w.writerows(rows)
-                yield buf.getvalue()
-                if len(rows) < 5000: break
-                offset += 5000
-            except Exception as e:
-                print(f"Export error: {e}")
+    # Fetch all rows by paginating with offset
+    all_rows = []
+    offset   = 0
+    batch    = 1000
+    while True:
+        try:
+            # Use offset pagination — most reliable with Supabase
+            q = (f"select={','.join(fields)}&order=sharpe.desc.nullslast"
+                 f"&limit={batch}&offset={offset}")
+            hdrs = {
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Prefer": "count=none",
+            }
+            res = httpx.get(
+                f"{SUPABASE_URL}/rest/v1/matrix_results?{q}",
+                headers=hdrs, timeout=60
+            )
+            if res.status_code != 200:
+                print(f"Supabase error {res.status_code}: {res.text[:200]}")
                 break
+            rows = res.json()
+            if not rows: break
+            all_rows.extend(rows)
+            print(f"Fetched {len(all_rows)} rows so far...")
+            if len(rows) < batch: break
+            offset += batch
+        except Exception as e:
+            print(f"Export page error at offset {offset}: {e}")
+            break
 
-    return StreamingResponse(
-        generate(),
+    # Build CSV in memory
+    buf = io.StringIO()
+    w   = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    w.writeheader()
+    w.writerows(all_rows)
+    csv_str = buf.getvalue()
+
+    print(f"Returning {len(all_rows)} rows as CSV ({len(csv_str):,} bytes)")
+    return Response(
+        content=csv_str,
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=waddle_matrix_all.csv"}
     )
