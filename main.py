@@ -1921,9 +1921,25 @@ def matrix_results_export(
     max_dd:     float = 100,
     pair:       str   = "",
     engine:     str   = "",
-    limit:      int   = 50000
 ):
-    try:
+    from fastapi.responses import StreamingResponse
+    import io, csv as csv_mod
+
+    fields = ["pair","timeframe","engine","entry_mode","pivot_n","rr","fib_level",
+              "ema_pair","adx_min",
+              "return_pct","cagr","max_dd","sharpe","profit_factor",
+              "win_rate","trades","wins","losses",
+              "avg_win","avg_loss","kelly_full","total_fees",
+              "period_start","period_end"]
+
+    def generate():
+        # Header row
+        buf = io.StringIO()
+        w   = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        yield buf.getvalue()
+
+        # Paginate through Supabase in chunks of 5000
         filters = ["success=eq.true"]
         if min_return > 0: filters.append(f"return_pct=gte.{min_return}")
         if min_sharpe > 0: filters.append(f"sharpe=gte.{min_sharpe}")
@@ -1931,31 +1947,35 @@ def matrix_results_export(
         if max_dd < 100:   filters.append(f"max_dd=lte.{max_dd}")
         if pair:            filters.append(f"pair=eq.{pair}")
         if engine:          filters.append(f"engine=eq.{engine}")
-        q = "&".join(filters) + f"&order=sharpe.desc&limit={limit}"
-        res = httpx.get(
-            f"{SUPABASE_URL}/rest/v1/matrix_results?{q}&select=*",
-            headers=HEADERS, timeout=30
-        )
-        if res.status_code != 200:
-            return {"success": False, "error": res.text}
-        rows = res.json()
-        if not rows:
-            return {"success": True, "count": 0, "csv": ""}
-        # Build CSV
-        import io, csv as csv_mod
-        buf = io.StringIO()
-        fields = ["pair","timeframe","engine","entry_mode","pivot_n","rr","fib_level",
-                  "ema_pair","adx_min",
-                  "return_pct","cagr","max_dd","sharpe","profit_factor",
-                  "win_rate","trades","wins","losses",
-                  "avg_win","avg_loss","kelly_full","total_fees",
-                  "period_start","period_end"]
-        w = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(rows)
-        return {"success": True, "count": len(rows), "csv": buf.getvalue()}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+        base_q = "&".join(filters) + "&order=sharpe.desc"
+
+        offset = 0
+        batch  = 5000
+        while True:
+            try:
+                q   = base_q + f"&limit={batch}&offset={offset}&select={','.join(fields)}"
+                res = httpx.get(
+                    f"{SUPABASE_URL}/rest/v1/matrix_results?{q}",
+                    headers=HEADERS, timeout=60
+                )
+                if res.status_code != 200: break
+                rows = res.json()
+                if not rows: break
+                buf = io.StringIO()
+                w   = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+                w.writerows(rows)
+                yield buf.getvalue()
+                if len(rows) < batch: break
+                offset += batch
+            except Exception as e:
+                print(f"Export page error: {e}")
+                break
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=waddle_matrix.csv"}
+    )
 
 @app.get("/journal")
 def journal():
