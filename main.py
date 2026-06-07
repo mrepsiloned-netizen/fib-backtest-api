@@ -1844,6 +1844,21 @@ def _run_matrix_thread():
     finally:
         _matrix_running = False
 
+@app.post("/batch")
+async def batch_backtest(request: Request):
+    """Run multiple backtest configs in one call. Returns list of results."""
+    body    = await request.json()
+    configs = body.get("configs", [])
+    results = []
+    for cfg in configs:
+        try:
+            req = BacktestRequest(**cfg)
+            res = process_request(req)
+            results.append(res)
+        except Exception as e:
+            results.append({"success": False, "error": str(e)})
+    return {"results": results}
+
 @app.post("/run-matrix")
 def run_matrix():
     global _matrix_thread, _matrix_running
