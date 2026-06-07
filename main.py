@@ -1848,10 +1848,53 @@ def _run_matrix_thread():
 def run_matrix():
     global _matrix_thread, _matrix_running
     if _matrix_running:
-        return {"success": False, "message": "Matrix runner already running"}
-    _matrix_thread = threading.Thread(target=_run_matrix_thread, daemon=True)
+        return {"success": False, "message": "Already running"}
+    def _run_compute():
+        global _matrix_running
+        _matrix_running = True
+        try:
+            import importlib.util, os
+            spec = importlib.util.spec_from_file_location(
+                "matrix_runner",
+                os.path.join(os.path.dirname(__file__), "matrix_runner.py")
+            )
+            if spec:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                mod.main_compute()
+        except Exception as e:
+            print(f"Compute error: {e}")
+        finally:
+            _matrix_running = False
+    _matrix_thread = threading.Thread(target=_run_compute, daemon=True)
     _matrix_thread.start()
-    return {"success": True, "message": "Matrix runner started — check Runner tab for progress"}
+    return {"success": True, "message": "Computation started — check Runner tab"}
+
+@app.post("/prefetch-candles")
+def prefetch_candles_endpoint():
+    global _matrix_thread, _matrix_running
+    if _matrix_running:
+        return {"success": False, "message": "Already running"}
+    def _run_prefetch():
+        global _matrix_running
+        _matrix_running = True
+        try:
+            import importlib.util, os
+            spec = importlib.util.spec_from_file_location(
+                "matrix_runner",
+                os.path.join(os.path.dirname(__file__), "matrix_runner.py")
+            )
+            if spec:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                mod.main_prefetch()
+        except Exception as e:
+            print(f"Prefetch error: {e}")
+        finally:
+            _matrix_running = False
+    _matrix_thread = threading.Thread(target=_run_prefetch, daemon=True)
+    _matrix_thread.start()
+    return {"success": True, "message": "Prefetch started — check Runner tab"}
 
 @app.get("/matrix-status")
 def matrix_status():
@@ -1861,10 +1904,14 @@ def matrix_status():
             headers=HEADERS, timeout=10
         )
         if res.status_code == 200 and res.json():
-            return {"success": True, **res.json()[0]}
-        return {"success": False, "status": "not_started", "completed": 0, "total": 0}
+            data = res.json()[0]
+            # Add live running flag
+            data["is_running"] = _matrix_running
+            return {"success": True, **data}
+        return {"success": False, "status": "not_started", "completed": 0,
+                "total": 0, "phase": "", "is_running": _matrix_running}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": str(e), "is_running": _matrix_running}
 
 @app.get("/matrix-results/export")
 def matrix_results_export(
@@ -1898,8 +1945,11 @@ def matrix_results_export(
         import io, csv as csv_mod
         buf = io.StringIO()
         fields = ["pair","timeframe","engine","entry_mode","pivot_n","rr","fib_level",
-                  "ema_pair","adx_min","return_pct","cagr","max_dd","sharpe",
-                  "profit_factor","win_rate","trades","avg_win","avg_loss","period_start","period_end"]
+                  "ema_pair","adx_min",
+                  "return_pct","cagr","max_dd","sharpe","profit_factor",
+                  "win_rate","trades","wins","losses",
+                  "avg_win","avg_loss","kelly_full","total_fees",
+                  "period_start","period_end"]
         w = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
