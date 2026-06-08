@@ -2069,3 +2069,41 @@ def live_journal():
         return {"success": True, "account": account, "trades": trades}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+@app.get("/candles")
+def get_candles(
+    symbol:    str = "XRP/USDT",
+    timeframe: str = "15m",
+    start_ms:  int = 0,
+    end_ms:    int = 0,
+    limit:     int = 2000,
+):
+    """
+    Serve candle data from Supabase cache to the frontend chart.
+    Called by TradeChartViz — avoids CORS issues with direct Supabase access.
+    """
+    try:
+        if not SUPABASE_URL:
+            return {"success": False, "error": "Supabase not configured", "candles": []}
+        limit = min(limit, 5000)
+        all_rows = []
+        offset   = 0
+        page     = 1000
+        while True:
+            filters = f"symbol=eq.{symbol}&timeframe=eq.{timeframe}&order=ts.asc&limit={page}&offset={offset}&select=ts,open,high,low,close"
+            if start_ms > 0: filters += f"&ts=gte.{start_ms}"
+            if end_ms   > 0: filters += f"&ts=lte.{end_ms}"
+            res = httpx.get(
+                f"{SUPABASE_URL}/rest/v1/candles?{filters}",
+                headers=HEADERS, timeout=30
+            )
+            if res.status_code != 200:
+                break
+            rows = res.json()
+            if not rows: break
+            all_rows += rows
+            if len(all_rows) >= limit or len(rows) < page: break
+            offset += page
+        return {"success": True, "candles": all_rows[:limit], "count": len(all_rows[:limit])}
+    except Exception as e:
+        return {"success": False, "error": str(e), "candles": []}
