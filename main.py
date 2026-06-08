@@ -546,6 +546,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
         armed_since  = None
         pending_p1   = None
         c_watch      = None
+        p2_time      = None   # timestamp when P2 high/low formed
+        p3_time      = None   # timestamp of candle that set final P3
 
         if st == "bull":
             p2_candidate = float(min(lows[p1_idx:p1_idx+2]))
@@ -575,6 +577,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                         p2        = p2_candidate
                         bos_idx   = ci
                         p3_float  = float(highs[ci])
+                        p2_time   = timestamps[ci]   # P2 low formed up to BOS candle
+                        p3_time   = timestamps[ci]   # P3 starts at BOS candle
                         rng       = p3_float - p2
                         if rng > 0 and rng / max(p2, 1) >= min_swing_pct:
                             fib_entry   = p3_float - rng * fib_level
@@ -594,6 +598,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                         p2        = p2_candidate
                         bos_idx   = ci
                         p3_float  = float(lows[ci])
+                        p2_time   = timestamps[ci]   # P2 high formed up to BOS candle
+                        p3_time   = timestamps[ci]   # P3 starts at BOS candle
                         rng       = p2 - p3_float
                         if rng > 0 and rng / max(p2, 1) >= min_swing_pct:
                             fib_entry   = p3_float + rng * fib_level
@@ -627,12 +633,14 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
                 if st == "bull" and c_high > p3_float:
                     p3_float  = float(c_high)
+                    p3_time   = timestamps[ci]   # track which candle set new P3 high
                     rng       = p3_float - p2
                     if rng > 0:
                         fib_entry = p3_float - rng * fib_level
 
                 elif st == "bear" and c_low < p3_float:
                     p3_float  = float(c_low)
+                    p3_time   = timestamps[ci]   # track which candle set new P3 low
                     rng       = p2 - p3_float
                     if rng > 0:
                         fib_entry = p3_float + rng * fib_level
@@ -686,6 +694,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                         if rng > 0 and rng / max(new_p2, 1) >= min_swing_pct:
                             p2        = new_p2
                             p3_float  = new_p3
+                            p2_time   = timestamps[p1_idx]
+                            p3_time   = timestamps[ci]
                             fib_entry = p3_float - rng * fib_level
                             bos_idx   = ci
                             armed_since = ci
@@ -706,6 +716,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                         if rng > 0 and rng / max(new_p2, 1) >= min_swing_pct:
                             p2        = new_p2
                             p3_float  = new_p3
+                            p2_time   = timestamps[p1_idx]
+                            p3_time   = timestamps[ci]
                             fib_entry = p3_float + rng * fib_level
                             bos_idx   = ci
                             armed_since = ci
@@ -801,6 +813,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                     "id":         0,
                     "direction":  "LONG" if st == "bull" else "SHORT",
                     "p1_time":    timestamps[p1_idx] if p1_idx < n else None,
+                    "p2_time":    p2_time,
+                    "p3_time":    p3_time,
                     "entry_time": timestamps[entry_candle],
                     "exit_time":  timestamps[xc],
                     "entry":      round(entry, 6),
