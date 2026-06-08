@@ -888,10 +888,13 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                         if ci - p1_idx < N_min: break
                         p3_idx = ci; p3_close = closes_[ci]
                         p2 = float(min(closes_[p1_idx:p3_idx + 1]))
+                        # find which candle had the min close for p2_time
+                        p2_ci = p1_idx + int(np.argmin(closes_[p1_idx:p3_idx + 1]))
                         rng = p3_close - p2
                         if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: break
                         setups.append({"st":"bull","p1_idx":p1_idx,"p1_price":p1_price,
-                            "p2":p2,"p3_idx":p3_idx,"p3_close":p3_close,
+                            "p2":p2,"p2_time":timestamps[p2_ci],
+                            "p3_idx":p3_idx,"p3_close":p3_close,"p3_time":timestamps[ci],
                             "rng":rng,"fib618":p2 + rng * fib_level,"sl":p2})
                         break
                     if lows_[ci] < p1_price * 0.90: break
@@ -902,10 +905,12 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                         if ci - p1_idx < 3: break
                         p3_idx = ci; p3_close = closes_[ci]
                         p2 = float(max(closes_[p1_idx:p3_idx + 1]))
+                        p2_ci = p1_idx + int(np.argmax(closes_[p1_idx:p3_idx + 1]))
                         rng = p2 - p3_close
                         if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: break
                         setups.append({"st":"bear","p1_idx":p1_idx,"p1_price":p1_price,
-                            "p2":p2,"p3_idx":p3_idx,"p3_close":p3_close,
+                            "p2":p2,"p2_time":timestamps[p2_ci],
+                            "p3_idx":p3_idx,"p3_close":p3_close,"p3_time":timestamps[ci],
                             "rng":rng,"fib618":p2 - rng * fib_level,"sl":p2})
                         break
                     if highs_[ci] > p1_price * 1.10: break
@@ -948,19 +953,21 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
                 if st == "bull" and ci in pivot_highs_:
                     new_ph = pivot_highs_[ci]
-                    # New high above P1 — cancel current structure, start fresh from new P1
                     if new_ph > p1_price:
                         active["p1_idx"]   = ci
                         active["p1_price"] = new_ph
                         active["p3_idx"]   = ci
                         active["p3_close"] = new_ph
+                        active["p3_time"]  = timestamps[ci]
                         new_p2 = float(min(lows_[p1_idx:ci + 1]))
+                        p2_ci  = p1_idx + int(np.argmin(lows_[p1_idx:ci + 1]))
                         new_rng = new_ph - new_p2
                         if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
-                            active["p2"]     = new_p2
-                            active["rng"]    = new_rng
-                            active["fib618"] = new_p2 + new_rng * fib_level
-                            active["sl"]     = new_p2
+                            active["p2"]      = new_p2
+                            active["p2_time"] = timestamps[p2_ci]
+                            active["rng"]     = new_rng
+                            active["fib618"]  = new_p2 + new_rng * fib_level
+                            active["sl"]      = new_p2
                             fib618 = active["fib618"]
                             sl_lvl = active["sl"]
                             p2     = active["p2"]
@@ -968,14 +975,16 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             p1_price = new_ph
                             p3_idx = ci
                         ci += 1; continue
-                    # New high above P3 but below P1 — update P3, redraw fib
                     elif new_ph > active["p3_close"]:
                         new_p2  = float(min(lows_[p3_idx:ci + 1]))
+                        p2_ci   = p3_idx + int(np.argmin(lows_[p3_idx:ci + 1]))
                         new_rng = new_ph - new_p2
                         if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
                             active["p2"]      = new_p2
+                            active["p2_time"] = timestamps[p2_ci]
                             active["p3_idx"]  = ci
                             active["p3_close"]= new_ph
+                            active["p3_time"] = timestamps[ci]
                             active["rng"]     = new_rng
                             active["fib618"]  = new_p2 + new_rng * fib_level
                             active["sl"]      = new_p2
@@ -987,19 +996,21 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
                 if st == "bear" and ci in pivot_lows_:
                     new_pl = pivot_lows_[ci]
-                    # New low below P1 — cancel current structure, start fresh from new P1
                     if new_pl < p1_price:
                         active["p1_idx"]   = ci
                         active["p1_price"] = new_pl
                         active["p3_idx"]   = ci
                         active["p3_close"] = new_pl
+                        active["p3_time"]  = timestamps[ci]
                         new_p2 = float(max(highs_[p1_idx:ci + 1]))
+                        p2_ci  = p1_idx + int(np.argmax(highs_[p1_idx:ci + 1]))
                         new_rng = new_p2 - new_pl
                         if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
-                            active["p2"]     = new_p2
-                            active["rng"]    = new_rng
-                            active["fib618"] = new_p2 - new_rng * fib_level
-                            active["sl"]     = new_p2
+                            active["p2"]      = new_p2
+                            active["p2_time"] = timestamps[p2_ci]
+                            active["rng"]     = new_rng
+                            active["fib618"]  = new_p2 - new_rng * fib_level
+                            active["sl"]      = new_p2
                             fib618 = active["fib618"]
                             sl_lvl = active["sl"]
                             p2     = active["p2"]
@@ -1007,14 +1018,16 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             p1_price = new_pl
                             p3_idx = ci
                         ci += 1; continue
-                    # New low below P3 but above P1 — update P3, redraw fib
                     elif new_pl < active["p3_close"]:
                         new_p2  = float(max(highs_[p3_idx:ci + 1]))
+                        p2_ci   = p3_idx + int(np.argmax(highs_[p3_idx:ci + 1]))
                         new_rng = new_p2 - new_pl
                         if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
                             active["p2"]      = new_p2
+                            active["p2_time"] = timestamps[p2_ci]
                             active["p3_idx"]  = ci
                             active["p3_close"]= new_pl
+                            active["p3_time"] = timestamps[ci]
                             active["rng"]     = new_rng
                             active["fib618"]  = new_p2 - new_rng * fib_level
                             active["sl"]      = new_p2
@@ -1093,6 +1106,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                 "id":         0,
                 "direction":  "LONG" if st == "bull" else "SHORT",
                 "p1_time":    timestamps[p1_idx] if p1_idx < n else None,
+                "p2_time":    active.get("p2_time"),
+                "p3_time":    active.get("p3_time"),
                 "entry_time": timestamps[entry_candle],
                 "exit_time":  timestamps[xc],
                 "entry":      round(entry, 6),
