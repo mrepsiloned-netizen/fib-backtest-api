@@ -550,9 +550,11 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
         p3_time      = None   # timestamp of candle that set final P3
 
         if st == "bull":
-            p2_candidate = float(min(lows[p1_idx:p1_idx+2]))
+            p2_candidate      = float(min(lows[p1_idx:p1_idx+2]))
+            p2_candidate_time = timestamps[p1_idx]
         else:
-            p2_candidate = float(max(highs[p1_idx:p1_idx+2]))
+            p2_candidate      = float(max(highs[p1_idx:p1_idx+2]))
+            p2_candidate_time = timestamps[p1_idx]
 
         ci = p1_idx + 1
 
@@ -564,9 +566,13 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
             if state == 2:
                 if st == "bull":
-                    p2_candidate = min(p2_candidate, float(lows[ci]))
+                    if float(lows[ci]) < p2_candidate:
+                        p2_candidate      = float(lows[ci])
+                        p2_candidate_time = timestamps[ci]
                 else:
-                    p2_candidate = max(p2_candidate, float(highs[ci]))
+                    if float(highs[ci]) > p2_candidate:
+                        p2_candidate      = float(highs[ci])
+                        p2_candidate_time = timestamps[ci]
 
                 is_ph = ci in pivot_highs
                 is_pl = ci in pivot_lows
@@ -577,8 +583,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                         p2        = p2_candidate
                         bos_idx   = ci
                         p3_float  = float(highs[ci])
-                        p2_time   = timestamps[ci]   # P2 low formed up to BOS candle
-                        p3_time   = timestamps[ci]   # P3 starts at BOS candle
+                        p2_time   = p2_candidate_time  # exact candle where lowest low formed
+                        p3_time   = timestamps[ci]     # P3 starts at BOS candle
                         rng       = p3_float - p2
                         if rng > 0 and rng / max(p2, 1) >= min_swing_pct:
                             fib_entry   = p3_float - rng * fib_level
@@ -587,10 +593,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             state       = 3
                         else:
                             p1_idx = ci; p1_price = new_high
-                            p2_candidate = float(min(lows[ci:ci+2]))
-                    else:
-                        p1_idx = ci; p1_price = new_high
-                        p2_candidate = float(min(lows[ci:ci+2]))
+                            p2_candidate      = float(min(lows[ci:ci+2]))
+                            p2_candidate_time = timestamps[ci]
 
                 elif st == "bear" and is_pl:
                     new_low = pivot_lows[ci]
@@ -598,8 +602,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                         p2        = p2_candidate
                         bos_idx   = ci
                         p3_float  = float(lows[ci])
-                        p2_time   = timestamps[ci]   # P2 high formed up to BOS candle
-                        p3_time   = timestamps[ci]   # P3 starts at BOS candle
+                        p2_time   = p2_candidate_time  # exact candle where highest high formed
+                        p3_time   = timestamps[ci]     # P3 starts at BOS candle
                         rng       = p2 - p3_float
                         if rng > 0 and rng / max(p2, 1) >= min_swing_pct:
                             fib_entry   = p3_float + rng * fib_level
@@ -608,10 +612,12 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             state       = 3
                         else:
                             p1_idx = ci; p1_price = new_low
-                            p2_candidate = float(max(highs[ci:ci+2]))
+                            p2_candidate      = float(max(highs[ci:ci+2]))
+                            p2_candidate_time = timestamps[ci]
                     else:
                         p1_idx = ci; p1_price = new_low
-                        p2_candidate = float(max(highs[ci:ci+2]))
+                        p2_candidate      = float(max(highs[ci:ci+2]))
+                        p2_candidate_time = timestamps[ci]
 
                 ci += 1
                 continue
