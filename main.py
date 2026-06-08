@@ -629,11 +629,13 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                         if p["idx"] > ci:
                             if st == "bull" and p["type"] == "H":
                                 p1_idx = p["idx"]; p1_price = p["price"]
-                                p2_candidate = float(min(lows[p1_idx:p1_idx+2]))
+                                p2_candidate      = float(min(lows[p1_idx:p1_idx+2]))
+                                p2_candidate_time = timestamps[p1_idx]
                                 ci = p1_idx + 1; break
                             elif st == "bear" and p["type"] == "L":
                                 p1_idx = p["idx"]; p1_price = p["price"]
-                                p2_candidate = float(max(highs[p1_idx:p1_idx+2]))
+                                p2_candidate      = float(max(highs[p1_idx:p1_idx+2]))
+                                p2_candidate_time = timestamps[p1_idx]
                                 ci = p1_idx + 1; break
                     continue
 
@@ -657,7 +659,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                     for p in pivots:
                         if p["idx"] > ci and p["type"] == "H":
                             p1_idx = p["idx"]; p1_price = p["price"]
-                            p2_candidate = float(min(lows[p1_idx:p1_idx+2]))
+                            p2_candidate      = float(min(lows[p1_idx:p1_idx+2]))
+                            p2_candidate_time = timestamps[p1_idx]
                             break
                     if p1_idx is None:
                         break
@@ -670,7 +673,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                     for p in pivots:
                         if p["idx"] > ci and p["type"] == "L":
                             p1_idx = p["idx"]; p1_price = p["price"]
-                            p2_candidate = float(max(highs[p1_idx:p1_idx+2]))
+                            p2_candidate      = float(max(highs[p1_idx:p1_idx+2]))
+                            p2_candidate_time = timestamps[p1_idx]
                             break
                     if p1_idx is None:
                         break
@@ -708,12 +712,9 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             pending_p1  = None
                         else:
                             state = 2
-                            p2_candidate = float(min(lows[ci:ci+2]))
+                            p2_candidate      = float(min(lows[ci:ci+2]))
+                            p2_candidate_time = timestamps[ci]
                             pending_p1 = None
-                        ci += 1
-                        continue
-
-                    elif st == "bear" and c_close < pending_p1["price"]:
                         p1_idx   = pending_p1["idx"]
                         p1_price = pending_p1["price"]
                         new_p2   = float(max(highs[p1_idx:ci+1]))
@@ -730,7 +731,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             pending_p1  = None
                         else:
                             state = 2
-                            p2_candidate = float(max(highs[ci:ci+2]))
+                            p2_candidate      = float(max(highs[ci:ci+2]))
+                            p2_candidate_time = timestamps[ci]
                             pending_p1 = None
                         ci += 1
                         continue
@@ -846,11 +848,13 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                     if p["idx"] > xc:
                         if st == "bull" and p["type"] == "H":
                             p1_idx = p["idx"]; p1_price = p["price"]
-                            p2_candidate = float(min(lows[p1_idx:p1_idx+2]))
+                            p2_candidate      = float(min(lows[p1_idx:p1_idx+2]))
+                            p2_candidate_time = timestamps[p1_idx]
                             ci = p1_idx + 1; break
                         elif st == "bear" and p["type"] == "L":
                             p1_idx = p["idx"]; p1_price = p["price"]
-                            p2_candidate = float(max(highs[p1_idx:p1_idx+2]))
+                            p2_candidate      = float(max(highs[p1_idx:p1_idx+2]))
+                            p2_candidate_time = timestamps[p1_idx]
                             ci = p1_idx + 1; break
                 else:
                     break
