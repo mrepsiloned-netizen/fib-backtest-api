@@ -890,7 +890,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                 p1_idx = p1["idx"]; p1_price = p1["price"]
                 for ci in range(p1_idx + 1, n - 1):
                     if highs_[ci] > p1_price:              # BOS: high breaks above P1
-                        if ci - p1_idx < N_min: break
+                        if ci - p1_idx < N_min: continue   # too close, keep looking
                         p3_idx = ci
                         p3_price = float(highs_[ci])        # P3 = BOS high
                         p2 = float(min(lows_[p1_idx:p3_idx + 1]))   # P2 = lowest low
@@ -908,7 +908,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                 p1_idx = p1["idx"]; p1_price = p1["price"]
                 for ci in range(p1_idx + 1, n - 1):
                     if lows_[ci] < p1_price:               # BOS: low breaks below P1
-                        if ci - p1_idx < 3: break
+                        if ci - p1_idx < N_min: continue   # too close, keep looking
                         p3_idx = ci
                         p3_price = float(lows_[ci])         # P3 = BOS low
                         p2 = float(max(highs_[p1_idx:p3_idx + 1]))  # P2 = highest high
