@@ -47,7 +47,7 @@ class BacktestRequest(BaseModel):
     rr: float = 2.0
     fib_level: float = 0.618
     max_bars: int = 200
-    max_hold: int = 200
+    max_hold: int = 1000
     recency_bars: int = 50
     one_per_pair: bool = True
     min_swing_pct: float = 0.002
@@ -796,16 +796,20 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                 notional = pos * entry
 
                 xc = xp = xr = None
-                for xi in range(entry_candle + 1, min(entry_candle + max_hold, n)):
+                for xi in range(entry_candle + 1, n):
                     if st == "bull":
                         if lows[xi]  <= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
                         if highs[xi] >= tp:      xp = tp;     xr = "TP"; xc = xi; break
+                        if xi >= entry_candle + max_hold:
+                            if closes[xi] > entry: xp = float(closes[xi]); xr = "TIMEOUT"; xc = xi; break
                     else:
                         if highs[xi] >= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
                         if lows[xi]  <= tp:      xp = tp;     xr = "TP"; xc = xi; break
+                        if xi >= entry_candle + max_hold:
+                            if closes[xi] < entry: xp = float(closes[xi]); xr = "TIMEOUT"; xc = xi; break
 
                 if xc is None:
-                    xc = min(entry_candle + max_hold, n - 1)
+                    xc = n - 1
                     xp = float(closes[xc])
                     xr = "TIMEOUT"
 
@@ -881,36 +885,39 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
         def build_setups():
             setups = []
             N_min = 3
+            # BULL: P1=pivot high, BOS when high breaks above P1, P2=lowest low between P1 and BOS, P3=BOS high
             for p1 in [p for p in pivots if p["type"] == "H"]:
                 p1_idx = p1["idx"]; p1_price = p1["price"]
                 for ci in range(p1_idx + 1, n - 1):
-                    if closes_[ci] > p1_price:
+                    if highs_[ci] > p1_price:              # BOS: high breaks above P1
                         if ci - p1_idx < N_min: break
-                        p3_idx = ci; p3_close = closes_[ci]
-                        p2 = float(min(closes_[p1_idx:p3_idx + 1]))
-                        # find which candle had the min close for p2_time
-                        p2_ci = p1_idx + int(np.argmin(closes_[p1_idx:p3_idx + 1]))
-                        rng = p3_close - p2
+                        p3_idx = ci
+                        p3_price = float(highs_[ci])        # P3 = BOS high
+                        p2 = float(min(lows_[p1_idx:p3_idx + 1]))   # P2 = lowest low
+                        p2_ci = p1_idx + int(np.argmin(lows_[p1_idx:p3_idx + 1]))
+                        rng = p3_price - p2
                         if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: break
                         setups.append({"st":"bull","p1_idx":p1_idx,"p1_price":p1_price,
                             "p2":p2,"p2_time":timestamps[p2_ci],
-                            "p3_idx":p3_idx,"p3_close":p3_close,"p3_time":timestamps[ci],
+                            "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[ci],
                             "rng":rng,"fib618":p2 + rng * fib_level,"sl":p2})
                         break
                     if lows_[ci] < p1_price * 0.90: break
+            # BEAR: P1=pivot low, BOS when low breaks below P1, P2=highest high between P1 and BOS, P3=BOS low
             for p1 in [p for p in pivots if p["type"] == "L"]:
                 p1_idx = p1["idx"]; p1_price = p1["price"]
                 for ci in range(p1_idx + 1, n - 1):
-                    if closes_[ci] < p1_price:
+                    if lows_[ci] < p1_price:               # BOS: low breaks below P1
                         if ci - p1_idx < 3: break
-                        p3_idx = ci; p3_close = closes_[ci]
-                        p2 = float(max(closes_[p1_idx:p3_idx + 1]))
-                        p2_ci = p1_idx + int(np.argmax(closes_[p1_idx:p3_idx + 1]))
-                        rng = p2 - p3_close
+                        p3_idx = ci
+                        p3_price = float(lows_[ci])         # P3 = BOS low
+                        p2 = float(max(highs_[p1_idx:p3_idx + 1]))  # P2 = highest high
+                        p2_ci = p1_idx + int(np.argmax(highs_[p1_idx:p3_idx + 1]))
+                        rng = p2 - p3_price
                         if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: break
                         setups.append({"st":"bear","p1_idx":p1_idx,"p1_price":p1_price,
                             "p2":p2,"p2_time":timestamps[p2_ci],
-                            "p3_idx":p3_idx,"p3_close":p3_close,"p3_time":timestamps[ci],
+                            "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[ci],
                             "rng":rng,"fib618":p2 - rng * fib_level,"sl":p2})
                         break
                     if highs_[ci] > p1_price * 1.10: break
@@ -1081,16 +1088,23 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
             notional = pos * entry
 
             xc = xp = xr = None
-            for xi in range(entry_candle + 1, min(entry_candle + max_hold, n)):
+            for xi in range(entry_candle + 1, n):
                 if st == "bull":
                     if lows_[xi]  <= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
                     if highs_[xi] >= tp:     xp = tp;     xr = "TP"; xc = xi; break
+                    # After max_hold, only close if in profit
+                    if xi >= entry_candle + max_hold:
+                        if closes_[xi] > entry: xp = float(closes_[xi]); xr = "TIMEOUT"; xc = xi; break
                 else:
                     if highs_[xi] >= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
                     if lows_[xi]  <= tp:     xp = tp;     xr = "TP"; xc = xi; break
+                    # After max_hold, only close if in profit
+                    if xi >= entry_candle + max_hold:
+                        if closes_[xi] < entry: xp = float(closes_[xi]); xr = "TIMEOUT"; xc = xi; break
 
+            # Fallback — if we reach end of data without closing
             if xc is None:
-                xc = min(entry_candle + max_hold, n - 1)
+                xc = n - 1
                 xp = float(closes_[xc]); xr = "TIMEOUT"
 
             gross_pnl = (xp - entry) * pos if st == "bull" else (entry - xp) * pos
@@ -1760,7 +1774,7 @@ async def compare(req: CompareRequest):
                                     base = {
                                         "symbol":sym,"timeframe":tf,"pivot_n":pn,
                                         "risk_method":risk,"risk_pct":0.02,"rr":rr,
-                                        "fib_level":fib,"max_bars":200,"max_hold":200,
+                                        "fib_level":fib,"max_bars":200,"max_hold":1000,
                                         "recency_bars":50,"one_per_pair":True,
                                         "engine":eng,"entry_mode":em
                                     }
