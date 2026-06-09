@@ -891,16 +891,18 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                 for ci in range(p1_idx + 1, n - 1):
                     if highs_[ci] > p1_price:              # BOS: high breaks above P1
                         if ci - p1_idx < N_min: continue   # too close, keep looking
-                        p3_idx = ci
-                        p3_price = float(highs_[ci])        # P3 = BOS high
-                        p2 = float(min(lows_[p1_idx:p3_idx + 1]))   # P2 = lowest low
-                        p2_ci = p1_idx + int(np.argmin(lows_[p1_idx:p3_idx + 1]))
+                        p2 = float(min(lows_[p1_idx:ci + 1]))   # P2 = lowest low
+                        p2_ci = p1_idx + int(np.argmin(lows_[p1_idx:ci + 1]))
+                        # P3 = actual highest high candle in range, not just BOS candle
+                        p3_ci    = p1_idx + int(np.argmax(highs_[p1_idx:ci + 1]))
+                        p3_price = float(highs_[p3_ci])
+                        p3_idx   = p3_ci
                         rng = p3_price - p2
                         if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: break
                         setups.append({"st":"bull","p1_idx":p1_idx,"p1_price":p1_price,
                             "p1_time":timestamps[p1_idx],
                             "p2":p2,"p2_time":timestamps[p2_ci],
-                            "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[ci],
+                            "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[p3_ci],
                             "rng":rng,"fib618":p2 + rng * fib_level,"sl":p2})
                         break
                     if lows_[ci] < p1_price * 0.90: break
@@ -910,16 +912,18 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                 for ci in range(p1_idx + 1, n - 1):
                     if lows_[ci] < p1_price:               # BOS: low breaks below P1
                         if ci - p1_idx < N_min: continue   # too close, keep looking
-                        p3_idx = ci
-                        p3_price = float(lows_[ci])         # P3 = BOS low
-                        p2 = float(max(highs_[p1_idx:p3_idx + 1]))  # P2 = highest high
-                        p2_ci = p1_idx + int(np.argmax(highs_[p1_idx:p3_idx + 1]))
+                        p2 = float(max(highs_[p1_idx:ci + 1]))  # P2 = highest high
+                        p2_ci = p1_idx + int(np.argmax(highs_[p1_idx:ci + 1]))
+                        # P3 = actual lowest low candle in range, not just BOS candle
+                        p3_ci    = p1_idx + int(np.argmin(lows_[p1_idx:ci + 1]))
+                        p3_price = float(lows_[p3_ci])
+                        p3_idx   = p3_ci
                         rng = p2 - p3_price
                         if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: break
                         setups.append({"st":"bear","p1_idx":p1_idx,"p1_price":p1_price,
                             "p1_time":timestamps[p1_idx],
                             "p2":p2,"p2_time":timestamps[p2_ci],
-                            "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[ci],
+                            "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[p3_ci],
                             "rng":rng,"fib618":p2 - rng * fib_level,"sl":p2})
                         break
                     if highs_[ci] > p1_price * 1.10: break
