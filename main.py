@@ -898,6 +898,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                         rng = p3_price - p2
                         if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: break
                         setups.append({"st":"bull","p1_idx":p1_idx,"p1_price":p1_price,
+                            "p1_time":timestamps[p1_idx],
                             "p2":p2,"p2_time":timestamps[p2_ci],
                             "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[ci],
                             "rng":rng,"fib618":p2 + rng * fib_level,"sl":p2})
@@ -916,6 +917,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                         rng = p2 - p3_price
                         if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: break
                         setups.append({"st":"bear","p1_idx":p1_idx,"p1_price":p1_price,
+                            "p1_time":timestamps[p1_idx],
                             "p2":p2,"p2_time":timestamps[p2_ci],
                             "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[ci],
                             "rng":rng,"fib618":p2 - rng * fib_level,"sl":p2})
@@ -1119,7 +1121,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
             trades_out.append({
                 "id":         0,
                 "direction":  "LONG" if st == "bull" else "SHORT",
-                "p1_time":    timestamps[p1_idx] if p1_idx < n else None,
+                "p1_time":    active.get("p1_time") or (timestamps[p1_idx] if p1_idx < n else None),
                 "p2_time":    active.get("p2_time"),
                 "p3_time":    active.get("p3_time"),
                 "entry_time": timestamps[entry_candle],
