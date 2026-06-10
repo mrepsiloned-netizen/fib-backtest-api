@@ -53,7 +53,8 @@ class BacktestRequest(BaseModel):
     min_swing_pct: float = 0.002
     stop_buffer_pct: float = 0.001
     k_stale: int = 0
-    entry_mode: str = "rejection"  # touch | rejection | reclaim
+    entry_mode: str = "rejection"  # touch | rejection
+    atr_sl:     str = "p2"         # p2 | 1atr | 1.5atr | 2atr | 2.5atr | 3atr
     engine: str = "original"      # original | classic | classic_v2 | structure
     use_ema_filter: bool = False   # True = only trade in EMA trend direction
     ema_fast: int = 34             # fast EMA period
@@ -256,7 +257,7 @@ def find_pivots(highs, lows, N):
 
 
 # ── BACKTEST CORE ─────────────────────────────────────────
-def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection", engine="structure", use_ema_filter=False, ema_fast=34, ema_slow=55, adx_period=14, adx_threshold=25.0):
+def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection", engine="structure", use_ema_filter=False, ema_fast=34, ema_slow=55, adx_period=14, adx_threshold=25.0, atr_sl="p2", atr_period=14):
     """
     Dispatches to the appropriate engine.
     Original engine has live-realism fixes applied (v7).
@@ -271,6 +272,27 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
     trades     = []
     equity     = 100.0
     N          = pivots[0].get("n", 3) if pivots else 3
+
+    # ATR calculation (Wilder's smoothing)
+    atr_mult = float(atr_sl.replace("atr","")) if atr_sl != "p2" else None
+    if atr_mult is not None:
+        tr = np.maximum(highs[1:]-lows[1:], np.maximum(abs(highs[1:]-closes[:-1]), abs(lows[1:]-closes[:-1])))
+        atr_arr = np.zeros(n)
+        atr_arr[atr_period] = np.mean(tr[:atr_period])
+        for i in range(atr_period+1, n):
+            atr_arr[i] = (atr_arr[i-1] * (atr_period-1) + tr[i-1]) / atr_period
+    else:
+        atr_arr = None
+
+    def get_sl(entry_price, direction, p2_price, candle_idx):
+        """Return SL level based on selected SL mode."""
+        if atr_arr is None or atr_mult is None:
+            # P2 mode — structure SL
+            buf = p2_price * stop_buffer_pct
+            return p2_price + buf if direction == "bear" else p2_price - buf
+        else:
+            atr = atr_arr[candle_idx] if atr_arr[candle_idx] > 0 else atr_arr[atr_arr > 0][-1]
+            return entry_price + atr * atr_mult if direction == "bear" else entry_price - atr * atr_mult
 
     if n < 50 or len(pivots) < 2:
         return trades
@@ -781,12 +803,17 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                     ci += 1
                     continue
 
+                # EMA filter — only take trade if EMA trend aligns
+                if not ema_allows(ci, st):
+                    ci += 1
+                    continue
+
                 if entry_mode != "touch" and ci + 1 >= n:
                     break
 
                 entry_candle = ci if entry_mode == "touch" else ci + 1
                 entry   = entry_price
-                sl_lvl  = p2 - (p2 * stop_buffer_pct) if st == "bull" else p2 + (p2 * stop_buffer_pct)
+                sl_lvl  = get_sl(entry, st, p2, entry_candle)
                 rpp     = abs(entry - sl_lvl)
                 if rpp <= 0:
                     ci += 1; continue
@@ -903,7 +930,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             "p1_time":timestamps[p1_idx],
                             "p2":p2,"p2_time":timestamps[p2_ci],
                             "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[p3_ci],
-                            "rng":rng,"fib618":p2 + rng * fib_level,"sl":p2})
+                            "rng":rng,"fib618":p3_price - rng * fib_level,"sl":p2})
                         break
                     if lows_[ci] < p1_price * 0.90: break
             # BEAR: P1=pivot low, BOS when low breaks below P1, P2=highest high between P1 and BOS, P3=BOS low
@@ -924,7 +951,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             "p1_time":timestamps[p1_idx],
                             "p2":p2,"p2_time":timestamps[p2_ci],
                             "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[p3_ci],
-                            "rng":rng,"fib618":p2 - rng * fib_level,"sl":p2})
+                            "rng":rng,"fib618":p3_price + rng * fib_level,"sl":p2})
                         break
                     if highs_[ci] > p1_price * 1.10: break
             setups.sort(key=lambda x: x["p3_idx"])
@@ -981,7 +1008,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             active["p2"]       = new_p2
                             active["p2_time"]  = timestamps[p2_ci]
                             active["rng"]      = new_rng
-                            active["fib618"]   = new_p2 + new_rng * fib_level
+                            active["fib618"]   = new_p3 - new_rng * fib_level
                             active["sl"]       = new_p2
                             fib618   = active["fib618"]
                             sl_lvl   = active["sl"]
@@ -1003,7 +1030,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             active["p3_close"] = new_p3
                             active["p3_time"]  = timestamps[p3_ci_new]
                             active["rng"]      = new_rng
-                            active["fib618"]   = new_p2 + new_rng * fib_level
+                            active["fib618"]   = new_p3 - new_rng * fib_level
                             active["sl"]       = new_p2
                             fib618   = active["fib618"]
                             sl_lvl   = active["sl"]
@@ -1029,7 +1056,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             active["p2"]       = new_p2
                             active["p2_time"]  = timestamps[p2_ci]
                             active["rng"]      = new_rng
-                            active["fib618"]   = new_p2 - new_rng * fib_level
+                            active["fib618"]   = new_p3 + new_rng * fib_level
                             active["sl"]       = new_p2
                             fib618   = active["fib618"]
                             sl_lvl   = active["sl"]
@@ -1051,7 +1078,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             active["p3_close"] = new_p3
                             active["p3_time"]  = timestamps[p3_ci_new]
                             active["rng"]      = new_rng
-                            active["fib618"]   = new_p2 - new_rng * fib_level
+                            active["fib618"]   = new_p3 + new_rng * fib_level
                             active["sl"]       = new_p2
                             fib618   = active["fib618"]
                             sl_lvl   = active["sl"]
@@ -1092,10 +1119,13 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
             if not triggered or entry_price is None:
                 ci += 1; continue
 
-            if entry_mode != "touch" and ci + 1 >= n: break
+            # EMA filter — only take trade if EMA trend aligns
+            direction = "bull" if st == "bull" else "bear"
+            if not ema_allows(ci, direction):
+                ci += 1; continue
             entry_candle = ci if entry_mode == "touch" else ci + 1
             entry  = entry_price
-            sl_lvl = p2 - (p2 * stop_buffer_pct) if st == "bull" else p2 + (p2 * stop_buffer_pct)
+            sl_lvl = get_sl(entry, st, p2, entry_candle)
             rpp    = abs(entry - sl_lvl)
             if rpp <= 0: active = None; ci += 1; continue
             tp       = entry + rpp * rr if st == "bull" else entry - rpp * rr
@@ -1592,7 +1622,7 @@ def process_request(req: BacktestRequest):
             candles, pivots, 0.02, req.rr, req.fib_level,
             req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
             req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
-            **ema_kwargs
+            **ema_kwargs, atr_sl=req.atr_sl
         )
         stats_fixed = calc_stats(trades_fixed, days)
 
@@ -1606,7 +1636,7 @@ def process_request(req: BacktestRequest):
             candles, pivots, risk_pct, req.rr, req.fib_level,
             req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
             req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
-            **ema_kwargs
+            **ema_kwargs, atr_sl=req.atr_sl
         )
         stats = calc_stats(trades, days)
 
