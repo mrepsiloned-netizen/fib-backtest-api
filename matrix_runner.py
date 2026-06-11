@@ -205,82 +205,44 @@ def backtest(H,L,C,n,pv,eng,em,rr,fib,ef,es,use_ema,adx_v,adx_thr,N,atr_sl="p2",
         v2=eng=="pullback"
         ph={p["i"]:p["p"] for p in pv if p["t"]=="H"}
         pl={p["i"]:p["p"] for p in pv if p["t"]=="L"}
+        ph_list=[p for p in pv if p["t"]=="H"]
+        pl_list=[p for p in pv if p["t"]=="L"]
+
+        def prev_ph_before(idx):
+            c=[p["p"] for p in ph_list if p["i"]<idx]
+            return c[-1] if c else None
+        def prev_pl_before(idx):
+            c=[p["p"] for p in pl_list if p["i"]<idx]
+            return c[-1] if c else None
+
         for st in ["bull","bear"]:
-            src=[p for p in pv if p["t"]==("H" if st=="bull" else "L")]
+            src=ph_list if st=="bull" else pl_list
             setups=[]
             for p1 in src:
+                prev_ref = prev_pl_before(p1["i"]) if st=="bull" else prev_ph_before(p1["i"])
+                if prev_ref is None: continue
                 for ci in range(p1["i"]+1,n-1):
                     if st=="bull" and H[ci]>p1["p"]:
                         p2_v=float(min(L[p1["i"]:ci+1]))
+                        if p2_v < prev_ref: break
                         p3_ci=p1["i"]+int(np.argmax(H[p1["i"]:ci+1]))
                         p3_v=float(H[p3_ci])
                         rng=p3_v-p2_v
                         if rng>0 and rng/max(p2_v,1)>=MIN:
                             setups.append({"p1i":p1["i"],"p1p":p1["p"],"p2":p2_v,
-                                "p3i":p3_ci,"p3c":p3_v,"fe":p3_v-rng*fib,"sl":p2_v})
+                                "p3i":p3_ci,"p3c":p3_v,"fe":p3_v-rng*fib,"sl":p2_v,"prev_ref":prev_ref})
                         break
                     elif st=="bear" and L[ci]<p1["p"]:
                         p2_v=float(max(H[p1["i"]:ci+1]))
+                        if p2_v > prev_ref: break
                         p3_ci=p1["i"]+int(np.argmin(L[p1["i"]:ci+1]))
                         p3_v=float(L[p3_ci])
                         rng=p2_v-p3_v
                         if rng>0 and rng/max(p2_v,1)>=MIN:
                             setups.append({"p1i":p1["i"],"p1p":p1["p"],"p2":p2_v,
-                                "p3i":p3_ci,"p3c":p3_v,"fe":p3_v+rng*fib,"sl":p2_v})
+                                "p3i":p3_ci,"p3c":p3_v,"fe":p3_v+rng*fib,"sl":p2_v,"prev_ref":prev_ref})
                         break
                     if (st=="bull" and L[ci]<p1["p"]*0.90) or (st=="bear" and H[ci]>p1["p"]*1.10): break
-            setups.sort(key=lambda x:x["p3i"])
-            si=0; act=None; lp=-1; ci=1
-            while ci<n-1:
-                if act is None:
-                    while si<len(setups):
-                        s=setups[si]; si+=1
-                        if s["p3i"]<=lp: continue
-                        act=s; ci=s["p3i"]+1; break
-                    if act is None: break
-                fe_,p2_=act["fe"],act["p2"]
-                if v2:
-                    pd=ph if st=="bull" else pl
-                    if ci in pd:
-                        nv=pd[ci]
-                        if (st=="bull" and nv>act["p1p"]) or (st=="bear" and nv<act["p1p"]):
-                            act["p1i"]=ci; act["p1p"]=nv
-                            np2=float(min(L[act["p1i"]:ci+1])) if st=="bull" else float(max(H[act["p1i"]:ci+1]))
-                            np3_ci=(act["p1i"]+int(np.argmax(H[act["p1i"]:ci+1]))) if st=="bull" else (act["p1i"]+int(np.argmin(L[act["p1i"]:ci+1])))
-                            np3=float(H[np3_ci]) if st=="bull" else float(L[np3_ci])
-                            rng=abs(np3-np2)
-                            if rng>0 and rng/max(np2,1)>=MIN:
-                                act["p2"]=np2; act["p3i"]=np3_ci; act["p3c"]=np3
-                                act["fe"]=np3-rng*fib if st=="bull" else np3+rng*fib
-                                act["sl"]=np2; fe_=act["fe"]; p2_=act["p2"]
-                            ci+=1; continue
-                        elif (st=="bull" and nv>act["p3c"]) or (st=="bear" and nv<act["p3c"]):
-                            np2=float(min(L[act["p3i"]:ci+1])) if st=="bull" else float(max(H[act["p3i"]:ci+1]))
-                            np3_ci=(act["p3i"]+int(np.argmax(H[act["p3i"]:ci+1]))) if st=="bull" else (act["p3i"]+int(np.argmin(L[act["p3i"]:ci+1])))
-                            np3=float(H[np3_ci]) if st=="bull" else float(L[np3_ci])
-                            rng=abs(np3-np2)
-                            if rng>0 and rng/max(np2,1)>=MIN:
-                                act["p2"]=np2; act["p3i"]=np3_ci; act["p3c"]=np3
-                                act["fe"]=np3-rng*fib if st=="bull" else np3+rng*fib
-                                act["sl"]=np2; fe_=act["fe"]; p2_=act["p2"]
-                            ci+=1; continue
-                if (st=="bull" and L[ci]<act["p2"]) or (st=="bear" and H[ci]>act["p2"]):
-                    act=None; ci+=1; continue
-                if not ok(ci,st): ci+=1; continue
-                trig=False
-                if em=="touch": trig=L[ci]<=fe_ if st=="bull" else H[ci]>=fe_
-                else: trig=(L[ci]<=fe_ and C[ci]>fe_) if st=="bull" else (H[ci]>=fe_ and C[ci]<fe_)
-                if not trig: ci+=1; continue
-                entry=fe_
-                sl_u=get_sl(entry, st, p2_, ci)
-                rpp=abs(entry-sl_u)
-                if rpp<=0: act=None; ci+=1; continue
-                tp=entry+rpp*rr if st=="bull" else entry-rpp*rr
-                xp,xc,xr=exit_(st,sl_u,tp,ci+1)
-                if xp is None: act=None; ci+=1; continue
-                trade(entry,sl_u,tp,xp,xr)
-                lp=xc; act=None; ci=xc+1
-
     elif eng=="structure":
         ph=[p for p in pv if p["t"]=="H"]
         pl=[p for p in pv if p["t"]=="L"]
