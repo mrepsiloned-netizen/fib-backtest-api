@@ -908,19 +908,48 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
         pivot_highs_ = {p["idx"]: p["price"] for p in pivots if p["type"] == "H"}
         pivot_lows_  = {p["idx"]: p["price"] for p in pivots if p["type"] == "L"}
+        ph_list_ = [p for p in pivots if p["type"] == "H"]
+        pl_list_ = [p for p in pivots if p["type"] == "L"]
+
+        def prev_ph_before_(idx):
+            c = [p["price"] for p in ph_list_ if p["idx"] < idx]
+            return c[-1] if c else None
+        def prev_pl_before_(idx):
+            c = [p["price"] for p in pl_list_ if p["idx"] < idx]
+            return c[-1] if c else None
 
         def build_setups():
             setups = []
             N_min = 3
+
+            # Build previous pivot lookups for structure validity check
+            # For each pivot low (P1 bear), find previous pivot high
+            # For each pivot high (P1 bull), find previous pivot low
+            pivot_highs_list = [p for p in pivots if p["type"] == "H"]
+            pivot_lows_list  = [p for p in pivots if p["type"] == "L"]
+
+            def prev_pivot_high_before(idx):
+                """Return price of last pivot high before idx, or None."""
+                candidates = [p["price"] for p in pivot_highs_list if p["idx"] < idx]
+                return candidates[-1] if candidates else None
+
+            def prev_pivot_low_before(idx):
+                """Return price of last pivot low before idx, or None."""
+                candidates = [p["price"] for p in pivot_lows_list if p["idx"] < idx]
+                return candidates[-1] if candidates else None
+
             # BULL: P1=pivot high, BOS when high breaks above P1, P2=lowest low between P1 and BOS, P3=BOS high
-            for p1 in [p for p in pivots if p["type"] == "H"]:
+            for p1 in pivot_highs_list:
                 p1_idx = p1["idx"]; p1_price = p1["price"]
+                # Get previous pivot low — P2 must not go below it
+                prev_pl = prev_pivot_low_before(p1_idx)
+                if prev_pl is None: continue  # no prior structure — skip
                 for ci in range(p1_idx + 1, n - 1):
                     if highs_[ci] > p1_price:              # BOS: high breaks above P1
                         if ci - p1_idx < N_min: continue   # too close, keep looking
                         p2 = float(min(lows_[p1_idx:ci + 1]))   # P2 = lowest low
+                        if p2 < prev_pl: break             # P2 broke below prev low — invalid
                         p2_ci = p1_idx + int(np.argmin(lows_[p1_idx:ci + 1]))
-                        # P3 = actual highest high candle in range, not just BOS candle
                         p3_ci    = p1_idx + int(np.argmax(highs_[p1_idx:ci + 1]))
                         p3_price = float(highs_[p3_ci])
                         p3_idx   = p3_ci
@@ -930,18 +959,23 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             "p1_time":timestamps[p1_idx],
                             "p2":p2,"p2_time":timestamps[p2_ci],
                             "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[p3_ci],
-                            "rng":rng,"fib618":p3_price - rng * fib_level,"sl":p2})
+                            "rng":rng,"fib618":p3_price - rng * fib_level,"sl":p2,
+                            "prev_ref":prev_pl})
                         break
                     if lows_[ci] < p1_price * 0.90: break
+
             # BEAR: P1=pivot low, BOS when low breaks below P1, P2=highest high between P1 and BOS, P3=BOS low
-            for p1 in [p for p in pivots if p["type"] == "L"]:
+            for p1 in pivot_lows_list:
                 p1_idx = p1["idx"]; p1_price = p1["price"]
+                # Get previous pivot high — P2 must not exceed it
+                prev_ph = prev_pivot_high_before(p1_idx)
+                if prev_ph is None: continue  # no prior structure — skip
                 for ci in range(p1_idx + 1, n - 1):
                     if lows_[ci] < p1_price:               # BOS: low breaks below P1
                         if ci - p1_idx < N_min: continue   # too close, keep looking
                         p2 = float(max(highs_[p1_idx:ci + 1]))  # P2 = highest high
+                        if p2 > prev_ph: break             # P2 exceeded prev high — invalid
                         p2_ci = p1_idx + int(np.argmax(highs_[p1_idx:ci + 1]))
-                        # P3 = actual lowest low candle in range, not just BOS candle
                         p3_ci    = p1_idx + int(np.argmin(lows_[p1_idx:ci + 1]))
                         p3_price = float(lows_[p3_ci])
                         p3_idx   = p3_ci
@@ -951,7 +985,8 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             "p1_time":timestamps[p1_idx],
                             "p2":p2,"p2_time":timestamps[p2_ci],
                             "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[p3_ci],
-                            "rng":rng,"fib618":p3_price + rng * fib_level,"sl":p2})
+                            "rng":rng,"fib618":p3_price + rng * fib_level,"sl":p2,
+                            "prev_ref":prev_ph})
                         break
                     if highs_[ci] > p1_price * 1.10: break
             setups.sort(key=lambda x: x["p3_idx"])
@@ -994,7 +1029,14 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                 if st == "bull" and ci in pivot_highs_:
                     new_ph = pivot_highs_[ci]
                     if new_ph > p1_price:
+                        # Option B — update prev_ref to new P1's previous pivot low
+                        new_prev_ref = prev_pl_before_(ci)
+                        if new_prev_ref is None:
+                            active = None; ci += 1; continue
                         new_p2    = float(min(lows_[p1_idx:ci + 1]))
+                        # Check new P2 against updated prev_ref
+                        if new_p2 < new_prev_ref:
+                            active = None; ci += 1; continue
                         p2_ci     = p1_idx + int(np.argmin(lows_[p1_idx:ci + 1]))
                         p3_ci_new = p1_idx + int(np.argmax(highs_[p1_idx:ci + 1]))
                         new_p3    = float(highs_[p3_ci_new])
@@ -1010,6 +1052,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             active["rng"]      = new_rng
                             active["fib618"]   = new_p3 - new_rng * fib_level
                             active["sl"]       = new_p2
+                            active["prev_ref"] = new_prev_ref
                             fib618   = active["fib618"]
                             sl_lvl   = active["sl"]
                             p2       = active["p2"]
@@ -1041,7 +1084,14 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                 if st == "bear" and ci in pivot_lows_:
                     new_pl = pivot_lows_[ci]
                     if new_pl < p1_price:
+                        # Option B — update prev_ref to new P1's previous pivot high
+                        new_prev_ref = prev_ph_before_(ci)
+                        if new_prev_ref is None:
+                            active = None; ci += 1; continue
                         new_p2  = float(max(highs_[p1_idx:ci + 1]))
+                        # Check new P2 against updated prev_ref
+                        if new_p2 > new_prev_ref:
+                            active = None; ci += 1; continue
                         p2_ci   = p1_idx + int(np.argmax(highs_[p1_idx:ci + 1]))
                         # P3 = actual lowest low candle in full range
                         p3_ci_new = p1_idx + int(np.argmin(lows_[p1_idx:ci + 1]))
@@ -1058,6 +1108,7 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
                             active["rng"]      = new_rng
                             active["fib618"]   = new_p3 + new_rng * fib_level
                             active["sl"]       = new_p2
+                            active["prev_ref"] = new_prev_ref
                             fib618   = active["fib618"]
                             sl_lvl   = active["sl"]
                             p2       = active["p2"]
