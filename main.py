@@ -54,6 +54,8 @@ class BacktestRequest(BaseModel):
     stop_buffer_pct: float = 0.001
     k_stale: int = 0
     entry_mode: str = "rejection"  # touch | rejection
+    bos_break: str = "close"       # close | wick — BOS confirmed by candle close vs wick poke
+    timeout_mode: str = "always"   # always | profit_only | off — max_hold exit behavior
     atr_sl:     str = "p2"         # p2 | 1atr | 1.5atr | 2atr | 2.5atr | 3atr
     engine: str = "original"      # original | classic | classic_v2 | structure
     use_ema_filter: bool = False   # True = only trade in EMA trend direction
@@ -257,7 +259,7 @@ def find_pivots(highs, lows, N):
 
 
 # ── BACKTEST CORE ─────────────────────────────────────────
-def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection", engine="structure", use_ema_filter=False, ema_fast=34, ema_slow=55, adx_period=14, adx_threshold=25.0, atr_sl="p2", atr_period=14):
+def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_hold, recency_bars, one_per_pair, min_swing_pct=0.002, stop_buffer_pct=0.001, k_stale=0, entry_mode="rejection", engine="structure", use_ema_filter=False, ema_fast=34, ema_slow=55, adx_period=14, adx_threshold=25.0, atr_sl="p2", atr_period=14, bos_break="close", timeout_mode="always"):
     """
     Dispatches to the appropriate engine.
     Original engine has live-realism fixes applied (v7).
@@ -897,9 +899,38 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
 
     # ── CLASSIC ENGINE ─────────────────────────────────────
     def run_classic(v2=False):
+        """
+        BOS Pullback engine — v8 rebuild (event-driven).
+
+        Per direction (bull/bear run independently — a long never blocks a short):
+          P1  = pivot high (bull) / pivot low (bear)
+          BOS = candle CLOSE breaks P1 (bos_break="close", default)
+                or candle WICK breaks P1 (bos_break="wick", legacy)
+          P2  = lowest low (bull) / highest high (bear) between P1 and BOS
+                — validated against previous opposite pivot, frozen after arming
+          P3  = leg extreme, CONTINUOUSLY EXTENDED: every new high (bull) /
+                low (bear) re-draws the fib on the true leg. Entry triggers are
+                checked against the fib SNAPSHOT from before this candle's
+                extension (no lookahead, Touch vs Rejection stay distinct).
+          Fib = P3 - rng*fib_level (bull) / P3 + rng*fib_level (bear)
+          SL  = P2 (via get_sl — buffer/ATR modes respected), TP = RR x risk
+
+        Multiple zones can be armed simultaneously; first trigger wins.
+        One open position per direction. A zone whose fib is hit while a
+        position is open is consumed (you couldn't take it — no backfill).
+
+        Exits: SL checked before TP (conservative). For rejection/reclaim
+        entries (fill at next open) the FILL CANDLE ITSELF is monitored —
+        a fill candle that dumps through SL is a recorded loss, not a gap.
+
+        timeout_mode: "always"      — close at market after max_hold bars
+                      "profit_only" — legacy: only close if in profit
+                      "off"         — no time exit (SL/TP only)
+        v2 extras preserved: k_stale expiry + full re-anchor when a new
+        pivot beyond P1 prints.
+        """
         nonlocal equity
-        trades_out = []
-        MIN_RANGE  = min_swing_pct
+        MIN_RANGE = min_swing_pct
 
         highs_  = np.array([c[2] for c in candles])
         lows_   = np.array([c[3] for c in candles])
@@ -914,332 +945,274 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
         def prev_ph_before_(idx):
             c = [p["price"] for p in ph_list_ if p["idx"] < idx]
             return c[-1] if c else None
+
         def prev_pl_before_(idx):
             c = [p["price"] for p in pl_list_ if p["idx"] < idx]
             return c[-1] if c else None
 
+        # ── SETUP CONSTRUCTION ──────────────────────────────
         def build_setups():
             setups = []
             N_min = 3
 
-            # Build previous pivot lookups for structure validity check
-            # For each pivot low (P1 bear), find previous pivot high
-            # For each pivot high (P1 bull), find previous pivot low
-            pivot_highs_list = [p for p in pivots if p["type"] == "H"]
-            pivot_lows_list  = [p for p in pivots if p["type"] == "L"]
-
-            def prev_pivot_high_before(idx):
-                """Return price of last pivot high before idx, or None."""
-                candidates = [p["price"] for p in pivot_highs_list if p["idx"] < idx]
-                return candidates[-1] if candidates else None
-
-            def prev_pivot_low_before(idx):
-                """Return price of last pivot low before idx, or None."""
-                candidates = [p["price"] for p in pivot_lows_list if p["idx"] < idx]
-                return candidates[-1] if candidates else None
-
-            # BULL: P1=pivot high, BOS when high breaks above P1, P2=lowest low between P1 and BOS, P3=BOS high
-            for p1 in pivot_highs_list:
+            # BULL: P1=pivot high, BOS breaks above P1
+            for p1 in ph_list_:
                 p1_idx = p1["idx"]; p1_price = p1["price"]
-                # Get previous pivot low — P2 must not go below it
-                prev_pl = prev_pivot_low_before(p1_idx)
-                if prev_pl is None: continue  # no prior structure — skip
+                prev_pl = prev_pl_before_(p1_idx)
+                if prev_pl is None: continue
                 for ci in range(p1_idx + 1, n - 1):
-                    if highs_[ci] > p1_price:              # BOS: high breaks above P1
-                        if ci - p1_idx < N_min: continue   # too close, keep looking
-                        p2 = float(min(lows_[p1_idx:ci + 1]))   # P2 = lowest low
-                        if p2 < prev_pl: break             # P2 broke below prev low — invalid
-                        p2_ci = p1_idx + int(np.argmin(lows_[p1_idx:ci + 1]))
+                    broke = (closes_[ci] > p1_price) if bos_break == "close" \
+                            else (highs_[ci] > p1_price)
+                    if broke:
+                        if ci - p1_idx < N_min: continue
+                        p2 = float(min(lows_[p1_idx:ci + 1]))
+                        if p2 < prev_pl: break
+                        p2_ci    = p1_idx + int(np.argmin(lows_[p1_idx:ci + 1]))
                         p3_ci    = p1_idx + int(np.argmax(highs_[p1_idx:ci + 1]))
                         p3_price = float(highs_[p3_ci])
-                        p3_idx   = p3_ci
                         rng = p3_price - p2
                         if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: break
                         setups.append({"st":"bull","p1_idx":p1_idx,"p1_price":p1_price,
                             "p1_time":timestamps[p1_idx],
                             "p2":p2,"p2_time":timestamps[p2_ci],
-                            "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[p3_ci],
+                            "p3_idx":p3_ci,"p3_close":p3_price,"p3_time":timestamps[p3_ci],
+                            "bos_idx":ci,
                             "rng":rng,"fib618":p3_price - rng * fib_level,"sl":p2,
                             "prev_ref":prev_pl})
                         break
                     if lows_[ci] < p1_price * 0.90: break
 
-            # BEAR: P1=pivot low, BOS when low breaks below P1, P2=highest high between P1 and BOS, P3=BOS low
-            for p1 in pivot_lows_list:
+            # BEAR: P1=pivot low, BOS breaks below P1
+            for p1 in pl_list_:
                 p1_idx = p1["idx"]; p1_price = p1["price"]
-                # Get previous pivot high — P2 must not exceed it
-                prev_ph = prev_pivot_high_before(p1_idx)
-                if prev_ph is None: continue  # no prior structure — skip
+                prev_ph = prev_ph_before_(p1_idx)
+                if prev_ph is None: continue
                 for ci in range(p1_idx + 1, n - 1):
-                    if lows_[ci] < p1_price:               # BOS: low breaks below P1
-                        if ci - p1_idx < N_min: continue   # too close, keep looking
-                        p2 = float(max(highs_[p1_idx:ci + 1]))  # P2 = highest high
-                        if p2 > prev_ph: break             # P2 exceeded prev high — invalid
-                        p2_ci = p1_idx + int(np.argmax(highs_[p1_idx:ci + 1]))
+                    broke = (closes_[ci] < p1_price) if bos_break == "close" \
+                            else (lows_[ci] < p1_price)
+                    if broke:
+                        if ci - p1_idx < N_min: continue
+                        p2 = float(max(highs_[p1_idx:ci + 1]))
+                        if p2 > prev_ph: break
+                        p2_ci    = p1_idx + int(np.argmax(highs_[p1_idx:ci + 1]))
                         p3_ci    = p1_idx + int(np.argmin(lows_[p1_idx:ci + 1]))
                         p3_price = float(lows_[p3_ci])
-                        p3_idx   = p3_ci
                         rng = p2 - p3_price
                         if rng <= 0 or rng / max(p2, 1) < MIN_RANGE: break
                         setups.append({"st":"bear","p1_idx":p1_idx,"p1_price":p1_price,
                             "p1_time":timestamps[p1_idx],
                             "p2":p2,"p2_time":timestamps[p2_ci],
-                            "p3_idx":p3_idx,"p3_close":p3_price,"p3_time":timestamps[p3_ci],
+                            "p3_idx":p3_ci,"p3_close":p3_price,"p3_time":timestamps[p3_ci],
+                            "bos_idx":ci,
                             "rng":rng,"fib618":p3_price + rng * fib_level,"sl":p2,
                             "prev_ref":prev_ph})
                         break
                     if highs_[ci] > p1_price * 1.10: break
-            setups.sort(key=lambda x: x["p3_idx"])
+
+            setups.sort(key=lambda x: x["bos_idx"])
             return setups
 
-        all_setups   = build_setups()
-        setup_idx    = 0
-        active       = None
-        last_p3_idx  = -1
-        ci           = 1
+        all_setups = build_setups()
 
-        while ci < n - 1:
-            if active is None:
-                while setup_idx < len(all_setups):
-                    s = all_setups[setup_idx]; setup_idx += 1
-                    if s["p3_idx"] <= last_p3_idx: continue
-                    active = s
-                    ci = s["p3_idx"] + 1
-                    break
-                if active is None: break
+        # ── PER-CANDLE STEP for one armed setup ─────────────
+        # Returns ("armed", None) | ("dead", None) | ("trig", entry_price)
+        def step_setup(a, ci):
+            st = a["st"]
+            c_low = float(lows_[ci]); c_high = float(highs_[ci]); c_close = float(closes_[ci])
 
-            st     = active["st"]
-            fib618 = active["fib618"]
-            sl_lvl = active["sl"]
-            p2     = active["p2"]
-            p3_idx = active["p3_idx"]
-            p1_idx = active["p1_idx"]
-            p1_price = active["p1_price"]
+            # staleness expiry (v2 only — preserved behavior)
+            if v2 and k_stale > 0 and (ci - a["p3_idx"]) > k_stale:
+                return "dead", None
 
-            if ci >= n - 1: break
+            # v2 full re-anchor on a new pivot beyond P1 (consumes the candle)
+            if v2 and st == "bull" and ci in pivot_highs_:
+                new_ph = pivot_highs_[ci]
+                if new_ph > a["p1_price"]:
+                    new_prev_ref = prev_pl_before_(ci)
+                    if new_prev_ref is None: return "dead", None
+                    new_p2 = float(min(lows_[a["p1_idx"]:ci + 1]))
+                    if new_p2 < new_prev_ref: return "dead", None
+                    p2_ci  = a["p1_idx"] + int(np.argmin(lows_[a["p1_idx"]:ci + 1]))
+                    p3_ci  = a["p1_idx"] + int(np.argmax(highs_[a["p1_idx"]:ci + 1]))
+                    new_p3 = float(highs_[p3_ci]); new_rng = new_p3 - new_p2
+                    if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
+                        a.update(p1_idx=ci, p1_price=new_ph,
+                                 p3_idx=p3_ci, p3_close=new_p3, p3_time=timestamps[p3_ci],
+                                 p2=new_p2, p2_time=timestamps[p2_ci],
+                                 rng=new_rng, fib618=new_p3 - new_rng * fib_level,
+                                 sl=new_p2, prev_ref=new_prev_ref)
+                    return "armed", None
+            if v2 and st == "bear" and ci in pivot_lows_:
+                new_pl = pivot_lows_[ci]
+                if new_pl < a["p1_price"]:
+                    new_prev_ref = prev_ph_before_(ci)
+                    if new_prev_ref is None: return "dead", None
+                    new_p2 = float(max(highs_[a["p1_idx"]:ci + 1]))
+                    if new_p2 > new_prev_ref: return "dead", None
+                    p2_ci  = a["p1_idx"] + int(np.argmax(highs_[a["p1_idx"]:ci + 1]))
+                    p3_ci  = a["p1_idx"] + int(np.argmin(lows_[a["p1_idx"]:ci + 1]))
+                    new_p3 = float(lows_[p3_ci]); new_rng = new_p2 - new_p3
+                    if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
+                        a.update(p1_idx=ci, p1_price=new_pl,
+                                 p3_idx=p3_ci, p3_close=new_p3, p3_time=timestamps[p3_ci],
+                                 p2=new_p2, p2_time=timestamps[p2_ci],
+                                 rng=new_rng, fib618=new_p3 + new_rng * fib_level,
+                                 sl=new_p2, prev_ref=new_prev_ref)
+                    return "armed", None
 
-            c_low   = lows_[ci]
-            c_high  = highs_[ci]
-            c_close = closes_[ci]
+            # snapshot — entry checks the fib that was live when price hit it
+            fib_snap = a["fib618"]; p2_snap = a["p2"]
 
-            if v2:
-                if k_stale > 0 and (ci - p3_idx) > k_stale:
-                    active = None; ci += 1; continue
+            # zone invalidation: structure low/high broken
+            if st == "bull" and c_low < p2_snap:  return "dead", None
+            if st == "bear" and c_high > p2_snap: return "dead", None
 
-                if st == "bull" and ci in pivot_highs_:
-                    new_ph = pivot_highs_[ci]
-                    if new_ph > p1_price:
-                        # Option B — update prev_ref to new P1's previous pivot low
-                        new_prev_ref = prev_pl_before_(ci)
-                        if new_prev_ref is None:
-                            active = None; ci += 1; continue
-                        new_p2    = float(min(lows_[p1_idx:ci + 1]))
-                        # Check new P2 against updated prev_ref
-                        if new_p2 < new_prev_ref:
-                            active = None; ci += 1; continue
-                        p2_ci     = p1_idx + int(np.argmin(lows_[p1_idx:ci + 1]))
-                        p3_ci_new = p1_idx + int(np.argmax(highs_[p1_idx:ci + 1]))
-                        new_p3    = float(highs_[p3_ci_new])
-                        new_rng   = new_p3 - new_p2
-                        if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
-                            active["p1_idx"]   = ci
-                            active["p1_price"] = new_ph
-                            active["p3_idx"]   = p3_ci_new
-                            active["p3_close"] = new_p3
-                            active["p3_time"]  = timestamps[p3_ci_new]
-                            active["p2"]       = new_p2
-                            active["p2_time"]  = timestamps[p2_ci]
-                            active["rng"]      = new_rng
-                            active["fib618"]   = new_p3 - new_rng * fib_level
-                            active["sl"]       = new_p2
-                            active["prev_ref"] = new_prev_ref
-                            fib618   = active["fib618"]
-                            sl_lvl   = active["sl"]
-                            p2       = active["p2"]
-                            p1_idx   = ci
-                            p1_price = new_ph
-                            p3_idx   = p3_ci_new
-                        ci += 1; continue
-                    elif new_ph > active["p3_close"]:
-                        new_p2    = float(min(lows_[p3_idx:ci + 1]))
-                        p2_ci     = p3_idx + int(np.argmin(lows_[p3_idx:ci + 1]))
-                        p3_ci_new = p3_idx + int(np.argmax(highs_[p3_idx:ci + 1]))
-                        new_p3    = float(highs_[p3_ci_new])
-                        new_rng   = new_p3 - new_p2
-                        if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
-                            active["p2"]       = new_p2
-                            active["p2_time"]  = timestamps[p2_ci]
-                            active["p3_idx"]   = p3_ci_new
-                            active["p3_close"] = new_p3
-                            active["p3_time"]  = timestamps[p3_ci_new]
-                            active["rng"]      = new_rng
-                            active["fib618"]   = new_p3 - new_rng * fib_level
-                            active["sl"]       = new_p2
-                            fib618   = active["fib618"]
-                            sl_lvl   = active["sl"]
-                            p2       = active["p2"]
-                            p3_idx   = p3_ci_new
-                        ci += 1; continue
+            # continuous P3 extension — fib re-drawn on true leg extreme (for NEXT candle)
+            if st == "bull" and c_high > a["p3_close"]:
+                new_rng = c_high - a["p2"]
+                if new_rng > 0 and new_rng / max(a["p2"], 1) >= MIN_RANGE:
+                    a["p3_idx"] = ci; a["p3_close"] = c_high; a["p3_time"] = timestamps[ci]
+                    a["rng"] = new_rng; a["fib618"] = c_high - new_rng * fib_level
+            elif st == "bear" and c_low < a["p3_close"]:
+                new_rng = a["p2"] - c_low
+                if new_rng > 0 and new_rng / max(a["p2"], 1) >= MIN_RANGE:
+                    a["p3_idx"] = ci; a["p3_close"] = c_low; a["p3_time"] = timestamps[ci]
+                    a["rng"] = new_rng; a["fib618"] = c_low + new_rng * fib_level
 
-                if st == "bear" and ci in pivot_lows_:
-                    new_pl = pivot_lows_[ci]
-                    if new_pl < p1_price:
-                        # Option B — update prev_ref to new P1's previous pivot high
-                        new_prev_ref = prev_ph_before_(ci)
-                        if new_prev_ref is None:
-                            active = None; ci += 1; continue
-                        new_p2  = float(max(highs_[p1_idx:ci + 1]))
-                        # Check new P2 against updated prev_ref
-                        if new_p2 > new_prev_ref:
-                            active = None; ci += 1; continue
-                        p2_ci   = p1_idx + int(np.argmax(highs_[p1_idx:ci + 1]))
-                        # P3 = actual lowest low candle in full range
-                        p3_ci_new = p1_idx + int(np.argmin(lows_[p1_idx:ci + 1]))
-                        new_p3    = float(lows_[p3_ci_new])
-                        new_rng   = new_p2 - new_p3
-                        if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
-                            active["p1_idx"]   = ci
-                            active["p1_price"] = new_pl
-                            active["p3_idx"]   = p3_ci_new
-                            active["p3_close"] = new_p3
-                            active["p3_time"]  = timestamps[p3_ci_new]
-                            active["p2"]       = new_p2
-                            active["p2_time"]  = timestamps[p2_ci]
-                            active["rng"]      = new_rng
-                            active["fib618"]   = new_p3 + new_rng * fib_level
-                            active["sl"]       = new_p2
-                            active["prev_ref"] = new_prev_ref
-                            fib618   = active["fib618"]
-                            sl_lvl   = active["sl"]
-                            p2       = active["p2"]
-                            p1_idx   = ci
-                            p1_price = new_pl
-                            p3_idx   = p3_ci_new
-                        ci += 1; continue
-                    elif new_pl < active["p3_close"]:
-                        new_p2    = float(max(highs_[p3_idx:ci + 1]))
-                        p2_ci     = p3_idx + int(np.argmax(highs_[p3_idx:ci + 1]))
-                        p3_ci_new = p3_idx + int(np.argmin(lows_[p3_idx:ci + 1]))
-                        new_p3    = float(lows_[p3_ci_new])
-                        new_rng   = new_p2 - new_p3
-                        if new_rng > 0 and new_rng / max(new_p2, 1) >= MIN_RANGE:
-                            active["p2"]       = new_p2
-                            active["p2_time"]  = timestamps[p2_ci]
-                            active["p3_idx"]   = p3_ci_new
-                            active["p3_close"] = new_p3
-                            active["p3_time"]  = timestamps[p3_ci_new]
-                            active["rng"]      = new_rng
-                            active["fib618"]   = new_p3 + new_rng * fib_level
-                            active["sl"]       = new_p2
-                            fib618   = active["fib618"]
-                            sl_lvl   = active["sl"]
-                            p2       = active["p2"]
-                            p3_idx   = p3_ci_new
-                        ci += 1; continue
-
-            if st == "bull" and c_low < p2:
-                active = None; ci += 1; continue
-            if st == "bear" and c_high > p2:
-                active = None; ci += 1; continue
-
-            triggered   = False
-            entry_price = None
+            # entry trigger vs snapshot
+            trig = False; ep = None
             if entry_mode == "touch":
-                if st == "bull" and c_low <= fib618:
-                    triggered = True; entry_price = fib618  # limit order fills exactly
-                elif st == "bear" and c_high >= fib618:
-                    triggered = True; entry_price = fib618
+                if st == "bull" and c_low <= fib_snap:  trig = True; ep = fib_snap
+                if st == "bear" and c_high >= fib_snap: trig = True; ep = fib_snap
             elif entry_mode == "rejection":
-                if st == "bull" and c_low <= fib618 and c_close > fib618:
-                    triggered = True; entry_price = float(opens_[ci+1]) if ci+1 < n else None
-                elif st == "bear" and c_high >= fib618 and c_close < fib618:
-                    triggered = True; entry_price = float(opens_[ci+1]) if ci+1 < n else None
+                if st == "bull" and c_low <= fib_snap and c_close > fib_snap:
+                    trig = True; ep = float(opens_[ci + 1]) if ci + 1 < n else None
+                if st == "bear" and c_high >= fib_snap and c_close < fib_snap:
+                    trig = True; ep = float(opens_[ci + 1]) if ci + 1 < n else None
             elif entry_mode == "reclaim":
-                if not active.get("c_watch"):
-                    if st == "bull" and c_close < fib618: active["c_watch"] = ci
-                    elif st == "bear" and c_close > fib618: active["c_watch"] = ci
+                if not a.get("c_watch"):
+                    if st == "bull" and c_close < fib_snap:    a["c_watch"] = ci
+                    elif st == "bear" and c_close > fib_snap:  a["c_watch"] = ci
                 else:
-                    if (ci - active["c_watch"]) <= 2:
-                        if st == "bull" and c_close > fib618:
-                            triggered = True; entry_price = c_close; active["c_watch"] = None
-                        elif st == "bear" and c_close < fib618:
-                            triggered = True; entry_price = c_close; active["c_watch"] = None
+                    if (ci - a["c_watch"]) <= 2:
+                        if st == "bull" and c_close > fib_snap:
+                            trig = True; ep = c_close; a["c_watch"] = None
+                        elif st == "bear" and c_close < fib_snap:
+                            trig = True; ep = c_close; a["c_watch"] = None
                     else:
-                        active["c_watch"] = None
+                        a["c_watch"] = None
 
-            if not triggered or entry_price is None:
-                ci += 1; continue
+            if trig and ep is not None:
+                # EMA filter — blocked trigger leaves the zone armed (legacy behavior)
+                if not ema_allows(ci, "bull" if st == "bull" else "bear"):
+                    return "armed", None
+                a["fib_trig"] = fib_snap
+                return "trig", ep
+            return "armed", None
 
-            # EMA filter — only take trade if EMA trend aligns
-            direction = "bull" if st == "bull" else "bear"
-            if not ema_allows(ci, direction):
-                ci += 1; continue
-            entry_candle = ci if entry_mode == "touch" else ci + 1
-            entry  = entry_price
-            sl_lvl = get_sl(entry, st, p2, entry_candle)
-            rpp    = abs(entry - sl_lvl)
-            if rpp <= 0: active = None; ci += 1; continue
-            tp       = entry + rpp * rr if st == "bull" else entry - rpp * rr
-            pos      = (equity * risk_pct) / rpp
-            notional = pos * entry
-
-            xc = xp = xr = None
-            for xi in range(entry_candle + 1, n):
-                if st == "bull":
-                    if lows_[xi]  <= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
-                    if highs_[xi] >= tp:     xp = tp;     xr = "TP"; xc = xi; break
-                    # After max_hold, only close if in profit
-                    if xi >= entry_candle + max_hold:
-                        if closes_[xi] > entry: xp = float(closes_[xi]); xr = "TIMEOUT"; xc = xi; break
-                else:
-                    if highs_[xi] >= sl_lvl: xp = sl_lvl; xr = "SL"; xc = xi; break
-                    if lows_[xi]  <= tp:     xp = tp;     xr = "TP"; xc = xi; break
-                    # After max_hold, only close if in profit
-                    if xi >= entry_candle + max_hold:
-                        if closes_[xi] < entry: xp = float(closes_[xi]); xr = "TIMEOUT"; xc = xi; break
-
-            # Fallback — if we reach end of data without closing
-            if xc is None:
-                xc = n - 1
-                xp = float(closes_[xc]); xr = "TIMEOUT"
-
-            gross_pnl = (xp - entry) * pos if st == "bull" else (entry - xp) * pos
-            won       = xr == "TP"
-            fee_entry = notional * 0.0002
-            fee_exit  = notional * 0.0002 if won else notional * 0.00055
-            total_fee = fee_entry + fee_exit
-            pnl       = gross_pnl - total_fee
-            equity   += pnl
-            last_p3_idx = p3_idx
-
-            trades_out.append({
+        # ── POSITION CLOSE / BOOKKEEPING ────────────────────
+        def close_position(pos, xp, xr, xc):
+            nonlocal equity
+            a = pos["a"]; st = a["st"]
+            gross = (xp - pos["entry"]) * pos["size"] if st == "bull" \
+                    else (pos["entry"] - xp) * pos["size"]
+            won = xr == "TP"
+            fee = pos["notional"] * 0.0002 + pos["notional"] * (0.0002 if won else 0.00055)
+            pnl = gross - fee
+            equity += pnl
+            return {
                 "id":         0,
                 "direction":  "LONG" if st == "bull" else "SHORT",
-                "p1_time":    active.get("p1_time") or (timestamps[p1_idx] if p1_idx < n else None),
-                "p2_time":    active.get("p2_time"),
-                "p3_time":    active.get("p3_time"),
-                "entry_time": timestamps[entry_candle],
+                "p1_time":    a.get("p1_time"),
+                "p2_time":    a.get("p2_time"),
+                "p3_time":    a.get("p3_time"),
+                "entry_time": timestamps[pos["entry_candle"]],
                 "exit_time":  timestamps[xc],
-                "entry":      round(entry, 6),
-                "sl":         round(sl_lvl, 6),
-                "tp":         round(tp, 6),
+                "entry":      round(pos["entry"], 6),
+                "sl":         round(pos["sl"], 6),
+                "tp":         round(pos["tp"], 6),
                 "exit_price": round(xp, 6),
                 "result":     xr,
-                "gross_pnl":  round(gross_pnl, 4),
-                "fee":        round(total_fee, 4),
+                "gross_pnl":  round(gross, 4),
+                "fee":        round(fee, 4),
                 "pnl":        round(pnl, 4),
                 "equity":     round(equity, 4),
                 "won":        won,
-                "p1":         round(p1_price, 6),
-                "p2":         round(p2, 6),
-                "p3":         round(active["p3_close"], 6),
-                "fib_entry":  round(fib618, 6),
-            })
+                "p1":         round(a["p1_price"], 6),
+                "p2":         round(a["p2"], 6),
+                "p3":         round(a["p3_close"], 6),
+                "fib_entry":  round(a.get("fib_trig", a["fib618"]), 6),
+            }
 
-            active = None
-            ci = xc + 1
+        # ── EVENT-DRIVEN DIRECTION LOOP ─────────────────────
+        def run_dir(stv):
+            out = []
+            su  = [dict(s) for s in all_setups if s["st"] == stv]
+            si  = 0
+            alive = []
+            pos = None
 
-        return trades_out
+            for ci in range(1, n):
+                # activate zones whose first tradeable candle is ci
+                while si < len(su) and su[si]["bos_idx"] + 1 <= ci:
+                    alive.append(su[si]); si += 1
+
+                # 1) manage open position (SL before TP — conservative)
+                if pos is not None and ci >= pos["scan_start"]:
+                    xp = xr = None
+                    if stv == "bull":
+                        if   lows_[ci]  <= pos["sl"]: xp, xr = pos["sl"], "SL"
+                        elif highs_[ci] >= pos["tp"]: xp, xr = pos["tp"], "TP"
+                        elif timeout_mode != "off" and ci >= pos["entry_candle"] + max_hold:
+                            if timeout_mode == "always" or closes_[ci] > pos["entry"]:
+                                xp, xr = float(closes_[ci]), "TIMEOUT"
+                    else:
+                        if   highs_[ci] >= pos["sl"]: xp, xr = pos["sl"], "SL"
+                        elif lows_[ci]  <= pos["tp"]: xp, xr = pos["tp"], "TP"
+                        elif timeout_mode != "off" and ci >= pos["entry_candle"] + max_hold:
+                            if timeout_mode == "always" or closes_[ci] < pos["entry"]:
+                                xp, xr = float(closes_[ci]), "TIMEOUT"
+                    if xr:
+                        out.append(close_position(pos, xp, xr, ci))
+                        pos = None
+
+                if ci >= n - 1:
+                    continue  # last candle: exits only, no new triggers
+
+                # 2) step every armed zone; first trigger wins the position slot
+                for a in list(alive):
+                    r, ep = step_setup(a, ci)
+                    if r == "dead":
+                        alive.remove(a)
+                    elif r == "trig":
+                        alive.remove(a)          # zone consumed, taken or not
+                        if pos is None:
+                            entry_candle = ci if entry_mode == "touch" else ci + 1
+                            if entry_candle >= n: continue
+                            sl_lvl = get_sl(ep, stv, a["p2"], entry_candle)
+                            rpp = abs(ep - sl_lvl)
+                            if rpp <= 0: continue
+                            tp = ep + rpp * rr if stv == "bull" else ep - rpp * rr
+                            size = (equity * risk_pct) / rpp
+                            pos = {
+                                "a": a, "entry": ep, "sl": sl_lvl, "tp": tp,
+                                "entry_candle": entry_candle,
+                                # rejection/reclaim fill at the open of entry_candle →
+                                # that candle itself is monitored (same-candle SL fix).
+                                # touch fills mid-candle → monitor from next candle (legacy).
+                                "scan_start": entry_candle + 1 if entry_mode == "touch"
+                                              else entry_candle,
+                                "size": size, "notional": size * ep,
+                            }
+
+            # end of data — flush open position at last close (legacy fallback)
+            if pos is not None:
+                out.append(close_position(pos, float(closes_[n - 1]), "TIMEOUT", n - 1))
+            return out
+
+        bull_t = run_dir("bull")
+        bear_t = run_dir("bear")
+        return sorted(bull_t + bear_t, key=lambda t: t["entry_time"])
 
     # ── PULLBACK ENGINE ───────────────────────────────────
     def run_pullback():
@@ -1673,7 +1646,8 @@ def process_request(req: BacktestRequest):
             candles, pivots, 0.02, req.rr, req.fib_level,
             req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
             req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
-            **ema_kwargs, atr_sl=req.atr_sl
+            **ema_kwargs, atr_sl=req.atr_sl,
+            bos_break=req.bos_break, timeout_mode=req.timeout_mode,
         )
         stats_fixed = calc_stats(trades_fixed, days)
 
@@ -1687,7 +1661,8 @@ def process_request(req: BacktestRequest):
             candles, pivots, risk_pct, req.rr, req.fib_level,
             req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
             req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
-            **ema_kwargs, atr_sl=req.atr_sl
+            **ema_kwargs, atr_sl=req.atr_sl,
+            bos_break=req.bos_break, timeout_mode=req.timeout_mode,
         )
         stats = calc_stats(trades, days)
 
