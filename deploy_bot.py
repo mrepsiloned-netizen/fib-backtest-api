@@ -165,6 +165,9 @@ def handle_file(message):
         return
 
     filename = doc.get("file_name", "")
+    # Telegram sometimes appends .txt to non-standard files (e.g. mise.toml.txt)
+    if filename.endswith(".toml.txt"): filename = filename[:-4]
+    if filename.endswith(".txt") and filename not in FILE_ROUTES: filename = filename[:-4]
     file_id  = doc.get("file_id")
 
     if filename not in FILE_ROUTES:
