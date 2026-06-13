@@ -362,7 +362,7 @@ def main_compute():
         print("Cleared old results")
     except: pass
 
-    tg(f"""🔢 <b>Matrix Runner v5 Started</b>
+    tg(f"""🔢 <b>Matrix Runner v5 — Pine Script Aligned</b>
 {TOTAL:,} combos | Pure Python — no HTTP per combo
 Pairs: {len(PAIRS)} × TF: {len(TIMEFRAMES)}
 Engines: {len(ENGINES)} × Entry: {len(ENTRY_MODES)}
