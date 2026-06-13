@@ -3,6 +3,7 @@
 # Telegram bot that deploys files to GitHub automatically
 # Commands:
 #   Send a file → deploys to correct repo/path automatically
+#   /archive [strategy-name] → next .md file goes to archive repo
 #   /status → shows all services status
 #   /help → shows available commands
 # ============================================================
@@ -21,6 +22,9 @@ GITHUB_USERNAME  = os.environ.get("GITHUB_USERNAME", "mrepsiloned-netizen")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{DEPLOY_BOT_TOKEN}"
 
+# Archive repo
+ARCHIVE_REPO = "waddle-strategy-archive"
+
 # File routing — maps filename to repo + path
 FILE_ROUTES = {
     "index.html":        {"repo": "fib-backtest-ui",  "path": "index.html"},
@@ -34,6 +38,26 @@ FILE_ROUTES = {
     "mise.toml":          {"repo": "fib-backtest-api", "path": "mise.toml"},
     "runtime.txt":        {"repo": "fib-backtest-api", "path": "runtime.txt"},
 }
+
+# ── ARCHIVE STATE ─────────────────────────────────────────
+# Stores pending archive target: {"strategy": "bos-pullback", "set_at": timestamp}
+_archive_pending = {}
+
+def set_archive_pending(strategy_name):
+    _archive_pending["strategy"] = strategy_name
+    _archive_pending["set_at"] = time.time()
+
+def get_archive_pending():
+    # Expires after 5 minutes
+    if not _archive_pending.get("strategy"):
+        return None
+    if time.time() - _archive_pending.get("set_at", 0) > 300:
+        _archive_pending.clear()
+        return None
+    return _archive_pending["strategy"]
+
+def clear_archive_pending():
+    _archive_pending.clear()
 
 # ── TELEGRAM HELPERS ──────────────────────────────────────
 def send(text, parse_mode="HTML"):
@@ -134,17 +158,24 @@ Just send me any of these files and I'll push to GitHub automatically:
 📄 <code>mise.toml</code> → fib-backtest-api
 📄 <code>runtime.txt</code> → fib-backtest-api
 
+<b>Archive a strategy doc:</b>
+1. Send <code>/archive [strategy-name]</code>
+   e.g. <code>/archive bos-pullback</code>
+2. Then send your .md file
+→ Pushes to waddle-strategy-archive/strategies/[name]/
+
 <b>Commands:</b>
 /help — show this message
 /status — check GitHub repos
 /files — list deployable files
+/archive [name] — set archive target, then send .md file
 
 Railway auto-deploys within 2 minutes of every push.""")
 
 def handle_status():
     send("⏳ Checking status...")
     msgs = []
-    for repo in ["fib-backtest-api", "fib-backtest-ui"]:
+    for repo in ["fib-backtest-api", "fib-backtest-ui", ARCHIVE_REPO]:
         info = get_repo_info(repo)
         if info:
             updated = info.get("updated_at","?")[:10]
@@ -157,7 +188,23 @@ def handle_files():
     lines = ["📁 <b>Deployable files:</b>\n"]
     for filename, route in FILE_ROUTES.items():
         lines.append(f"• <code>{filename}</code> → {route['repo']}")
+    lines.append(f"\n📚 <b>Archive:</b> /archive [strategy-name] then send .md")
     send("\n".join(lines))
+
+def handle_archive_command(text):
+    parts = text.strip().split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        send("❓ Usage: <code>/archive [strategy-name]</code>\nExample: <code>/archive bos-pullback</code>")
+        return
+    strategy = parts[1].strip().lower().replace(" ", "-")
+    set_archive_pending(strategy)
+    send(f"""📚 <b>Archive mode active</b>
+
+Strategy: <code>{strategy}</code>
+Now send your .md file → it will be pushed to:
+<code>waddle-strategy-archive/strategies/{strategy}/</code>
+
+⏳ Waiting for file (expires in 5 minutes)""")
 
 def handle_file(message):
     doc = message.get("document")
@@ -170,8 +217,44 @@ def handle_file(message):
     if filename.endswith(".txt") and filename not in FILE_ROUTES: filename = filename[:-4]
     file_id  = doc.get("file_id")
 
+    # ── ARCHIVE ROUTE ──────────────────────────────────────
+    pending_strategy = get_archive_pending()
+    if pending_strategy and filename.endswith(".md"):
+        clear_archive_pending()
+        archive_path = f"strategies/{pending_strategy}/{filename}"
+        send(f"📥 Received <code>{filename}</code>\n⏳ Archiving to <b>{ARCHIVE_REPO}</b>/{archive_path}...")
+
+        content = download_file(file_id)
+        if not content:
+            send(f"❌ Failed to download {filename}")
+            return
+
+        now_str    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        commit_msg = f"Archive {pending_strategy}/{filename} via Telegram — {now_str}"
+        success, result = push_to_github(ARCHIVE_REPO, archive_path, content, commit_msg)
+
+        if success:
+            commit_url = result.get("commit", {}).get("html_url", "")
+            send(f"""✅ <b>Archived successfully!</b>
+
+📄 File: <code>{filename}</code>
+📚 Strategy: <b>{pending_strategy}</b>
+📦 Repo: <b>{ARCHIVE_REPO}</b>
+⏰ {now_str}
+
+{f'🔗 <a href="{commit_url}">View commit</a>' if commit_url else ''}""")
+        else:
+            error = result.get("message", "Unknown error")
+            send(f"❌ Archive failed: {error}")
+        return
+
+    # ── STANDARD DEPLOY ROUTE ──────────────────────────────
     if filename not in FILE_ROUTES:
-        send(f"❓ Unknown file: <code>{filename}</code>\n\nSend /files to see deployable files.")
+        # Give a hint if they forgot to set archive mode
+        if filename.endswith(".md"):
+            send(f"❓ To archive a .md file, first send:\n<code>/archive [strategy-name]</code>\nthen resend your file.")
+        else:
+            send(f"❓ Unknown file: <code>{filename}</code>\n\nSend /files to see deployable files.")
         return
 
     route = FILE_ROUTES[filename]
@@ -209,6 +292,7 @@ def run():
     send("""🚀 <b>Waddle Deployer is LIVE</b>
 
 Send me any file to deploy it automatically to GitHub.
+Use /archive [strategy-name] to archive strategy docs.
 
 Send /help for instructions.""")
 
@@ -232,6 +316,8 @@ Send /help for instructions.""")
                     handle_status()
                 elif text == "/files":
                     handle_files()
+                elif text.startswith("/archive"):
+                    handle_archive_command(text)
                 elif msg.get("document"):
                     handle_file(msg)
                 elif text and not text.startswith("/"):
