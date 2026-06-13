@@ -1117,6 +1117,14 @@ def prefetch_candles_endpoint():
     _matrix_thread.start()
     return {"success": True, "message": "Prefetch started — check Runner tab"}
 
+@app.post("/matrix-status/reset")
+def reset_matrix_status():
+    try:
+        httpx.delete(f"{SUPABASE_URL}/rest/v1/matrix_status?id=gt.0", headers=HEADERS, timeout=10)
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 @app.get("/matrix-status")
 def matrix_status():
     try:
@@ -1136,44 +1144,50 @@ def matrix_status():
 
 @app.post("/send-matrix-csv")
 def send_matrix_csv():
-    """Build full matrix CSV and send to Telegram as file."""
-    import io, csv as csv_mod
-    fields = ["pair","timeframe","engine","entry_mode","pivot_n","rr","fib_level",
-              "ema_pair","adx_min","return_pct","cagr","max_dd","sharpe","profit_factor",
-              "win_rate","trades","wins","losses","avg_win","avg_loss","kelly_full",
-              "period_start","period_end"]
-    try:
-        all_rows = []
-        offset = 0
-        while True:
-            q = f"select={','.join(fields)}&order=sharpe.desc.nullslast&limit=1000&offset={offset}"
-            hdrs = {"apikey":SUPABASE_KEY,"Authorization":f"Bearer {SUPABASE_KEY}","Prefer":"count=none"}
-            res = httpx.get(f"{SUPABASE_URL}/rest/v1/matrix_results?{q}",headers=hdrs,timeout=60)
-            if res.status_code != 200: break
-            rows = res.json()
-            if not rows: break
-            all_rows.extend(rows)
-            if len(rows) < 1000: break
-            offset += 1000
+    """Build full matrix CSV and send to Telegram as file — runs in background."""
+    import io, csv as csv_mod, threading
 
-        buf = io.StringIO()
-        w = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
-        w.writeheader(); w.writerows(all_rows)
-        csv_bytes = buf.getvalue().encode("utf-8")
+    def do_send():
+        fields = ["pair","timeframe","engine","entry_mode","pivot_n","rr","fib_level",
+                  "ema_pair","adx_min","return_pct","cagr","max_dd","sharpe","profit_factor",
+                  "win_rate","trades","wins","losses","avg_win","avg_loss","kelly_full",
+                  "period_start","period_end"]
+        try:
+            all_rows = []
+            offset   = 0
+            while True:
+                q    = f"select={','.join(fields)}&order=sharpe.desc.nullslast&limit=1000&offset={offset}"
+                hdrs = {"apikey":SUPABASE_KEY,"Authorization":f"Bearer {SUPABASE_KEY}","Prefer":"count=none"}
+                res  = httpx.get(f"{SUPABASE_URL}/rest/v1/matrix_results?{q}",headers=hdrs,timeout=60)
+                if res.status_code != 200: break
+                rows = res.json()
+                if not rows: break
+                all_rows.extend(rows)
+                if len(rows) < 1000: break
+                offset += 1000
 
-        TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN","")
-        TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","")
-        filename = f"waddle_matrix_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.csv"
+            buf = io.StringIO()
+            w   = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+            w.writeheader(); w.writerows(all_rows)
+            csv_bytes = buf.getvalue().encode("utf-8")
 
-        httpx.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
-            data={"chat_id": TELEGRAM_CHAT_ID, "caption": f"Matrix results — {len(all_rows)} rows"},
-            files={"document": (filename, csv_bytes, "text/csv")},
-            timeout=120
-        )
-        return {"success": True, "rows": len(all_rows), "message": f"Sent {len(all_rows)} rows to Telegram"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+            TG_TOKEN   = os.environ.get("TELEGRAM_TOKEN","")
+            TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","")
+            filename   = f"waddle_matrix_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.csv"
+
+            httpx.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
+                data={"chat_id":TG_CHAT_ID,"caption":f"✅ Matrix CSV — {len(all_rows):,} rows"},
+                files={"document":(filename, csv_bytes, "text/csv")},
+                timeout=120
+            )
+            print(f"CSV sent to Telegram: {len(all_rows)} rows")
+        except Exception as e:
+            print(f"send_matrix_csv error: {e}")
+
+    t = threading.Thread(target=do_send, daemon=True)
+    t.start()
+    return {"success": True, "message": "Building CSV and sending to Telegram — arrives in ~30 seconds"}
 
 @app.get("/matrix-results/all")
 def matrix_results_all():
