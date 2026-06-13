@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================
-# WADDLE MATRIX RUNNER v5
-# Pure standalone — loads candles from Supabase, runs all
-# combos in memory, saves results. No HTTP per combo.
-# Estimated runtime: 15-30 minutes for 19,440 combos
+# WADDLE MATRIX RUNNER v6
+# Pine Script P1-P2-P3 Master Algorithm v6.5 faithful port
+# Pulls candles from Supabase, runs all combos in memory
+# No HTTP per combo — full speed pure Python
 # ============================================================
 
-import os, time, httpx, itertools, csv, io
+import os, time, httpx, itertools, io, csv as csv_mod
 import numpy as np
 from datetime import datetime, timezone
 
@@ -22,9 +22,9 @@ HEADERS = {
     "Prefer": "return=minimal,resolution=ignore-duplicates",
 }
 
+# ── VARIABLE SPACE ─────────────────────────────────────────────
 PAIRS       = ["DOGE/USDT","XLM/USDT","XRP/USDT","ADA/USDT","TRX/USDT","ARB/USDT"]
 TIMEFRAMES  = ["5m","15m","1h"]
-ENGINES     = ["structure"]
 ENTRY_MODES = ["rejection","reclaim"]
 PIVOT_NS    = [3,5,8]
 RR_RATIOS   = [1.5,2.0,3.0,4.0]
@@ -34,9 +34,12 @@ ADX_MINS    = [0,15,25]
 PERIOD_START= "2025-01-01"
 PERIOD_END  = "2026-01-01"
 RISK_PCT    = 0.02
+MIN_SWING   = 0.002
+STOP_BUF    = 0.001
 
-TOTAL = (len(PAIRS)*len(TIMEFRAMES)*len(ENGINES)*len(ENTRY_MODES)*
-         len(PIVOT_NS)*len(RR_RATIOS)*len(FIB_LEVELS)*len(EMA_PAIRS)*len(ADX_MINS))
+TOTAL = (len(PAIRS)*len(TIMEFRAMES)*len(ENTRY_MODES)*
+         len(PIVOT_NS)*len(RR_RATIOS)*len(FIB_LEVELS)*
+         len(EMA_PAIRS)*len(ADX_MINS))
 
 # ── HELPERS ────────────────────────────────────────────────────
 def tg(msg):
@@ -82,265 +85,203 @@ def save_rows(rows):
         print(f"Save error: {e}")
 
 # ── INDICATORS ─────────────────────────────────────────────────
-def ema(arr, p):
-    k=2/(p+1); out=np.empty(len(arr)); out[0]=arr[0]
+def calc_ema(arr, period):
+    k=2/(period+1); out=np.empty(len(arr)); out[0]=arr[0]
     for i in range(1,len(arr)): out[i]=arr[i]*k+out[i-1]*(1-k)
     return out
 
-def adx(H,L,C,p):
+def calc_adx(H,L,C,period):
     n=len(H); adx_=np.zeros(n); pdm=np.zeros(n); mdm=np.zeros(n); tr=np.zeros(n)
     for i in range(1,n):
         pdm[i]=max(H[i]-H[i-1],0) if H[i]-H[i-1]>L[i-1]-L[i] else 0
         mdm[i]=max(L[i-1]-L[i],0) if L[i-1]-L[i]>H[i]-H[i-1] else 0
         tr[i]=max(H[i]-L[i],abs(H[i]-C[i-1]),abs(L[i]-C[i-1]))
-    st=sp=sm=sum(tr[1:p+1]); sp=sum(pdm[1:p+1]); sm=sum(mdm[1:p+1])
+    st_=sum(tr[1:period+1]); sp=sum(pdm[1:period+1]); sm=sum(mdm[1:period+1])
     dx=np.zeros(n)
-    for i in range(p+1,n):
-        st=st-st/p+tr[i]; sp=sp-sp/p+pdm[i]; sm=sm-sm/p+mdm[i]
-        pi_=(sp/st*100) if st>0 else 0; mi_=(sm/st*100) if st>0 else 0
+    for i in range(period+1,n):
+        st_=st_-st_/period+tr[i]; sp=sp-sp/period+pdm[i]; sm=sm-sm/period+mdm[i]
+        pi_=(sp/st_*100) if st_>0 else 0; mi_=(sm/st_*100) if st_>0 else 0
         s=pi_+mi_; dx[i]=abs(pi_-mi_)/s*100 if s>0 else 0
-    s2=p*2
-    if s2<n: adx_[s2]=sum(dx[p+1:s2+1])/p
-    for i in range(s2+1,n): adx_[i]=(adx_[i-1]*(p-1)+dx[i])/p
+    s2=period*2
+    if s2<n: adx_[s2]=sum(dx[period+1:s2+1])/period
+    for i in range(s2+1,n): adx_[i]=(adx_[i-1]*(period-1)+dx[i])/period
     return adx_
 
-def pivots(H,L,N):
-    pv=[]
-    for i in range(N,len(H)-N):
-        if H[i]==max(H[i-N:i+N+1]): pv.append({"i":i,"t":"H","p":float(H[i])})
-        elif L[i]==min(L[i-N:i+N+1]): pv.append({"i":i,"t":"L","p":float(L[i])})
-    dd=[]
-    for p in pv:
-        if not dd: dd.append(p); continue
-        last=dd[-1]
-        if last["t"]==p["t"]:
-            if p["t"]=="H" and p["p"]>last["p"]: dd[-1]=p
-            elif p["t"]=="L" and p["p"]<last["p"]: dd[-1]=p
-        else: dd.append(p)
-    return dd
+# ── BACKTEST — Pine Script P1-P2-P3 v6.5 ──────────────────────
+def backtest(H, L, C, O, n, N, rr, fib_level, entry_mode,
+             ema_f, ema_s, use_ema, adx_v, adx_thr):
 
-# ── BACKTEST ───────────────────────────────────────────────────
-def backtest(H,L,C,n,pv,eng,em,rr,fib,ef,es,use_ema,adx_v,adx_thr,N):
-    equity=100.0; trades=[]
-    MIN=0.002
+    # Strict fractals — confirmed at bar i+N (no lookahead)
+    conf_high, conf_low = {}, {}
+    for i in range(N, n-N):
+        if all(H[i]>H[i-N:i]) and all(H[i]>H[i+1:i+N+1]):
+            conf_high[i+N] = (i, float(H[i]))
+        if all(L[i]<L[i-N:i]) and all(L[i]<L[i+1:i+N+1]):
+            conf_low[i+N]  = (i, float(L[i]))
 
-    def ok(i,d):
-        if use_ema and ef is not None:
-            if d=="bull" and ef[i]<=es[i]: return False
-            if d=="bear" and ef[i]>=es[i]: return False
-        if adx_v is not None and adx_v[i]<adx_thr: return False
+    def ema_ok(idx, side):
+        if idx>=n: return False
+        if use_ema and ema_f is not None:
+            if side=="bull" and ema_f[idx]<=ema_s[idx]: return False
+            if side=="bear" and ema_f[idx]>=ema_s[idx]: return False
+        if adx_v is not None and adx_v[idx]<adx_thr: return False
         return True
 
-    def exit_(d,sl,tp,start):
-        for i in range(start,min(start+300,n)):
-            if d=="bull":
-                if L[i]<=sl: return sl,i
-                if H[i]>=tp: return tp,i
-            else:
-                if H[i]>=sl: return sl,i
-                if L[i]<=tp: return tp,i
-        return None,None
+    mac = {"trend":0,"ext":None,"ext_idx":None}
 
-    def trade(entry,sl,tp,won_price):
+    def fresh(side):
+        return {"side":side,"state":0,"p1_idx":None,"p1_price":None,
+                "p2":None,"p2_idx":None,"prev_p2":None,"anchor":None,
+                "p3":None,"p3_bar":None,"ttl":None,"fib":None,"c_watch":None}
+
+    def reset(m):
+        m.update(state=0,p1_idx=None,p1_price=None,p2=None,p2_idx=None,
+                 anchor=None,p3=None,p3_bar=None,ttl=None,fib=None,c_watch=None)
+
+    mach = {"bull":fresh("bull"), "bear":fresh("bear")}
+    pos  = {"bull":None, "bear":None}
+    equity = 100.0
+    trades = []
+
+    def close_pos(side, xp, xr, xc):
         nonlocal equity
-        rpp=abs(entry-sl)
-        if rpp<=0: return
-        pos=equity*RISK_PCT/rpp
-        won=won_price==tp
-        gross=(won_price-entry)*pos if sl<entry else (entry-won_price)*pos
-        fee=pos*entry*(0.0004 if won else 0.00075)
+        po=pos[side]
+        gross=(xp-po["entry"])*po["size"] if side=="bull" else (po["entry"]-xp)*po["size"]
+        won=xr=="TP"
+        fee=po["notional"]*0.0002+po["notional"]*(0.0002 if won else 0.00055)
         pnl=gross-fee; equity+=pnl
-        trades.append({"w":won,"p":pnl,"e":equity})
+        trades.append({"won":won,"pnl":pnl,"eq":equity})
+        pos[side]=None
 
-    if eng=="original":
-        used=-1; bias=None
-        for pi in range(2,len(pv)):
-            a,b,c_=pv[pi-2],pv[pi-1],pv[pi]
-            st=None
-            if a["t"]=="H" and b["t"]=="L" and c_["t"]=="H" and c_["p"]<a["p"]: st="bear"
-            elif a["t"]=="L" and b["t"]=="H" and c_["t"]=="L" and c_["p"]>a["p"]: st="bull"
-            if not st or c_["i"]<=used: continue
-            if bias and bias!=st: continue
-            fh=a["p"] if st=="bear" else b["p"]
-            fl=b["p"] if st=="bear" else a["p"]
-            rng=fh-fl
-            if rng<=0: continue
-            fe=fl+rng*fib if st=="bear" else fh-rng*fib
-            sl_=fh+rng*0.02 if st=="bear" else fl-rng*0.02
-            ec=None
-            for ci in range(c_["i"]+N+1,min(c_["i"]+200,n-1)):
-                if st=="bear":
-                    if H[ci]>fh: break
-                    if H[ci]>=fe: ec=ci; break
+    def open_pos(side, m, entry_price, entry_candle, scan_start):
+        nonlocal equity
+        sl=m["p2"]*(1+STOP_BUF) if side=="bear" else m["p2"]*(1-STOP_BUF)
+        rpp=abs(entry_price-sl)
+        if rpp<=0: return
+        rng=(m["p3"]-m["p2"]) if side=="bull" else (m["p2"]-m["p3"])
+        if rng<=0 or rng/max(min(m["p2"],m["p3"]),1)<MIN_SWING: return
+        tp=entry_price+rpp*rr if side=="bull" else entry_price-rpp*rr
+        sz=equity*RISK_PCT/rpp
+        pos[side]={"entry":entry_price,"sl":sl,"tp":tp,
+                   "entry_candle":entry_candle,"scan_start":scan_start,
+                   "size":sz,"notional":sz*entry_price}
+
+    def step(m, ci):
+        side=m["side"]
+        ch=float(H[ci]); cl=float(L[ci])
+        cc=float(C[ci]); co=float(O[ci])
+
+        # New P1 — state 2 locked (allowStale=False)
+        pv=conf_high.get(ci) if side=="bull" else conf_low.get(ci)
+        if pv is not None and m["state"]!=2:
+            p_idx,p_price=pv
+            m["state"]=1; m["p1_idx"]=p_idx; m["p1_price"]=p_price
+            if side=="bull":
+                m["anchor"]=m["prev_p2"] if mac["trend"]==1 else mac["ext"]
+                m["p2"]=float(min(L[p_idx:ci+1]))
+                m["p2_idx"]=p_idx+int(np.argmin(L[p_idx:ci+1]))
+            else:
+                m["anchor"]=m["prev_p2"] if mac["trend"]==-1 else mac["ext"]
+                m["p2"]=float(max(H[p_idx:ci+1]))
+                m["p2_idx"]=p_idx+int(np.argmax(H[p_idx:ci+1]))
+
+        # State 1 — float P2, INVALID, hunt BOS
+        if m["state"]==1:
+            if side=="bull" and cl<m["p2"]: m["p2"]=cl; m["p2_idx"]=ci
+            elif side=="bear" and ch>m["p2"]: m["p2"]=ch; m["p2_idx"]=ci
+            if m["anchor"] is not None:
+                if side=="bull" and cl<m["anchor"]: reset(m); return
+                if side=="bear" and ch>m["anchor"]: reset(m); return
+            broke=(cc>m["p1_price"]) if side=="bull" else (cc<m["p1_price"])
+            if broke:
+                m["state"]=2
+                mac["trend"]=1 if side=="bull" else -1
+                mac["ext"]=ch if side=="bull" else cl
+                mac["ext_idx"]=ci
+                m["prev_p2"]=m["p2"]
+                m["ttl"]=(ci-m["p1_idx"])*2
+                m["p3"]=ch if side=="bull" else cl
+                m["p3_bar"]=ci
+
+        # State 2 — KILLED / float P3 / fib / FAILED / EXPIRED / trigger
+        if m["state"]==2:
+            if (side=="bull" and mac["trend"]==-1) or (side=="bear" and mac["trend"]==1):
+                reset(m); return
+            if side=="bull" and ch>=m["p3"]: m["p3"]=ch; m["p3_bar"]=ci
+            elif side=="bear" and cl<=m["p3"]: m["p3"]=cl; m["p3_bar"]=ci
+            rng=(m["p3"]-m["p2"]) if side=="bull" else (m["p2"]-m["p3"])
+            if rng>0:
+                m["fib"]=m["p3"]-rng*fib_level if side=="bull" else m["p3"]+rng*fib_level
+            if side=="bull" and cl<m["p2"]: reset(m); return
+            if side=="bear" and ch>m["p2"]: reset(m); return
+            if m["ttl"] and (ci-m["p3_bar"])>m["ttl"]: reset(m); return
+            if m["fib"] is None: return
+
+            fib=m["fib"]; trig=False; ep=None; ec=None; ss=None
+
+            if entry_mode=="rejection":
+                if side=="bull" and cl<=fib and cc>fib and cc>co:
+                    if ci+1<n: trig=True; ep=float(O[ci+1]); ec=ci+1; ss=ci+1
+                elif side=="bear" and ch>=fib and cc<fib and cc<co:
+                    if ci+1<n: trig=True; ep=float(O[ci+1]); ec=ci+1; ss=ci+1
+            elif entry_mode=="reclaim":
+                if m["c_watch"] is None:
+                    if side=="bull" and cc<fib: m["c_watch"]=ci
+                    elif side=="bear" and cc>fib: m["c_watch"]=ci
                 else:
-                    if L[ci]<fl: break
-                    if L[ci]<=fe: ec=ci; break
-            if ec is None: continue
-            if not ok(ec,st): continue
-            rpp=abs(fe-sl_)
-            if rpp<=0: continue
-            tp=fe+rpp*rr if st=="bull" else fe-rpp*rr
-            xp,xc=exit_(st,sl_,tp,ec+1)
-            if xp is None: continue
-            trade(fe,sl_,tp,xp)
-            bias=None if xp==tp else ("bull" if st=="bear" else "bear")
-            used=c_["i"]
-
-    elif eng in ("bos_pivot","pullback"):
-        v2=eng=="pullback"
-        ph={p["i"]:p["p"] for p in pv if p["t"]=="H"}
-        pl={p["i"]:p["p"] for p in pv if p["t"]=="L"}
-        for st in ["bull","bear"]:
-            src=[p for p in pv if p["t"]==("H" if st=="bull" else "L")]
-            setups=[]
-            for p1 in src:
-                for ci in range(p1["i"]+1,n-1):
-                    if st=="bull" and C[ci]>p1["p"]:
-                        p2=float(min(L[p1["i"]:ci+1]))
-                        rng=C[ci]-p2
-                        if rng>0 and rng/max(p2,1)>=MIN:
-                            setups.append({"p1i":p1["i"],"p1p":p1["p"],"p2":p2,
-                                "p3i":ci,"p3c":C[ci],"fe":p2+rng*fib,"sl":p2})
-                        break
-                    elif st=="bear" and C[ci]<p1["p"]:
-                        p2=float(max(H[p1["i"]:ci+1]))
-                        rng=p2-C[ci]
-                        if rng>0 and rng/max(p2,1)>=MIN:
-                            setups.append({"p1i":p1["i"],"p1p":p1["p"],"p2":p2,
-                                "p3i":ci,"p3c":C[ci],"fe":p2-rng*fib,"sl":p2})
-                        break
-                    if (st=="bull" and L[ci]<p1["p"]*0.90) or (st=="bear" and H[ci]>p1["p"]*1.10): break
-            setups.sort(key=lambda x:x["p3i"])
-            si=0; act=None; lp=-1; ci=1
-            while ci<n-1:
-                if act is None:
-                    while si<len(setups):
-                        s=setups[si]; si+=1
-                        if s["p3i"]<=lp: continue
-                        act=s; ci=s["p3i"]+1; break
-                    if act is None: break
-                fe_,sl_=act["fe"],act["sl"]
-                if v2:
-                    pd=ph if st=="bull" else pl
-                    if ci in pd:
-                        nv=pd[ci]
-                        if (st=="bull" and nv>act["p1p"]) or (st=="bear" and nv<act["p1p"]):
-                            act["p1i"]=ci; act["p1p"]=nv; act["p3i"]=ci; act["p3c"]=nv
-                            np2=float(min(L[act["p1i"]:ci+1])) if st=="bull" else float(max(H[act["p1i"]:ci+1]))
-                            rng=abs(nv-np2)
-                            if rng>0 and rng/max(np2,1)>=MIN:
-                                act["p2"]=np2; act["fe"]=np2+rng*fib if st=="bull" else np2-rng*fib
-                                act["sl"]=np2; fe_=act["fe"]; sl_=act["sl"]
-                            ci+=1; continue
-                        elif (st=="bull" and nv>act["p3c"]) or (st=="bear" and nv<act["p3c"]):
-                            np2=float(min(L[act["p3i"]:ci+1])) if st=="bull" else float(max(H[act["p3i"]:ci+1]))
-                            rng=abs(nv-np2)
-                            if rng>0 and rng/max(np2,1)>=MIN:
-                                act["p2"]=np2; act["p3i"]=ci; act["p3c"]=nv
-                                act["fe"]=np2+rng*fib if st=="bull" else np2-rng*fib
-                                act["sl"]=np2; fe_=act["fe"]; sl_=act["sl"]
-                            ci+=1; continue
-                if (st=="bull" and L[ci]<act["p2"]) or (st=="bear" and H[ci]>act["p2"]):
-                    act=None; ci+=1; continue
-                if not ok(ci,st): ci+=1; continue
-                trig=False
-                if em=="touch": trig=L[ci]<=fe_ if st=="bull" else H[ci]>=fe_
-                else: trig=(L[ci]<=fe_ and C[ci]>fe_) if st=="bull" else (H[ci]>=fe_ and C[ci]<fe_)
-                if not trig: ci+=1; continue
-                sl_u=act["p2"]*(0.999 if st=="bull" else 1.001)
-                rpp=abs(fe_-sl_u)
-                if rpp<=0: act=None; ci+=1; continue
-                tp=fe_+rpp*rr if st=="bull" else fe_-rpp*rr
-                xp,xc=exit_(st,sl_u,tp,ci+1)
-                if xp is None: act=None; ci=n; continue
-                trade(fe_,sl_u,tp,xp)
-                lp=act["p3i"]; act=None; ci=xc+1
-
-    elif eng=="structure":
-        ph=[p for p in pv if p["t"]=="H"]
-        pl=[p for p in pv if p["t"]=="L"]
-        for st in ["bull","bear"]:
-            src=ph if st=="bull" else pl
-            for i in range(1,len(src)):
-                pp,pc=src[i-1],src[i]
-                if (st=="bull" and pc["p"]<=pp["p"]) or (st=="bear" and pc["p"]>=pp["p"]): continue
-                p2=float(min(L[pp["i"]:pc["i"]+1])) if st=="bull" else float(max(H[pp["i"]:pc["i"]+1]))
-                rng=abs(pc["p"]-p2)
-                if rng<=0: continue
-                fe_=pc["p"]-rng*fib if st=="bull" else pc["p"]+rng*fib
-                sl_=p2*(0.999 if st=="bull" else 1.001)
-                for ci in range(pc["i"]+1,n-1):
-                    if not ok(ci,st): continue
-                    if (st=="bull" and L[ci]<sl_) or (st=="bear" and H[ci]>sl_): break
-                    trig=False
-                    if em=="touch": trig=L[ci]<=fe_ if st=="bull" else H[ci]>=fe_
-                    else: trig=(L[ci]<=fe_ and C[ci]>fe_) if st=="bull" else (H[ci]>=fe_ and C[ci]<fe_)
-                    if not trig: continue
-                    rpp=abs(fe_-sl_)
-                    if rpp<=0: break
-                    tp=fe_+rpp*rr if st=="bull" else fe_-rpp*rr
-                    xp,xc=exit_(st,sl_,tp,ci+1)
-                    if xp is None: break
-                    trade(fe_,sl_,tp,xp); break
-
-    elif eng=="ema_cross":
-        if ef is None: return None
-        av=np.zeros(n)
-        for i in range(1,n):
-            tr=max(H[i]-L[i],abs(H[i]-C[i-1]),abs(L[i]-C[i-1]))
-            av[i]=(av[i-1]*(N-1)+tr)/N if i>=N else tr
-        for st in ["bull","bear"]:
-            in_t=False; en_=sl_=tp_=pos_=nt_=None
-            for ci in range(max(50,int(n*0.05)),n-1):
-                f_,s_=ef[ci],es[ci]
-                if in_t:
-                    xp_=None
-                    if st=="bull":
-                        if L[ci]<=sl_: xp_=sl_
-                        elif H[ci]>=tp_: xp_=tp_
+                    if (ci-m["c_watch"])<=2:
+                        if side=="bull" and cc>fib:
+                            trig=True; ep=cc; ec=ci; ss=ci+1; m["c_watch"]=None
+                        elif side=="bear" and cc<fib:
+                            trig=True; ep=cc; ec=ci; ss=ci+1; m["c_watch"]=None
                     else:
-                        if H[ci]>=sl_: xp_=sl_
-                        elif L[ci]<=tp_: xp_=tp_
-                    if xp_ is not None:
-                        won=xp_==tp_
-                        gross=(xp_-en_)*pos_ if st=="bull" else (en_-xp_)*pos_
-                        fee=nt_*(0.0004 if won else 0.00075)
-                        pnl=gross-fee; equity+=pnl
-                        trades.append({"w":won,"p":pnl,"e":equity})
-                        in_t=False
-                    continue
-                if adx_v is not None and adx_v[ci]<adx_thr: continue
-                if st=="bull":
-                    if not(C[ci]>f_ and C[ci]>s_ and f_>s_): continue
-                    tf_=L[ci]<=f_ and C[ci]>f_; ts_=L[ci]<=s_ and C[ci]>s_
-                    if not(tf_ or ts_): continue
-                    ep=f_ if tf_ else s_
-                else:
-                    if not(C[ci]<f_ and C[ci]<s_ and f_<s_): continue
-                    tf_=H[ci]>=f_ and C[ci]<f_; ts_=H[ci]>=s_ and C[ci]<s_
-                    if not(tf_ or ts_): continue
-                    ep=f_ if tf_ else s_
-                at=av[ci]
-                if at<=0: continue
-                sl=ep-at*1.5 if st=="bull" else ep+at*1.5
-                rpp=abs(ep-sl)
-                if rpp<=0: continue
-                tp=ep+rpp*rr if st=="bull" else ep-rpp*rr
-                pos_=equity*RISK_PCT/rpp; nt_=pos_*ep
-                en_=ep; sl_=sl; tp_=tp; in_t=True
+                        m["c_watch"]=None
+
+            if not trig or ep is None: return
+            if not ema_ok(ci,side): return
+
+            sig=dict(m); reset(m)
+            if pos[side] is None:
+                open_pos(side,sig,ep,ec,ss)
+
+    # Main bar loop
+    for ci in range(n):
+        if mac["trend"]==1:
+            if mac["ext"] is None or H[ci]>mac["ext"]: mac["ext"]=float(H[ci]); mac["ext_idx"]=ci
+        elif mac["trend"]==-1:
+            if mac["ext"] is None or L[ci]<mac["ext"]: mac["ext"]=float(L[ci]); mac["ext_idx"]=ci
+
+        for side in ("bull","bear"):
+            po=pos[side]
+            if po is None or ci<po["scan_start"]: continue
+            if side=="bull":
+                if L[ci]<=po["sl"]: close_pos(side,po["sl"],"SL",ci)
+                elif H[ci]>=po["tp"]: close_pos(side,po["tp"],"TP",ci)
+            else:
+                if H[ci]>=po["sl"]: close_pos(side,po["sl"],"SL",ci)
+                elif L[ci]<=po["tp"]: close_pos(side,po["tp"],"TP",ci)
+
+        if ci<n-1:
+            step(mach["bull"],ci)
+            step(mach["bear"],ci)
+
+    for side in ("bull","bear"):
+        if pos[side] is not None:
+            close_pos(side,float(C[n-1]),"TIMEOUT",n-1)
 
     if not trades: return None
-    W=[t for t in trades if t["w"]]; L_=[t for t in trades if not t["w"]]
-    final=trades[-1]["e"]; tr=(final-100)/100*100; wr=len(W)/len(trades)*100
+    W=[t for t in trades if t["won"]]; L_=[t for t in trades if not t["won"]]
+    final=trades[-1]["eq"]; tr=(final-100)/100*100
+    wr=len(W)/len(trades)*100
     peak=100; mdd=0
     for t in trades:
-        if t["e"]>peak: peak=t["e"]
-        mdd=max(mdd,(peak-t["e"])/peak*100)
-    rets=[t["p"]/(t["e"]-t["p"])*100 for t in trades if t["e"]!=t["p"]]
+        if t["eq"]>peak: peak=t["eq"]
+        mdd=max(mdd,(peak-t["eq"])/peak*100)
+    rets=[t["pnl"]/(t["eq"]-t["pnl"])*100 for t in trades if t["eq"]!=t["pnl"]]
     mean=sum(rets)/len(rets) if rets else 0
     std=(sum((r-mean)**2 for r in rets)/len(rets))**0.5 if rets else 0
     sharpe=mean/std*(365**0.5) if std>0 else 0
-    gw=sum(t["p"] for t in W); gl=abs(sum(t["p"] for t in L_))
+    gw=sum(t["pnl"] for t in W); gl=abs(sum(t["pnl"] for t in L_))
     pf=gw/gl if gl>0 else 999
     kf=(wr/100-(1-wr/100)/(gw/len(W)/(gl/len(L_)))) if W and L_ else 0
     return {
@@ -353,30 +294,30 @@ def backtest(H,L,C,n,pv,eng,em,rr,fib,ef,es,use_ema,adx_v,adx_thr,N):
         "kelly":round(kf,3),
     }
 
-# ── MAIN ───────────────────────────────────────────────────────
+# ── MAIN COMPUTE ───────────────────────────────────────────────
 def main_compute():
-    # Clear old results
     try:
         httpx.delete(f"{SUPABASE_URL}/rest/v1/matrix_results?id=gt.0",
                      headers=HEADERS,timeout=30)
         print("Cleared old results")
     except: pass
 
-    tg(f"""🔢 <b>Matrix Runner v5 — Pine Script Aligned</b>
-{TOTAL:,} combos | Pure Python — no HTTP per combo
-Pairs: {len(PAIRS)} × TF: {len(TIMEFRAMES)}
-Engines: {len(ENGINES)} × Entry: {len(ENTRY_MODES)}
-EMA: {len(EMA_PAIRS)} × ADX: {len(ADX_MINS)}
-Est: 15-30 min""")
+    tg(f"""🔢 <b>Matrix Runner v6 — Pine Script P1-P2-P3</b>
+Total combos: {TOTAL:,}
+Pairs: {', '.join(p.replace('/USDT','') for p in PAIRS)}
+TFs: {', '.join(TIMEFRAMES)}
+Entry: {', '.join(ENTRY_MODES)}
+EMA: {len(EMA_PAIRS)} options × ADX: {len(ADX_MINS)} options
+Period: {PERIOD_START} → {PERIOD_END}""")
 
     saved=0; errors=0; done=0
     start=time.time(); last_tg=time.time()
     buf=[]
 
-    for sym,tf in itertools.product(PAIRS,TIMEFRAMES):
-        print(f"\nLoading {sym} {tf}...")
-        set_status("compute","running",done,TOTAL,f"{sym} {tf}")
-        rows=get_candles(sym,tf)
+    for symbol,tf in itertools.product(PAIRS,TIMEFRAMES):
+        print(f"\nLoading {symbol} {tf}...")
+        set_status("compute","running",done,TOTAL,f"{symbol} {tf}")
+        rows=get_candles(symbol,tf)
         if not rows:
             print(f"  No candles — skip")
             continue
@@ -384,32 +325,39 @@ Est: 15-30 min""")
         H=np.array([r["high"]  for r in rows],dtype=float)
         L=np.array([r["low"]   for r in rows],dtype=float)
         C=np.array([r["close"] for r in rows],dtype=float)
+        O=np.array([r["open"]  for r in rows],dtype=float)
         n=len(rows)
-        print(f"  {n} candles — running combos...")
+        print(f"  {n} candles")
 
-        # Precompute per pair+TF
-        pv_cache={N:pivots(H,L,N) for N in PIVOT_NS}
-        ema_cache={ep:(ema(C,int(ep.split("/")[0])),ema(C,int(ep.split("/")[1])))
-                   for ep in EMA_PAIRS if ep!="off"}
-        adx_cache=adx(H,L,C,14)
+        # Precompute EMA and ADX for all combinations
+        ema_cache={}
+        for ep in EMA_PAIRS:
+            if ep!="off":
+                f,s=map(int,ep.split("/"))
+                ema_cache[ep]=(calc_ema(C,f),calc_ema(C,s))
+        adx_cache=calc_adx(H,L,C,14)
 
-        pt_combos=list(itertools.product(ENGINES,ENTRY_MODES,PIVOT_NS,RR_RATIOS,FIB_LEVELS,EMA_PAIRS,ADX_MINS))
+        pt_combos=list(itertools.product(
+            ENTRY_MODES,PIVOT_NS,RR_RATIOS,FIB_LEVELS,EMA_PAIRS,ADX_MINS
+        ))
+        print(f"  Running {len(pt_combos):,} combos...")
 
-        for eng,em,N,rr,fib,ep,ax in pt_combos:
+        for em,N,rr,fib,ep,ax in pt_combos:
             use_ema=ep!="off"
-            ef,es=(ema_cache[ep] if use_ema else (None,None))
+            ef,es=ema_cache[ep] if use_ema else (None,None)
             adx_v=adx_cache if ax>0 else None
 
             try:
-                s=backtest(H,L,C,n,pv_cache[N],eng,em,rr,fib,ef,es,use_ema,adx_v,float(ax),N)
+                s=backtest(H,L,C,O,n,N,rr,fib,em,ef,es,use_ema,adx_v,float(ax))
             except Exception as e:
-                s=None; errors+=1
+                s=None; errors+=1; print(f"  Error {symbol} {tf} {em} N={N}: {e}")
 
             buf.append({
-                "combo_key":f"{sym}|{tf}|{eng}|{em}|{N}|{rr}|{fib}|{ep}|{ax}",
-                "pair":sym.replace("/USDT",""),"timeframe":tf,
-                "engine":eng,"entry_mode":em,"pivot_n":N,"rr":rr,
-                "fib_level":fib,"ema_pair":ep,"adx_min":ax,
+                "combo_key":f"{symbol}|{tf}|structure|{em}|{N}|{rr}|{fib}|{ep}|{ax}",
+                "pair":symbol.replace("/USDT",""),
+                "timeframe":tf,"engine":"structure","entry_mode":em,
+                "pivot_n":N,"rr":rr,"fib_level":fib,
+                "ema_pair":ep,"adx_min":ax,
                 "period_start":PERIOD_START,"period_end":PERIOD_END,
                 "success":s is not None,
                 "return_pct":s["return_pct"] if s else None,
@@ -440,21 +388,20 @@ Est: 15-30 min""")
                    f"Done: {done:,}/{TOTAL:,} ({done/TOTAL*100:.1f}%)\n"
                    f"Saved: {saved:,} | Errors: {errors}\n"
                    f"Rate: {rate:.0f}/s | ETA: {eta/60:.0f}min\n"
-                   f"Current: {sym} {tf}")
-                set_status("compute","running",done,TOTAL,f"{sym} {tf}")
+                   f"Current: {symbol} {tf}")
+                set_status("compute","running",done,TOTAL,f"{symbol} {tf}")
                 last_tg=time.time()
 
         if buf: save_rows(buf); buf=[]
-        print(f"  Done {sym} {tf}")
+        print(f"  Done {symbol} {tf} — {saved:,} saved so far")
 
     if buf: save_rows(buf)
     el=time.time()-start
     set_status("compute","done",TOTAL,TOTAL,"")
     tg(f"""✅ <b>Matrix Complete</b>
-Combos: {TOTAL:,}
-Saved: {saved:,} | Errors: {errors}
+Combos: {TOTAL:,} | Saved: {saved:,} | Errors: {errors}
 Time: {el/60:.1f}min
-Download from Runner tab → All Results""")
+Download from Runner tab.""")
     print(f"\nDone. {saved:,} saved in {el/60:.1f}min")
 
 def main_prefetch():
@@ -470,9 +417,9 @@ def main_prefetch():
         while since<e_ms:
             try:
                 b=ex.fetch_ohlcv(sym,tf,since=since,limit=1000)
-                if not b: ec+=1;
+                if not b: ec+=1
                 if ec>=3: break
-                f=[c for c in b if c[0]<e_ms]; candles+=f
+                f_=[c for c in b if c[0]<e_ms]; candles+=f_
                 if b[-1][0]>=e_ms: break
                 since=b[-1][0]+1; time.sleep(0.3); ec=0
             except Exception as e:
