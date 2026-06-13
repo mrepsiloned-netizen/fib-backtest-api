@@ -32,6 +32,7 @@ FILE_ROUTES = {
     "Procfile":          {"repo": "fib-backtest-api", "path": "Procfile"},
     "matrix_runner.py":  {"repo": "fib-backtest-api", "path": "matrix_runner.py"},
     "mise.toml":          {"repo": "fib-backtest-api", "path": "mise.toml"},
+    "runtime.txt":        {"repo": "fib-backtest-api", "path": "runtime.txt"},
 }
 
 # ── TELEGRAM HELPERS ──────────────────────────────────────
@@ -131,6 +132,7 @@ Just send me any of these files and I'll push to GitHub automatically:
 📄 <code>Procfile</code> → fib-backtest-api
 📄 <code>matrix_runner.py</code> → fib-backtest-api
 📄 <code>mise.toml</code> → fib-backtest-api
+📄 <code>runtime.txt</code> → fib-backtest-api
 
 <b>Commands:</b>
 /help — show this message
