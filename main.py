@@ -1134,10 +1134,46 @@ def matrix_status():
     except Exception as e:
         return {"success": False, "error": str(e), "is_running": _matrix_running}
 
-@app.get("/supabase-config")
-def supabase_config():
-    """Return Supabase URL and anon key for direct frontend queries."""
-    return {"url": SUPABASE_URL, "key": SUPABASE_KEY}
+@app.post("/send-matrix-csv")
+def send_matrix_csv():
+    """Build full matrix CSV and send to Telegram as file."""
+    import io, csv as csv_mod
+    fields = ["pair","timeframe","engine","entry_mode","pivot_n","rr","fib_level",
+              "ema_pair","adx_min","return_pct","cagr","max_dd","sharpe","profit_factor",
+              "win_rate","trades","wins","losses","avg_win","avg_loss","kelly_full",
+              "period_start","period_end"]
+    try:
+        all_rows = []
+        offset = 0
+        while True:
+            q = f"select={','.join(fields)}&order=sharpe.desc.nullslast&limit=1000&offset={offset}"
+            hdrs = {"apikey":SUPABASE_KEY,"Authorization":f"Bearer {SUPABASE_KEY}","Prefer":"count=none"}
+            res = httpx.get(f"{SUPABASE_URL}/rest/v1/matrix_results?{q}",headers=hdrs,timeout=60)
+            if res.status_code != 200: break
+            rows = res.json()
+            if not rows: break
+            all_rows.extend(rows)
+            if len(rows) < 1000: break
+            offset += 1000
+
+        buf = io.StringIO()
+        w = csv_mod.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+        w.writeheader(); w.writerows(all_rows)
+        csv_bytes = buf.getvalue().encode("utf-8")
+
+        TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN","")
+        TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","")
+        filename = f"waddle_matrix_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.csv"
+
+        httpx.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": f"Matrix results — {len(all_rows)} rows"},
+            files={"document": (filename, csv_bytes, "text/csv")},
+            timeout=120
+        )
+        return {"success": True, "rows": len(all_rows), "message": f"Sent {len(all_rows)} rows to Telegram"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 @app.get("/matrix-results/all")
 def matrix_results_all():
