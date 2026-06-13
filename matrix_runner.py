@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================
-# WADDLE MATRIX RUNNER v7
-# Two engines in one sweep:
-#   1. BOS Pullback — Pine Script P1-P2-P3 v6.5 faithful port
-#   2. EMA Cross    — Engine 6, 1m/5m/15m, filter matrix
-# Pulls candles from Supabase, runs all combos in memory
-# No HTTP per combo — full speed pure Python
+# WADDLE MATRIX RUNNER v8
+# Default: EMA Cross only (Engine 6)
+# Args:
+#   (none)    → EMA Cross only
+#   bos       → BOS Pullback only
+#   all       → both engines
+#   prefetch  → fetch candles
 # ============================================================
 
 import os, time, httpx, itertools, io, csv as csv_mod
@@ -33,9 +34,8 @@ BOS_RR_RATIOS   = [1.5,2.0,3.0,4.0]
 BOS_FIB_LEVELS  = [0.382,0.5,0.618]
 BOS_EMA_PAIRS   = ["off","34/55","55/89","89/144","144/169"]
 BOS_ADX_MINS    = [0,15,25]
-BOS_PERIOD_START= "2025-01-01"
-BOS_PERIOD_END  = "2026-01-01"
-
+PERIOD_START    = "2025-01-01"
+PERIOD_END      = "2026-01-01"
 BOS_TOTAL = (len(BOS_PAIRS)*len(BOS_TIMEFRAMES)*len(BOS_ENTRY_MODES)*
              len(BOS_PIVOT_NS)*len(BOS_RR_RATIOS)*len(BOS_FIB_LEVELS)*
              len(BOS_EMA_PAIRS)*len(BOS_ADX_MINS))
@@ -46,20 +46,17 @@ EMA_TIMEFRAMES  = ["1m","5m","15m"]
 EMA_FAST_LIST   = [9, 12]
 EMA_SLOW_LIST   = [21, 26]
 EMA_RR_LIST     = [1.5, 2.0]
-EMA_RSI_OPTS    = [False, True]    # RSI filter ON/OFF
-EMA_VOL_OPTS    = [False, True]    # Volume filter ON/OFF
-EMA_GAP_OPTS    = [False, True]    # EMA gap filter ON/OFF
-EMA_HTF_OPTS    = [False, True]    # HTF multiplier ON/OFF
-EMA_PERIOD_START= "2025-01-01"
-EMA_PERIOD_END  = "2026-01-01"
-
+EMA_RSI_OPTS    = [False, True]
+EMA_VOL_OPTS    = [False, True]
+EMA_GAP_OPTS    = [False, True]
+EMA_HTF_OPTS    = [False, True]
 EMA_TOTAL = (len(EMA_PAIRS_LIST)*len(EMA_TIMEFRAMES)*len(EMA_FAST_LIST)*
              len(EMA_SLOW_LIST)*len(EMA_RR_LIST)*len(EMA_RSI_OPTS)*
              len(EMA_VOL_OPTS)*len(EMA_GAP_OPTS)*len(EMA_HTF_OPTS))
 
-RISK_PCT    = 0.02
-MIN_SWING   = 0.002
-STOP_BUF    = 0.001
+RISK_PCT  = 0.02
+MIN_SWING = 0.002
+STOP_BUF  = 0.001
 
 # ── HELPERS ────────────────────────────────────────────────────
 def tg(msg):
@@ -77,9 +74,9 @@ def set_status(phase, status, done, total, detail=""):
                    headers={**HEADERS,"Prefer":"resolution=merge-duplicates"},timeout=10)
     except: pass
 
-def get_candles(symbol, timeframe, period_start=None, period_end=None):
-    ps = period_start or BOS_PERIOD_START
-    pe = period_end   or BOS_PERIOD_END
+def get_candles(symbol, timeframe, ps=None, pe=None):
+    ps = ps or PERIOD_START
+    pe = pe or PERIOD_END
     start_ms=int(datetime.strptime(ps,"%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
     end_ms  =int(datetime.strptime(pe,"%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
     rows=[]; offset=0
@@ -340,54 +337,46 @@ def backtest_ema(H, L, C, O, V, n, rr,
             rsi[i]=100 if al==0 else 100-100/(1+ag/al)
         return rsi
 
-    ef = calc_ema(C, ema_fast)
-    es = calc_ema(C, ema_slow)
-    rsi_v = calc_rsi(C) if use_rsi else None
-    hf = calc_ema(C, ema_fast*htf_mult) if use_htf_mult else None
-    hs = calc_ema(C, ema_slow*htf_mult) if use_htf_mult else None
+    ef=calc_ema(C,ema_fast); es=calc_ema(C,ema_slow)
+    rsi_v=calc_rsi(C) if use_rsi else None
+    hf=calc_ema(C,ema_fast*htf_mult) if use_htf_mult else None
+    hs=calc_ema(C,ema_slow*htf_mult) if use_htf_mult else None
 
-    vol_ma = np.zeros(n)
-    for i in range(20, n): vol_ma[i] = np.mean(V[i-20:i])
+    vol_ma=np.zeros(n)
+    for i in range(20,n): vol_ma[i]=np.mean(V[i-20:i])
 
     trades=[]; equity=100.0; pos=None
-    EMA_GAP_MIN = 0.0005
+    EMA_GAP_MIN=0.0005
 
     for i in range(ema_slow*2, n-1):
-        # Manage open position
         if pos is not None:
             if pos["side"]=="long":
                 if L[i]<=pos["sl"]:
                     gross=(pos["sl"]-pos["entry"])*pos["size"]
                     fee=pos["notional"]*0.0002+pos["notional"]*0.00055
-                    pnl=gross-fee; equity+=pnl
-                    trades.append({"won":False,"pnl":pnl,"eq":equity}); pos=None
+                    trades.append({"won":False,"pnl":gross-fee,"eq":equity+(gross-fee)}); equity+=gross-fee; pos=None
                 elif H[i]>=pos["tp"]:
                     gross=(pos["tp"]-pos["entry"])*pos["size"]
                     fee=pos["notional"]*0.0002+pos["notional"]*0.0002
-                    pnl=gross-fee; equity+=pnl
-                    trades.append({"won":True,"pnl":pnl,"eq":equity}); pos=None
+                    trades.append({"won":True,"pnl":gross-fee,"eq":equity+(gross-fee)}); equity+=gross-fee; pos=None
             else:
                 if H[i]>=pos["sl"]:
                     gross=(pos["entry"]-pos["sl"])*pos["size"]
                     fee=pos["notional"]*0.0002+pos["notional"]*0.00055
-                    pnl=gross-fee; equity+=pnl
-                    trades.append({"won":False,"pnl":pnl,"eq":equity}); pos=None
+                    trades.append({"won":False,"pnl":gross-fee,"eq":equity+(gross-fee)}); equity+=gross-fee; pos=None
                 elif L[i]<=pos["tp"]:
                     gross=(pos["entry"]-pos["tp"])*pos["size"]
                     fee=pos["notional"]*0.0002+pos["notional"]*0.0002
-                    pnl=gross-fee; equity+=pnl
-                    trades.append({"won":True,"pnl":pnl,"eq":equity}); pos=None
+                    trades.append({"won":True,"pnl":gross-fee,"eq":equity+(gross-fee)}); equity+=gross-fee; pos=None
 
         if pos is not None: continue
 
-        # Cross detection
         prev_bull=ef[i-1]>es[i-1]; curr_bull=ef[i]>es[i]
         cross_up=not prev_bull and curr_bull
         cross_dn=prev_bull and not curr_bull
         if not cross_up and not cross_dn: continue
         side="long" if cross_up else "short"
 
-        # Filters
         if use_rsi and rsi_v is not None:
             if side=="long"  and rsi_v[i]<50: continue
             if side=="short" and rsi_v[i]>50: continue
@@ -399,7 +388,6 @@ def backtest_ema(H, L, C, O, V, n, rr,
             if side=="long"  and hf[i]<=hs[i]: continue
             if side=="short" and hf[i]>=hs[i]: continue
 
-        # Entry next open
         ei=i+1
         if ei>=n: continue
         ep=float(O[ei])
@@ -411,18 +399,15 @@ def backtest_ema(H, L, C, O, V, n, rr,
         sz=equity*RISK_PCT/rpp
         pos={"side":side,"entry":ep,"sl":sl,"tp":tp,"size":sz,"notional":sz*ep}
 
-    # Flush
     if pos is not None:
         xp=float(C[n-1])
         gross=(xp-pos["entry"])*pos["size"] if pos["side"]=="long" else (pos["entry"]-xp)*pos["size"]
         fee=pos["notional"]*0.0002+pos["notional"]*0.00055
-        pnl=gross-fee; equity+=pnl
-        trades.append({"won":pnl>0,"pnl":pnl,"eq":equity})
+        trades.append({"won":gross-fee>0,"pnl":gross-fee,"eq":equity+(gross-fee)})
 
     if not trades: return None
     W=[t for t in trades if t["won"]]; L_=[t for t in trades if not t["won"]]
-    final=trades[-1]["eq"]; tr=(final-100)/100*100
-    wr=len(W)/len(trades)*100
+    final=trades[-1]["eq"]; tr=(final-100)/100*100; wr=len(W)/len(trades)*100
     peak=100; mdd=0
     for t in trades:
         if t["eq"]>peak: peak=t["eq"]
@@ -445,56 +430,31 @@ def backtest_ema(H, L, C, O, V, n, rr,
     }
 
 
-# ── MAIN COMPUTE ───────────────────────────────────────────────
-def main_compute():
-    try:
-        httpx.delete(f"{SUPABASE_URL}/rest/v1/matrix_results?id=gt.0",
-                     headers=HEADERS,timeout=30)
-        print("Cleared old results")
-    except: pass
-
-    GRAND_TOTAL = BOS_TOTAL + EMA_TOTAL
-    tg(f"""🔢 <b>Matrix Runner v7 — Dual Engine</b>
-BOS Pullback: {BOS_TOTAL:,} combos
-EMA Cross:    {EMA_TOTAL:,} combos
-Total:        {GRAND_TOTAL:,} combos
-Period: {BOS_PERIOD_START} → {BOS_PERIOD_END}""")
-
-    saved=0; errors=0; done=0
-    start=time.time(); last_tg=time.time()
-    buf=[]
-
-    # ── PHASE 1: BOS Pullback ──────────────────────────────
-    print("\n=== PHASE 1: BOS Pullback ===")
-    for symbol,tf in itertools.product(BOS_PAIRS,BOS_TIMEFRAMES):
+# ── PHASE: BOS PULLBACK ────────────────────────────────────────
+def run_bos(grand_total, done, saved, errors, buf, start, last_tg):
+    print("\n=== BOS Pullback ===")
+    for symbol,tf in itertools.product(BOS_PAIRS, BOS_TIMEFRAMES):
         print(f"\nLoading {symbol} {tf}...")
-        set_status("compute","running",done,GRAND_TOTAL,f"BOS {symbol} {tf}")
-        rows=get_candles(symbol,tf,BOS_PERIOD_START,BOS_PERIOD_END)
-        if not rows:
-            print(f"  No candles — skip"); continue
+        set_status("compute","running",done,grand_total,f"BOS {symbol} {tf}")
+        rows=get_candles(symbol,tf)
+        if not rows: print("  No candles — skip"); continue
 
         H=np.array([r["high"]  for r in rows],dtype=float)
         L=np.array([r["low"]   for r in rows],dtype=float)
         C=np.array([r["close"] for r in rows],dtype=float)
         O=np.array([r["open"]  for r in rows],dtype=float)
-        n=len(rows)
-        print(f"  {n} candles")
+        n=len(rows); print(f"  {n} candles")
 
         ema_cache={}
         for ep in BOS_EMA_PAIRS:
             if ep!="off":
-                f,s=map(int,ep.split("/"))
-                ema_cache[ep]=(calc_ema(C,f),calc_ema(C,s))
+                f,s=map(int,ep.split("/")); ema_cache[ep]=(calc_ema(C,f),calc_ema(C,s))
         adx_cache=calc_adx(H,L,C,14)
 
-        pt_combos=list(itertools.product(BOS_ENTRY_MODES,BOS_PIVOT_NS,BOS_RR_RATIOS,BOS_FIB_LEVELS,BOS_EMA_PAIRS,BOS_ADX_MINS))
-        print(f"  Running {len(pt_combos):,} combos...")
-
-        for em,N,rr,fib,ep,ax in pt_combos:
+        for em,N,rr,fib,ep,ax in itertools.product(BOS_ENTRY_MODES,BOS_PIVOT_NS,BOS_RR_RATIOS,BOS_FIB_LEVELS,BOS_EMA_PAIRS,BOS_ADX_MINS):
             use_ema=ep!="off"
             ef,es=ema_cache[ep] if use_ema else (None,None)
             adx_v=adx_cache if ax>0 else None
-
             try:
                 s=backtest(H,L,C,O,n,N,rr,fib,em,ef,es,use_ema,adx_v,float(ax))
             except Exception as e:
@@ -502,137 +462,138 @@ Period: {BOS_PERIOD_START} → {BOS_PERIOD_END}""")
 
             buf.append({
                 "combo_key":f"{symbol}|{tf}|bos_pullback|{em}|{N}|{rr}|{fib}|{ep}|{ax}",
-                "pair":symbol.replace("/USDT",""),
-                "timeframe":tf,"engine":"bos_pullback","entry_mode":em,
-                "pivot_n":N,"rr":rr,"fib_level":fib,
-                "ema_pair":ep,"adx_min":ax,
-                "period_start":BOS_PERIOD_START,"period_end":BOS_PERIOD_END,
+                "pair":symbol.replace("/USDT",""),"timeframe":tf,
+                "engine":"bos_pullback","entry_mode":em,
+                "pivot_n":N,"rr":rr,"fib_level":fib,"ema_pair":ep,"adx_min":ax,
+                "period_start":PERIOD_START,"period_end":PERIOD_END,
                 "success":s is not None,
-                "return_pct":s["return_pct"] if s else None,
-                "cagr":s["cagr"] if s else None,
-                "max_dd":s["max_dd"] if s else None,
-                "sharpe":s["sharpe"] if s else None,
-                "profit_factor":s["pf"] if s else None,
-                "win_rate":s["wr"] if s else None,
-                "trades":s["trades"] if s else 0,
-                "wins":s["wins"] if s else 0,
-                "losses":s["losses"] if s else 0,
-                "avg_win":s["avg_win"] if s else None,
-                "avg_loss":s["avg_loss"] if s else None,
-                "kelly_full":s["kelly"] if s else None,
+                "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
+                "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
+                "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
+                "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
+                "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
+                "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
                 "computed_at":datetime.now(timezone.utc).isoformat(),
             })
             if s: saved+=1
             done+=1
-
             if len(buf)>=500: save_rows(buf); buf=[]
             if time.time()-last_tg>600:
-                el=time.time()-start; rate=done/el if el>0 else 0
-                eta=(GRAND_TOTAL-done)/rate if rate>0 else 0
-                tg(f"⏳ BOS Phase\nDone: {done:,}/{GRAND_TOTAL:,} ({done/GRAND_TOTAL*100:.1f}%)\nETA: {eta/60:.0f}min\nCurrent: {symbol} {tf}")
-                set_status("compute","running",done,GRAND_TOTAL,f"BOS {symbol} {tf}")
+                el=time.time()-start; rate=done/el if el>0 else 0; eta=(grand_total-done)/rate if rate>0 else 0
+                tg(f"⏳ BOS Phase\nDone: {done:,}/{grand_total:,} ({done/grand_total*100:.1f}%)\nETA: {eta/60:.0f}min\n{symbol} {tf}")
+                set_status("compute","running",done,grand_total,f"BOS {symbol} {tf}")
                 last_tg=time.time()
 
         if buf: save_rows(buf); buf=[]
+    return done, saved, errors, buf, last_tg
 
-    # ── PHASE 2: EMA Cross ─────────────────────────────────
-    print("\n=== PHASE 2: EMA Cross ===")
-    for symbol,tf in itertools.product(EMA_PAIRS_LIST,EMA_TIMEFRAMES):
+
+# ── PHASE: EMA CROSS ───────────────────────────────────────────
+def run_ema(grand_total, done, saved, errors, buf, start, last_tg):
+    print("\n=== EMA Cross ===")
+    for symbol,tf in itertools.product(EMA_PAIRS_LIST, EMA_TIMEFRAMES):
         print(f"\nLoading {symbol} {tf}...")
-        set_status("compute","running",done,GRAND_TOTAL,f"EMA {symbol} {tf}")
-        rows=get_candles(symbol,tf,EMA_PERIOD_START,EMA_PERIOD_END)
-        if not rows:
-            print(f"  No candles — skip"); continue
+        set_status("compute","running",done,grand_total,f"EMA {symbol} {tf}")
+        rows=get_candles(symbol,tf)
+        if not rows: print("  No candles — skip"); continue
 
         H=np.array([r["high"]  for r in rows],dtype=float)
         L=np.array([r["low"]   for r in rows],dtype=float)
         C=np.array([r["close"] for r in rows],dtype=float)
         O=np.array([r["open"]  for r in rows],dtype=float)
-        # Volume — may not be in rows if fetched without volume col
         V=np.array([r.get("volume",0) for r in rows],dtype=float)
-        n=len(rows)
-        print(f"  {n} candles")
+        n=len(rows); print(f"  {n} candles")
 
-        ema_combos=list(itertools.product(
+        for ef_p,es_p,rr,use_rsi,use_vol,use_gap,use_htf in itertools.product(
             EMA_FAST_LIST,EMA_SLOW_LIST,EMA_RR_LIST,
             EMA_RSI_OPTS,EMA_VOL_OPTS,EMA_GAP_OPTS,EMA_HTF_OPTS
-        ))
-        print(f"  Running {len(ema_combos):,} combos...")
-
-        for ef_p,es_p,rr,use_rsi,use_vol,use_gap,use_htf in ema_combos:
-            if ef_p>=es_p: done+=1; continue  # skip invalid pairs
-
-            # Build filter label
-            filters=[]
-            if use_rsi:  filters.append("rsi")
-            if use_vol:  filters.append("vol")
-            if use_gap:  filters.append("gap")
-            if use_htf:  filters.append("htf")
-            filter_str="+".join(filters) if filters else "none"
-
+        ):
+            filters="+".join(f for f,v in [("rsi",use_rsi),("vol",use_vol),("gap",use_gap),("htf",use_htf)] if v) or "none"
             try:
                 s=backtest_ema(H,L,C,O,V,n,rr,ef_p,es_p,use_rsi,use_vol,use_gap,use_htf)
             except Exception as e:
                 s=None; errors+=1; print(f"  EMA error: {e}")
 
             buf.append({
-                "combo_key":f"{symbol}|{tf}|ema_cross|cross|{ef_p}/{es_p}|{rr}|0|{filter_str}|0",
-                "pair":symbol.replace("/USDT",""),
-                "timeframe":tf,"engine":"ema_cross","entry_mode":"cross",
+                "combo_key":f"{symbol}|{tf}|ema_cross|cross|{ef_p}/{es_p}|{rr}|0|{filters}|0",
+                "pair":symbol.replace("/USDT",""),"timeframe":tf,
+                "engine":"ema_cross","entry_mode":"cross",
                 "pivot_n":0,"rr":rr,"fib_level":0,
                 "ema_pair":f"{ef_p}/{es_p}","adx_min":0,
-                "period_start":EMA_PERIOD_START,"period_end":EMA_PERIOD_END,
+                "period_start":PERIOD_START,"period_end":PERIOD_END,
                 "success":s is not None,
-                "return_pct":s["return_pct"] if s else None,
-                "cagr":s["cagr"] if s else None,
-                "max_dd":s["max_dd"] if s else None,
-                "sharpe":s["sharpe"] if s else None,
-                "profit_factor":s["pf"] if s else None,
-                "win_rate":s["wr"] if s else None,
-                "trades":s["trades"] if s else 0,
-                "wins":s["wins"] if s else 0,
-                "losses":s["losses"] if s else 0,
-                "avg_win":s["avg_win"] if s else None,
-                "avg_loss":s["avg_loss"] if s else None,
-                "kelly_full":s["kelly"] if s else None,
+                "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
+                "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
+                "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
+                "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
+                "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
+                "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
                 "computed_at":datetime.now(timezone.utc).isoformat(),
-                # Store filter config in ema_pair label for reference
             })
             if s: saved+=1
             done+=1
-
             if len(buf)>=500: save_rows(buf); buf=[]
             if time.time()-last_tg>600:
-                el=time.time()-start; rate=done/el if el>0 else 0
-                eta=(GRAND_TOTAL-done)/rate if rate>0 else 0
-                tg(f"⏳ EMA Phase\nDone: {done:,}/{GRAND_TOTAL:,} ({done/GRAND_TOTAL*100:.1f}%)\nETA: {eta/60:.0f}min\nCurrent: {symbol} {tf}")
-                set_status("compute","running",done,GRAND_TOTAL,f"EMA {symbol} {tf}")
+                el=time.time()-start; rate=done/el if el>0 else 0; eta=(grand_total-done)/rate if rate>0 else 0
+                tg(f"⏳ EMA Phase\nDone: {done:,}/{grand_total:,} ({done/grand_total*100:.1f}%)\nETA: {eta/60:.0f}min\n{symbol} {tf}")
+                set_status("compute","running",done,grand_total,f"EMA {symbol} {tf}")
                 last_tg=time.time()
 
         if buf: save_rows(buf); buf=[]
         print(f"  Done {symbol} {tf} — {saved:,} saved so far")
+    return done, saved, errors, buf, last_tg
+
+
+# ── MAIN COMPUTE ───────────────────────────────────────────────
+def main_compute(mode="ema"):
+    # Clear only the engine(s) we're about to rerun
+    engines_to_clear = []
+    if mode in ("ema","all"): engines_to_clear.append("ema_cross")
+    if mode in ("bos","all"): engines_to_clear.append("bos_pullback")
+
+    for eng in engines_to_clear:
+        try:
+            httpx.delete(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.{eng}",
+                         headers=HEADERS, timeout=30)
+            print(f"Cleared old {eng} results")
+        except: pass
+
+    grand_total = (EMA_TOTAL if mode=="ema" else BOS_TOTAL if mode=="bos" else EMA_TOTAL+BOS_TOTAL)
+
+    engine_label = ("EMA Cross only" if mode=="ema" else
+                    "BOS Pullback only" if mode=="bos" else
+                    "BOS Pullback + EMA Cross")
+    tg(f"""🔢 <b>Matrix Runner v8 — {engine_label}</b>
+Total combos: {grand_total:,}
+Period: {PERIOD_START} → {PERIOD_END}""")
+
+    saved=0; errors=0; done=0
+    start=time.time(); last_tg=time.time(); buf=[]
+
+    if mode in ("bos","all"):
+        done,saved,errors,buf,last_tg = run_bos(grand_total,done,saved,errors,buf,start,last_tg)
+    if mode in ("ema","all"):
+        done,saved,errors,buf,last_tg = run_ema(grand_total,done,saved,errors,buf,start,last_tg)
 
     if buf: save_rows(buf)
     el=time.time()-start
-    set_status("compute","done",GRAND_TOTAL,GRAND_TOTAL,"")
-    tg(f"""✅ <b>Matrix v7 Complete</b>
-BOS Pullback: {BOS_TOTAL:,} combos
-EMA Cross:    {EMA_TOTAL:,} combos
-Saved: {saved:,} | Errors: {errors}
+    set_status("compute","done",grand_total,grand_total,"")
+    tg(f"""✅ <b>Matrix v8 Complete — {engine_label}</b>
+Combos: {grand_total:,} | Saved: {saved:,} | Errors: {errors}
 Time: {el/60:.1f}min
 Download from Runner tab.""")
     print(f"\nDone. {saved:,} saved in {el/60:.1f}min")
 
+
 def main_prefetch():
     import ccxt
     ex=ccxt.kucoin({"enableRateLimit":True})
-    tg("📥 <b>Prefetch Started — BOS + EMA TFs</b>")
+    tg("📥 <b>Prefetch Started — all TFs including 1m</b>")
     sh={**HEADERS,"Prefer":"return=minimal,resolution=ignore-duplicates"}
-    # All unique pairs and TFs across both engines
-    all_pairs = list(set(BOS_PAIRS) | set(EMA_PAIRS_LIST))
-    all_tfs   = list(set(BOS_TIMEFRAMES) | set(EMA_TIMEFRAMES))
-    s_ms=int(datetime.strptime(BOS_PERIOD_START,"%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
-    e_ms=int(datetime.strptime(BOS_PERIOD_END,  "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
+    all_pairs=list(set(BOS_PAIRS)|set(EMA_PAIRS_LIST))
+    all_tfs  =list(set(BOS_TIMEFRAMES)|set(EMA_TIMEFRAMES))
+    s_ms=int(datetime.strptime(PERIOD_START,"%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
+    e_ms=int(datetime.strptime(PERIOD_END,  "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
     for sym,tf in itertools.product(all_pairs,all_tfs):
         print(f"Fetching {sym} {tf}...")
         candles=[]; since=s_ms; ec=0
@@ -658,12 +619,18 @@ def main_prefetch():
             print(f"  {len(candles)} candles saved")
     tg("✅ <b>Prefetch Done</b>")
 
+
 def main():
-    main_compute()
+    import sys
+    arg = sys.argv[1] if len(sys.argv)>1 else "ema"
+    if arg == "prefetch":
+        main_prefetch()
+    elif arg == "bos":
+        main_compute("bos")
+    elif arg == "all":
+        main_compute("all")
+    else:
+        main_compute("ema")  # default
 
 if __name__=="__main__":
-    import sys
-    if len(sys.argv)>1 and sys.argv[1]=="prefetch":
-        main_prefetch()
-    else:
-        main_compute()
+    main()
