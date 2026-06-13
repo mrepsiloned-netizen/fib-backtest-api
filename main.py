@@ -1134,6 +1134,11 @@ def matrix_status():
     except Exception as e:
         return {"success": False, "error": str(e), "is_running": _matrix_running}
 
+@app.get("/supabase-config")
+def supabase_config():
+    """Return Supabase URL and anon key for direct frontend queries."""
+    return {"url": SUPABASE_URL, "key": SUPABASE_KEY}
+
 @app.get("/matrix-results/all")
 def matrix_results_all():
     """Export ALL results — fetches all pages from Supabase and returns complete CSV."""
