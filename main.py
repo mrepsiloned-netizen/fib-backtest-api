@@ -61,11 +61,6 @@ class BacktestRequest(BaseModel):
     ema_slow: int = 55             # slow EMA period
     adx_period: int = 14           # ADX period for trend strength filter
     adx_threshold: float = 25.0    # ADX minimum value to allow trades
-    # ── EMA Cross Engine filters ──
-    ema_cross_rsi:    bool = False  # RSI > 50 long / < 50 short
-    ema_cross_volume: bool = False  # cross candle volume > 20-bar avg
-    ema_cross_gap:    bool = False  # min 0.05% spread between EMAs
-    ema_cross_htf:    bool = False  # HTF multiplier trend filter (×5)
 
 class BatchRequest(BaseModel):
     configs: List[BacktestRequest]
@@ -667,215 +662,6 @@ def run_backtest_core(candles, pivots, risk_pct, rr, fib_level, max_bars, max_ho
     return all_trades
 
 
-# ── EMA CROSS ENGINE (Engine 6) ───────────────────────────
-def run_ema_cross(candles, rr, ema_fast, ema_slow,
-                  use_rsi=False, use_volume=False, use_ema_gap=False,
-                  use_htf_mult=False, htf_mult=5,
-                  risk_pct=0.02, stop_buffer_pct=0.001):
-    """
-    EMA Cross Engine — Engine 6
-    Strategy: EMA fast/slow crossover with optional filters
-      - RSI filter:      RSI(14) > 50 for long, < 50 for short
-      - Volume filter:   cross candle volume > 20-bar average
-      - EMA gap filter:  |ema_fast - ema_slow| / price >= 0.0005
-      - HTF mult filter: ema_fast*htf_mult > ema_slow*htf_mult for long
-    Entry: next candle open after cross
-    SL:    lowest low (long) / highest high (short) of last 3 bars
-    TP:    entry + RR * risk
-    Fees:  Bybit notional (0.02% entry, 0.02% TP exit, 0.055% SL exit)
-    """
-    if len(candles) < 100:
-        return []
-
-    closes  = np.array([c[4] for c in candles], dtype=float)
-    highs   = np.array([c[2] for c in candles], dtype=float)
-    lows    = np.array([c[3] for c in candles], dtype=float)
-    volumes = np.array([c[5] for c in candles], dtype=float)
-    opens   = np.array([c[1] for c in candles], dtype=float)
-    n       = len(candles)
-    timestamps = [c[0] for c in candles]
-
-    def calc_ema(arr, period):
-        ema = np.zeros(len(arr))
-        k   = 2 / (period + 1)
-        ema[0] = arr[0]
-        for i in range(1, len(arr)):
-            ema[i] = arr[i] * k + ema[i-1] * (1 - k)
-        return ema
-
-    def calc_rsi(arr, period=14):
-        rsi = np.full(len(arr), 50.0)
-        gains = np.zeros(len(arr))
-        losses = np.zeros(len(arr))
-        for i in range(1, len(arr)):
-            d = arr[i] - arr[i-1]
-            gains[i]  = max(d, 0)
-            losses[i] = max(-d, 0)
-        avg_g = avg_l = 0.0
-        for i in range(1, period + 1):
-            avg_g += gains[i]; avg_l += losses[i]
-        avg_g /= period; avg_l /= period
-        if avg_l == 0:
-            rsi[period] = 100
-        else:
-            rs = avg_g / avg_l
-            rsi[period] = 100 - 100 / (1 + rs)
-        for i in range(period + 1, len(arr)):
-            avg_g = (avg_g * (period - 1) + gains[i])  / period
-            avg_l = (avg_l * (period - 1) + losses[i]) / period
-            if avg_l == 0:
-                rsi[i] = 100
-            else:
-                rs = avg_g / avg_l
-                rsi[i] = 100 - 100 / (1 + rs)
-        return rsi
-
-    ema_f = calc_ema(closes, ema_fast)
-    ema_s = calc_ema(closes, ema_slow)
-    rsi_v = calc_rsi(closes) if use_rsi else None
-
-    # HTF EMAs — multiply periods by htf_mult
-    htf_f = calc_ema(closes, ema_fast  * htf_mult) if use_htf_mult else None
-    htf_s = calc_ema(closes, ema_slow  * htf_mult) if use_htf_mult else None
-
-    # Volume rolling average (20-bar)
-    vol_ma = np.zeros(n)
-    for i in range(20, n):
-        vol_ma[i] = np.mean(volumes[i-20:i])
-
-    trades = []
-    equity = 100.0
-    pos    = None   # only 1 position at a time
-
-    EMA_GAP_MIN = 0.0005  # 0.05% minimum gap between EMAs
-
-    for i in range(ema_slow * 2, n - 1):
-        # ── Manage open position ───────────────────────────
-        if pos is not None:
-            c_high = highs[i]; c_low = lows[i]
-            if pos["side"] == "long":
-                if c_low <= pos["sl"]:
-                    # SL hit
-                    xp = pos["sl"]
-                    gross = (xp - pos["entry"]) * pos["size"]
-                    fee   = pos["notional"] * 0.0002 + pos["notional"] * 0.00055
-                    pnl   = gross - fee; equity += pnl
-                    trades.append({"won": False, "pnl": pnl, "equity": equity,
-                                   "entry_time": timestamps[pos["entry_i"]],
-                                   "exit_time": timestamps[i], "result": "SL",
-                                   "direction": "LONG"})
-                    pos = None
-                elif c_high >= pos["tp"]:
-                    xp = pos["tp"]
-                    gross = (xp - pos["entry"]) * pos["size"]
-                    fee   = pos["notional"] * 0.0002 + pos["notional"] * 0.0002
-                    pnl   = gross - fee; equity += pnl
-                    trades.append({"won": True, "pnl": pnl, "equity": equity,
-                                   "entry_time": timestamps[pos["entry_i"]],
-                                   "exit_time": timestamps[i], "result": "TP",
-                                   "direction": "LONG"})
-                    pos = None
-            else:  # short
-                if c_high >= pos["sl"]:
-                    xp = pos["sl"]
-                    gross = (pos["entry"] - xp) * pos["size"]
-                    fee   = pos["notional"] * 0.0002 + pos["notional"] * 0.00055
-                    pnl   = gross - fee; equity += pnl
-                    trades.append({"won": False, "pnl": pnl, "equity": equity,
-                                   "entry_time": timestamps[pos["entry_i"]],
-                                   "exit_time": timestamps[i], "result": "SL",
-                                   "direction": "SHORT"})
-                    pos = None
-                elif c_low <= pos["tp"]:
-                    xp = pos["tp"]
-                    gross = (pos["entry"] - xp) * pos["size"]
-                    fee   = pos["notional"] * 0.0002 + pos["notional"] * 0.0002
-                    pnl   = gross - fee; equity += pnl
-                    trades.append({"won": True, "pnl": pnl, "equity": equity,
-                                   "entry_time": timestamps[pos["entry_i"]],
-                                   "exit_time": timestamps[i], "result": "TP",
-                                   "direction": "SHORT"})
-                    pos = None
-
-        if pos is not None:
-            continue  # already in trade
-
-        # ── Detect cross ───────────────────────────────────
-        prev_bull = ema_f[i-1] > ema_s[i-1]
-        curr_bull = ema_f[i]   > ema_s[i]
-        cross_up   = not prev_bull and curr_bull
-        cross_down = prev_bull and not curr_bull
-
-        if not cross_up and not cross_down:
-            continue
-
-        side = "long" if cross_up else "short"
-
-        # ── Filters ────────────────────────────────────────
-        # RSI filter
-        if use_rsi and rsi_v is not None:
-            if side == "long"  and rsi_v[i] < 50: continue
-            if side == "short" and rsi_v[i] > 50: continue
-
-        # Volume filter
-        if use_volume and vol_ma[i] > 0:
-            if volumes[i] <= vol_ma[i]: continue
-
-        # EMA gap filter
-        if use_ema_gap:
-            gap_pct = abs(ema_f[i] - ema_s[i]) / closes[i]
-            if gap_pct < EMA_GAP_MIN: continue
-
-        # HTF multiplier filter
-        if use_htf_mult and htf_f is not None:
-            if side == "long"  and htf_f[i] <= htf_s[i]: continue
-            if side == "short" and htf_f[i] >= htf_s[i]: continue
-
-        # ── Entry on next open ─────────────────────────────
-        entry_i = i + 1
-        if entry_i >= n: continue
-        entry_price = float(opens[entry_i])
-
-        # SL = lowest low (long) / highest high (short) of last 3 bars
-        if side == "long":
-            sl_price = float(np.min(lows[max(0, i-2):i+1])) * (1 - stop_buffer_pct)
-        else:
-            sl_price = float(np.max(highs[max(0, i-2):i+1])) * (1 + stop_buffer_pct)
-
-        risk_per_unit = abs(entry_price - sl_price)
-        if risk_per_unit <= 0: continue
-
-        tp_price = (entry_price + risk_per_unit * rr) if side == "long" \
-                   else (entry_price - risk_per_unit * rr)
-
-        size     = (equity * risk_pct) / risk_per_unit
-        notional = size * entry_price
-
-        pos = {
-            "side":     side,
-            "entry":    entry_price,
-            "sl":       sl_price,
-            "tp":       tp_price,
-            "size":     size,
-            "notional": notional,
-            "entry_i":  entry_i,
-        }
-
-    # Flush open position at end
-    if pos is not None:
-        xp    = float(closes[n - 1])
-        gross = (xp - pos["entry"]) * pos["size"] if pos["side"] == "long" \
-                else (pos["entry"] - xp) * pos["size"]
-        fee   = pos["notional"] * 0.0002 + pos["notional"] * 0.00055
-        pnl   = gross - fee; equity += pnl
-        trades.append({"won": pnl > 0, "pnl": pnl, "equity": equity,
-                        "entry_time": timestamps[pos["entry_i"]],
-                        "exit_time": timestamps[n-1], "result": "TIMEOUT",
-                        "direction": "LONG" if pos["side"] == "long" else "SHORT"})
-
-    return trades
-
-
 # ── STATS ─────────────────────────────────────────────────
 def calc_stats(trades, days):
     if not trades: return None
@@ -947,69 +733,35 @@ def process_request(req: BacktestRequest):
 
         # Run fixed 2% first (needed for Kelly calculation)
         # EMA cross engine always needs EMA computed — force use_ema_filter on
-        # ── EMA Cross engine dispatch ──────────────────────
-        if req.engine == "ema_cross":
-            # EMA Cross engine has its own filter flags from query params
-            use_rsi     = getattr(req, "ema_cross_rsi",     False)
-            use_volume  = getattr(req, "ema_cross_volume",  False)
-            use_gap     = getattr(req, "ema_cross_gap",     False)
-            use_htf     = getattr(req, "ema_cross_htf",     False)
+        ema_kwargs = dict(
+            use_ema_filter=req.use_ema_filter or req.engine == "ema_cross",
+            ema_fast=req.ema_fast,
+            ema_slow=req.ema_slow,
+            adx_period=req.adx_period,
+            adx_threshold=req.adx_threshold,
+        )
 
-            trades_fixed = run_ema_cross(
-                candles, rr=req.rr,
-                ema_fast=req.ema_fast, ema_slow=req.ema_slow,
-                use_rsi=use_rsi, use_volume=use_volume,
-                use_ema_gap=use_gap, use_htf_mult=use_htf,
-                risk_pct=0.02, stop_buffer_pct=req.stop_buffer_pct,
-            )
-            stats_fixed = calc_stats(trades_fixed, days)
+        trades_fixed = run_backtest_core(
+            candles, pivots, 0.02, req.rr, req.fib_level,
+            req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
+            req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
+            **ema_kwargs, bos_break=req.bos_break,
+        )
+        stats_fixed = calc_stats(trades_fixed, days)
 
-            risk_pct = req.risk_pct
-            if req.risk_method == "half_kelly" and stats_fixed:
-                risk_pct = max(stats_fixed["kelly_half"], 0.01)
-            elif req.risk_method == "full_kelly" and stats_fixed:
-                risk_pct = max(stats_fixed["kelly_full"], 0.01)
+        risk_pct = req.risk_pct
+        if req.risk_method == "half_kelly" and stats_fixed:
+            risk_pct = max(stats_fixed["kelly_half"], 0.01)
+        elif req.risk_method == "full_kelly" and stats_fixed:
+            risk_pct = max(stats_fixed["kelly_full"], 0.01)
 
-            trades = run_ema_cross(
-                candles, rr=req.rr,
-                ema_fast=req.ema_fast, ema_slow=req.ema_slow,
-                use_rsi=use_rsi, use_volume=use_volume,
-                use_ema_gap=use_gap, use_htf_mult=use_htf,
-                risk_pct=risk_pct, stop_buffer_pct=req.stop_buffer_pct,
-            )
-            stats = calc_stats(trades, days)
-
-        else:
-            # ── BOS Pullback (structure engine) ─────────────
-            ema_kwargs = dict(
-                use_ema_filter=req.use_ema_filter or req.engine == "ema_cross",
-                ema_fast=req.ema_fast,
-                ema_slow=req.ema_slow,
-                adx_period=req.adx_period,
-                adx_threshold=req.adx_threshold,
-            )
-
-            trades_fixed = run_backtest_core(
-                candles, pivots, 0.02, req.rr, req.fib_level,
-                req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
-                req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
-                **ema_kwargs, bos_break=req.bos_break,
-            )
-            stats_fixed = calc_stats(trades_fixed, days)
-
-            risk_pct = req.risk_pct
-            if req.risk_method == "half_kelly" and stats_fixed:
-                risk_pct = max(stats_fixed["kelly_half"], 0.01)
-            elif req.risk_method == "full_kelly" and stats_fixed:
-                risk_pct = max(stats_fixed["kelly_full"], 0.01)
-
-            trades = run_backtest_core(
-                candles, pivots, risk_pct, req.rr, req.fib_level,
-                req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
-                req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
-                **ema_kwargs, bos_break=req.bos_break,
-            )
-            stats = calc_stats(trades, days)
+        trades = run_backtest_core(
+            candles, pivots, risk_pct, req.rr, req.fib_level,
+            req.max_bars, req.max_hold, req.recency_bars, req.one_per_pair,
+            req.min_swing_pct, req.stop_buffer_pct, req.k_stale, req.entry_mode, req.engine,
+            **ema_kwargs, bos_break=req.bos_break,
+        )
+        stats = calc_stats(trades, days)
 
         # Result saving disabled — see cache note above
 
@@ -1062,7 +814,7 @@ def process_request(req: BacktestRequest):
 # ── ROUTES ────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "Waddle Backtest API v12 — Structure + EMA Cross Engine", "rules": "ema_cross+adx+pullback_p1reset+ema_cross_engine"}
+    return {"status": "Waddle Backtest API v11 — Structure Engine", "rules": "ema_cross+adx+pullback_p1reset"}
 
 @app.get("/pairs")
 def get_pairs():
@@ -1397,7 +1149,7 @@ def send_matrix_csv():
 
     def do_send():
         fields = ["pair","timeframe","engine","entry_mode","pivot_n","rr","fib_level",
-                  "ema_pair","adx_min","return_pct","cagr","max_dd","sharpe","profit_factor",
+                  "ema_pair","adx_min","filters","return_pct","cagr","max_dd","sharpe","profit_factor",
                   "win_rate","trades","wins","losses","avg_win","avg_loss","kelly_full",
                   "period_start","period_end"]
         try:
@@ -1506,7 +1258,7 @@ def matrix_results_export(
     import io, csv as csv_mod
 
     fields = ["pair","timeframe","engine","entry_mode","pivot_n","rr","fib_level",
-              "ema_pair","adx_min",
+              "ema_pair","adx_min","filters",
               "return_pct","cagr","max_dd","sharpe","profit_factor",
               "win_rate","trades","wins","losses",
               "avg_win","avg_loss","kelly_full","total_fees",
