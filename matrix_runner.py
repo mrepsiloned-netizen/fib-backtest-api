@@ -82,14 +82,14 @@ def get_candles(symbol, timeframe, ps=None, pe=None):
     while True:
         q=(f"symbol=eq.{symbol}&timeframe=eq.{timeframe}"
            f"&ts=gte.{start_ms}&ts=lte.{end_ms}"
-           f"&order=ts.asc&limit=10000&offset={offset}&select=open,high,low,close,volume")
+           f"&order=ts.asc&limit=1000&offset={offset}&select=open,high,low,close,volume")
         res=httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q}",headers=HEADERS,timeout=60)
         if res.status_code==200:
             batch=res.json()
             if not batch: break
             rows+=batch
-            if len(batch)<10000: break
-            offset+=10000
+            if len(batch)<1000: break
+            offset+=len(batch)
         else: break
     if len(rows)<50: return None
     return rows
