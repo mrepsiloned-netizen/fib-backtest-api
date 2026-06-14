@@ -1196,7 +1196,7 @@ def matrix_results_all():
     import io, csv as csv_mod
 
     fields = ["pair","timeframe","engine","entry_mode","pivot_n","rr","fib_level",
-              "ema_pair","adx_min","return_pct","cagr","max_dd","sharpe","profit_factor",
+              "ema_pair","adx_min","filters","return_pct","cagr","max_dd","sharpe","profit_factor",
               "win_rate","trades","wins","losses","avg_win","avg_loss","kelly_full",
               "total_fees","period_start","period_end"]
 
@@ -1368,3 +1368,98 @@ def get_candles(
         return {"success": True, "candles": all_rows[:limit], "count": len(all_rows[:limit])}
     except Exception as e:
         return {"success": False, "error": str(e), "candles": []}
+
+@app.get("/diagnose-ema-filters")
+def diagnose_ema_filters(symbol: str = "DOGE/USDT", tf: str = "5m",
+                          period_start: str = "2025-01-01", period_end: str = "2025-02-01"):
+    """
+    One-time diagnostic — checks:
+    1. Whether volume data exists in candles table
+    2. Whether RSI calc produces real varying values
+    3. Whether RSI filter would actually block any real EMA crosses
+    Hit via browser: /diagnose-ema-filters
+    """
+    import numpy as np
+    from datetime import datetime as dt, timezone as tz
+
+    start_ms = int(dt.strptime(period_start,"%Y-%m-%d").replace(tzinfo=tz.utc).timestamp()*1000)
+    end_ms   = int(dt.strptime(period_end,  "%Y-%m-%d").replace(tzinfo=tz.utc).timestamp()*1000)
+
+    q = (f"symbol=eq.{symbol}&timeframe=eq.{tf}"
+         f"&ts=gte.{start_ms}&ts=lte.{end_ms}"
+         f"&order=ts.asc&limit=10000&select=ts,open,high,low,close,volume")
+    res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q}", headers=HEADERS, timeout=60)
+    rows = res.json() if res.status_code == 200 else []
+
+    if not rows:
+        return {"success": False, "error": "No candles found", "query": q}
+
+    # ── Volume check ──────────────────────────────────────
+    vols = [r.get("volume", None) for r in rows]
+    n_none  = sum(1 for v in vols if v is None)
+    n_zero  = sum(1 for v in vols if v == 0)
+    n_valid = sum(1 for v in vols if v not in (None, 0))
+    nonzero_sample = [v for v in vols if v][:5]
+
+    # ── RSI check ─────────────────────────────────────────
+    C = np.array([float(r["close"]) for r in rows])
+    n = len(C)
+
+    def calc_ema(arr, period):
+        k=2/(period+1); out=np.empty(len(arr)); out[0]=arr[0]
+        for i in range(1,len(arr)): out[i]=arr[i]*k+out[i-1]*(1-k)
+        return out
+
+    def calc_rsi(arr, period=14):
+        rsi=np.full(len(arr),50.0)
+        g=np.zeros(len(arr)); l_=np.zeros(len(arr))
+        for i in range(1,len(arr)):
+            d=arr[i]-arr[i-1]; g[i]=max(d,0); l_[i]=max(-d,0)
+        ag=al=0.0
+        for i in range(1,period+1): ag+=g[i]; al+=l_[i]
+        ag/=period; al/=period
+        rsi[period]=100 if al==0 else 100-100/(1+ag/al)
+        for i in range(period+1,len(arr)):
+            ag=(ag*(period-1)+g[i])/period; al=(al*(period-1)+l_[i])/period
+            rsi[i]=100 if al==0 else 100-100/(1+ag/al)
+        return rsi
+
+    ema_fast, ema_slow = 9, 21
+    ef = calc_ema(C, ema_fast)
+    es = calc_ema(C, ema_slow)
+    rsi_v = calc_rsi(C, 14)
+
+    # ── Cross + RSI alignment check ────────────────────────
+    crosses = []
+    start = ema_slow * 2
+    for i in range(start, n-1):
+        prev_bull = ef[i-1] > es[i-1]
+        curr_bull = ef[i] > es[i]
+        if not prev_bull and curr_bull:
+            crosses.append({"side":"UP","idx":i,"rsi":round(float(rsi_v[i]),2)})
+        elif prev_bull and not curr_bull:
+            crosses.append({"side":"DOWN","idx":i,"rsi":round(float(rsi_v[i]),2)})
+
+    n_blocked = sum(1 for c in crosses
+                    if (c["side"]=="UP" and c["rsi"]<50) or (c["side"]=="DOWN" and c["rsi"]>50))
+
+    return {
+        "success": True,
+        "symbol": symbol, "tf": tf, "candles": n,
+        "volume": {
+            "none_count": n_none, "zero_count": n_zero, "valid_count": n_valid,
+            "sample_nonzero": nonzero_sample,
+        },
+        "rsi": {
+            "min": round(float(rsi_v.min()),2),
+            "max": round(float(rsi_v.max()),2),
+            "mean": round(float(rsi_v.mean()),2),
+            "distinct_values": len(set(round(float(x),1) for x in rsi_v)),
+            "sample_idx_50_60": [round(float(x),2) for x in rsi_v[50:60]],
+        },
+        "crosses": {
+            "total": len(crosses),
+            "blocked_by_rsi_filter": n_blocked,
+            "sample": crosses[:15],
+        },
+    }
