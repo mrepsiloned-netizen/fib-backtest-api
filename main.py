@@ -84,7 +84,7 @@ def get_cached_candles(symbol, timeframe, start_ms, end_ms):
     try:
         all_rows = []
         offset = 0
-        page_size = 10000
+        page_size = 1000
         while True:
             query = (f"symbol=eq.{symbol}&timeframe=eq.{timeframe}"
                      f"&ts=gte.{start_ms}&ts=lte.{end_ms}"
@@ -96,7 +96,7 @@ def get_cached_candles(symbol, timeframe, start_ms, end_ms):
                 if not rows: break
                 all_rows += rows
                 if len(rows) < page_size: break
-                offset += page_size
+                offset += len(rows)
             else:
                 break
         if len(all_rows) > 50:
@@ -1385,11 +1385,20 @@ def diagnose_ema_filters(symbol: str = "DOGE/USDT", tf: str = "5m",
     start_ms = int(dt.strptime(period_start,"%Y-%m-%d").replace(tzinfo=tz.utc).timestamp()*1000)
     end_ms   = int(dt.strptime(period_end,  "%Y-%m-%d").replace(tzinfo=tz.utc).timestamp()*1000)
 
-    q = (f"symbol=eq.{symbol}&timeframe=eq.{tf}"
-         f"&ts=gte.{start_ms}&ts=lte.{end_ms}"
-         f"&order=ts.asc&limit=10000&select=ts,open,high,low,close,volume")
-    res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q}", headers=HEADERS, timeout=60)
-    rows = res.json() if res.status_code == 200 else []
+    q_base = (f"symbol=eq.{symbol}&timeframe=eq.{tf}"
+              f"&ts=gte.{start_ms}&ts=lte.{end_ms}"
+              f"&order=ts.asc&select=ts,open,high,low,close,volume")
+    rows=[]; offset=0
+    while True:
+        res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q_base}&limit=1000&offset={offset}",
+                         headers=HEADERS, timeout=60)
+        if res.status_code != 200: break
+        batch = res.json()
+        if not batch: break
+        rows += batch
+        if len(batch) < 1000: break
+        offset += len(batch)
+    q = q_base  # for error reporting below
 
     if not rows:
         return {"success": False, "error": "No candles found", "query": q}
@@ -1492,14 +1501,14 @@ def diagnose_candle_quality(period_start: str = "2025-01-01", period_end: str = 
                f"&order=ts.asc&select=ts,open,high,low,close,volume")
             rows=[]; offset=0
             while True:
-                page_q = q + f"&limit=10000&offset={offset}"
+                page_q = q + f"&limit=1000&offset={offset}"
                 res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{page_q}", headers=HEADERS, timeout=60)
                 if res.status_code != 200: break
                 batch = res.json()
                 if not batch: break
                 rows += batch
-                if len(batch) < 10000: break
-                offset += 10000
+                if len(batch) < 1000: break
+                offset += len(batch)
 
             if not rows:
                 results.append({"symbol":symbol,"tf":tf,"status":"NO DATA"})
