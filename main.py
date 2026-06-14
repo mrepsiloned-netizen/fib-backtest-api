@@ -1066,7 +1066,7 @@ def _run_matrix_thread():
         _matrix_running = False
 
 @app.post("/run-matrix")
-def run_matrix():
+def run_matrix(mode: str = "ema"):
     global _matrix_thread, _matrix_running
     if _matrix_running:
         return {"success": False, "message": "Already running"}
@@ -1082,14 +1082,14 @@ def run_matrix():
             if spec:
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
-                mod.main_compute()
+                mod.main_compute(mode)
         except Exception as e:
             print(f"Compute error: {e}")
         finally:
             _matrix_running = False
     _matrix_thread = threading.Thread(target=_run_compute, daemon=True)
     _matrix_thread.start()
-    return {"success": True, "message": "Computation started — check Runner tab"}
+    return {"success": True, "message": f"Computation started (mode={mode}) — check Runner tab"}
 
 @app.post("/prefetch-candles")
 def prefetch_candles_endpoint():
