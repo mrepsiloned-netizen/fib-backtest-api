@@ -1,7 +1,10 @@
 # ============================================================
-# WADDLE PAPER TRADER v7
-# BOS Pullback Strategy — Pine Script P1-P2-P3 v6.5
-# 5 pairs: DOGE/15m, XLM/5m, TRX/1h, ARB/15m, XRP/1h
+# WADDLE PAPER TRADER v8
+# Dual Engine: BOS Pullback + EMA Cross
+#   BOS Pullback — Pine Script P1-P2-P3 v6.5
+#     5 pairs: DOGE/15m, XLM/5m, TRX/1h, ARB/15m, XRP/1h
+#   EMA Cross — Engine 6, stability-tested combos
+#     3 pairs: ARB/5m, XLM/5m, TRX/15m
 # ============================================================
 
 import ccxt
@@ -33,14 +36,23 @@ SCAN_INTERVALS = {
     "5m":300,"15m":900,"1h":3600,
 }
 
-# ── WATCHLIST ─────────────────────────────────────────────────
-WATCHLIST = [
-    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":3,"rr":1.5,"fib_level":0.5, "entry_mode":"reclaim",   "label":"DOGE 15m"},
-    {"symbol":"XLM/USDT", "timeframe":"5m", "pivot_n":5,"rr":1.5,"fib_level":0.5, "entry_mode":"reclaim",   "label":"XLM 5m"},
-    {"symbol":"TRX/USDT", "timeframe":"1h", "pivot_n":3,"rr":2.0,"fib_level":0.5, "entry_mode":"reclaim",   "label":"TRX 1h"},
-    {"symbol":"ARB/USDT", "timeframe":"15m","pivot_n":5,"rr":1.5,"fib_level":0.5, "entry_mode":"rejection", "label":"ARB 15m"},
-    {"symbol":"XRP/USDT", "timeframe":"1h", "pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim",  "label":"XRP 1h"},
+# ── WATCHLISTS ────────────────────────────────────────────────
+BOS_WATCHLIST = [
+    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":3,"rr":1.5,"fib_level":0.5, "entry_mode":"reclaim",   "label":"DOGE 15m BOS",  "engine":"bos_pullback"},
+    {"symbol":"XLM/USDT", "timeframe":"5m", "pivot_n":5,"rr":1.5,"fib_level":0.5, "entry_mode":"reclaim",   "label":"XLM 5m BOS",   "engine":"bos_pullback"},
+    {"symbol":"TRX/USDT", "timeframe":"1h", "pivot_n":3,"rr":2.0,"fib_level":0.5, "entry_mode":"reclaim",   "label":"TRX 1h BOS",   "engine":"bos_pullback"},
+    {"symbol":"ARB/USDT", "timeframe":"15m","pivot_n":5,"rr":1.5,"fib_level":0.5, "entry_mode":"rejection", "label":"ARB 15m BOS",  "engine":"bos_pullback"},
+    {"symbol":"XRP/USDT", "timeframe":"1h", "pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim",  "label":"XRP 1h BOS",   "engine":"bos_pullback"},
 ]
+
+# EMA Cross — locked from stability sweep (2025 full / 2026 YTD / L30D all profitable)
+EMA_WATCHLIST = [
+    {"symbol":"ARB/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":False,"use_gap":True, "use_htf":False,"label":"ARB 5m EMA12/26 gap","engine":"ema_cross"},
+    {"symbol":"XLM/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":21,"rr":2.0,"use_vol":False,"use_gap":True, "use_htf":False,"label":"XLM 5m EMA12/21 gap","engine":"ema_cross"},
+    {"symbol":"TRX/USDT","timeframe":"15m","ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":True, "use_gap":False,"use_htf":True, "label":"TRX 15m EMA12/26 vol+htf","engine":"ema_cross"},
+]
+
+ALL_WATCHLIST = BOS_WATCHLIST + EMA_WATCHLIST
 
 # ── SUPABASE ──────────────────────────────────────────────────
 def get_account():
@@ -113,6 +125,12 @@ def tg(msg):
     except Exception as e: print(f"Telegram error: {e}")
 
 def send_entry(w, signal, acc):
+    if w["engine"]=="ema_cross":
+        send_entry_ema(w, signal, acc)
+    else:
+        send_entry_bos(w, signal, acc)
+
+def send_entry_bos(w, signal, acc):
     balance  = acc["balance"]
     risk_amt = round(balance*RISK_PCT,4)
     rpp      = abs(signal["entry"]-signal["sl"])
@@ -144,16 +162,48 @@ def send_entry(w, signal, acc):
 <b>Stats:</b> {acc['total_trades']} trades · {acc['wins']}W {acc['losses']}L · {wr}% WR
 <b>Total return:</b> {'+' if total_ret>=0 else ''}{total_ret}%
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-📊 Paper trade v7""")
+📊 Paper trade v8""")
+
+def send_entry_ema(w, signal, acc):
+    balance  = acc["balance"]
+    risk_amt = round(balance*RISK_PCT,4)
+    rpp      = abs(signal["entry"]-signal["sl"])
+    pos_size = round(risk_amt/rpp,6) if rpp>0 else 0
+    pos_val  = round(pos_size*signal["entry"],2)
+    total_ret= round((balance-START_BALANCE)/START_BALANCE*100,2)
+    wr       = round(acc["wins"]/acc["total_trades"]*100,1) if acc["total_trades"]>0 else 0
+    emoji    = "🟢" if signal["direction"]=="LONG" else "🔴"
+
+    tg(f"""{emoji} <b>ENTRY — {w['symbol']} {w['timeframe'].upper()}</b>
+
+<b>Strategy:</b> EMA Cross | {signal['direction']}
+<b>EMA pair:</b> {signal['ema_fast']}/{signal['ema_slow']}
+<b>Filters:</b> {signal['filters']}
+
+<b>Entry:</b>  ${signal['entry']}
+<b>SL:</b>     ${signal['sl']} (3-bar swing)
+<b>TP:</b>     ${signal['tp']}
+<b>RR:</b>     1:{w['rr']}R
+
+<b>Account:</b>  ${balance:.2f}
+<b>Risk:</b>     2% = ${risk_amt:.2f}
+<b>Position:</b> ${pos_val:.2f} of {w['symbol'].split('/')[0]}
+
+<b>Stats:</b> {acc['total_trades']} trades · {acc['wins']}W {acc['losses']}L · {wr}% WR
+<b>Total return:</b> {'+' if total_ret>=0 else ''}{total_ret}%
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+📊 Paper trade v8""")
 
 def send_exit(w, signal, exit_price, won, pnl, acc):
     emoji    = "✅" if won else "❌"
     result   = "TAKE PROFIT" if won else "STOP LOSS"
     total_ret= round((acc["balance"]-START_BALANCE)/START_BALANCE*100,2)
     wr       = round(acc["wins"]/acc["total_trades"]*100,1) if acc["total_trades"]>0 else 0
+    strategy = "EMA Cross" if w["engine"]=="ema_cross" else "BOS Pullback"
 
     tg(f"""{emoji} <b>TRADE CLOSED — {w['symbol']} {w['timeframe'].upper()}</b>
 
+<b>Strategy:</b> {strategy}
 <b>Result:</b>    {result}
 <b>Direction:</b> {signal['direction']}
 
@@ -169,7 +219,7 @@ def send_exit(w, signal, exit_price, won, pnl, acc):
 
 <b>All time:</b> {acc['total_trades']} trades · {acc['wins']}W {acc['losses']}L · {wr}% WR
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-📊 Paper trade v7""")
+📊 Paper trade v8""")
 
 def send_daily_summary(open_signals):
     try:
@@ -378,19 +428,87 @@ def detect_signal_bos(candles, N, fib_level, entry_mode, rr):
         return sig
     return None
 
+# ── EMA CROSS SIGNAL DETECTION ─────────────────────────────────
+def calc_ema(arr, period):
+    k=2/(period+1); out=np.empty(len(arr)); out[0]=arr[0]
+    for i in range(1,len(arr)): out[i]=arr[i]*k+out[i-1]*(1-k)
+    return out
+
+def detect_signal_ema_cross(candles, ema_fast, ema_slow, rr,
+                             use_vol, use_gap, use_htf, htf_mult=5):
+    """
+    EMA Cross — Engine 6
+    Detects a cross on the last confirmed candle (n-2).
+    Entry = open of the most recent candle (n-1), matching backtest "next open".
+    SL = 3-bar swing extreme. TP = entry +/- RR * risk.
+    """
+    if len(candles) < ema_slow*2+10: return None
+
+    H=np.array([c[2] for c in candles],dtype=float)
+    L=np.array([c[3] for c in candles],dtype=float)
+    C=np.array([c[4] for c in candles],dtype=float)
+    O=np.array([c[1] for c in candles],dtype=float)
+    V=np.array([c[5] if len(c)>5 else 0 for c in candles],dtype=float)
+    n=len(candles)
+
+    ef=calc_ema(C,ema_fast); es=calc_ema(C,ema_slow)
+    hf=calc_ema(C,ema_fast*htf_mult) if use_htf else None
+    hs=calc_ema(C,ema_slow*htf_mult) if use_htf else None
+
+    vol_ma=np.zeros(n)
+    for i in range(20,n): vol_ma[i]=np.mean(V[i-20:i])
+
+    EMA_GAP_MIN=0.0005
+    i=n-2  # last confirmed candle
+
+    prev_bull=ef[i-1]>es[i-1]; curr_bull=ef[i]>es[i]
+    cross_up=not prev_bull and curr_bull
+    cross_dn=prev_bull and not curr_bull
+    if not cross_up and not cross_dn: return None
+    side="long" if cross_up else "short"
+
+    if use_vol and vol_ma[i]>0:
+        if V[i]<=vol_ma[i]: return None
+    if use_gap:
+        if abs(ef[i]-es[i])/C[i] < EMA_GAP_MIN: return None
+    if use_htf and hf is not None:
+        if side=="long"  and hf[i]<=hs[i]: return None
+        if side=="short" and hf[i]>=hs[i]: return None
+
+    ei=n-1  # entry on most recent candle's open
+    ep=float(O[ei])
+    sl=(float(np.min(L[max(0,i-2):i+1]))*(1-STOP_BUF) if side=="long"
+        else float(np.max(H[max(0,i-2):i+1]))*(1+STOP_BUF))
+    rpp=abs(ep-sl)
+    if rpp<=0: return None
+    tp=(ep+rpp*rr) if side=="long" else (ep-rpp*rr)
+
+    return {
+        "direction":"LONG" if side=="long" else "SHORT",
+        "entry":round(ep,6),"sl":round(sl,6),"tp":round(tp,6),
+        "rr":rr,"ema_fast":ema_fast,"ema_slow":ema_slow,
+        "filters":"+".join(f for f,v in [("vol",use_vol),("gap",use_gap),("htf",use_htf)] if v) or "none",
+    }
+
 # ── MAIN LOOP ─────────────────────────────────────────────────
 def run():
-    print("🤖 Waddle Paper Trader v7 — BOS Pullback starting...")
+    print("🤖 Waddle Paper Trader v8 — Dual Engine starting...")
     acc = init_account()
-    wl_str = "\n".join([f"• {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R {w['entry_mode']} fib={w['fib_level']}" for w in WATCHLIST])
-    tg(f"""🤖 <b>Waddle Paper Trader v7 LIVE</b>
-<b>Strategy:</b> BOS Pullback — Pine Script aligned
+    bos_str = "\n".join([f"• {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R {w['entry_mode']} fib={w['fib_level']}" for w in BOS_WATCHLIST])
+    ema_str = "\n".join([f"• {w['symbol']} {w['timeframe'].upper()} EMA{w['ema_fast']}/{w['ema_slow']} {w['rr']}R "
+                          f"[{'+'.join(f for f,v in [('vol',w['use_vol']),('gap',w['use_gap']),('htf',w['use_htf'])] if v) or 'none'}]"
+                          for w in EMA_WATCHLIST])
+    tg(f"""🤖 <b>Waddle Paper Trader v8 LIVE</b>
+<b>Dual Engine:</b> BOS Pullback + EMA Cross
 
 <b>Account:</b> ${acc['balance']:.2f}
 <b>Risk per trade:</b> {RISK_PCT*100:.0f}%
 
-<b>Watchlist:</b>
-{wl_str}
+<b>BOS Pullback watchlist:</b>
+{bos_str}
+
+<b>EMA Cross watchlist:</b>
+{ema_str}
 
 📊 Paper trading active""")
 
@@ -425,14 +543,15 @@ def run():
                 acc=init_account()
                 total_ret=round((acc["balance"]-START_BALANCE)/START_BALANCE*100,2)
                 open_str=f"\nOpen: {len(open_signals)}"+"".join([f"\n• {s['symbol']} {s['timeframe'].upper()} {s['direction']} @ ${s['entry']}" for s in open_signals.values()])
-                tg(f"💓 <b>Bot Alive</b> — {now_utc.strftime('%H:%M UTC')}\nBalance: ${acc['balance']:.2f} ({'+' if total_ret>=0 else ''}{total_ret}%)\nScanning {len(WATCHLIST)} pairs{open_str}")
+                tg(f"💓 <b>Bot Alive</b> — {now_utc.strftime('%H:%M UTC')}\nBalance: ${acc['balance']:.2f} ({'+' if total_ret>=0 else ''}{total_ret}%)\nScanning {len(ALL_WATCHLIST)} pairs (BOS:{len(BOS_WATCHLIST)} + EMA:{len(EMA_WATCHLIST)}){open_str}")
                 last_heartbeat=now
 
-            # Scan watchlist
-            for w in WATCHLIST:
+            # Scan watchlist (both engines)
+            for w in ALL_WATCHLIST:
                 symbol    = w["symbol"]
                 timeframe = w["timeframe"]
-                key       = f"{symbol}_{timeframe}"
+                engine    = w["engine"]
+                key       = f"{symbol}_{timeframe}_{engine}"
                 interval  = SCAN_INTERVALS.get(timeframe,60)
 
                 if now-last_scan.get(key,0)<interval: continue
@@ -444,10 +563,16 @@ def run():
                         print(f"[{now_str}] {symbol} {timeframe} — not enough candles")
                         continue
 
-                    signal=detect_signal_bos(
-                        candles, w["pivot_n"], w["fib_level"],
-                        w["entry_mode"], w["rr"]
-                    )
+                    if engine=="ema_cross":
+                        signal=detect_signal_ema_cross(
+                            candles, w["ema_fast"], w["ema_slow"], w["rr"],
+                            w["use_vol"], w["use_gap"], w["use_htf"]
+                        )
+                    else:
+                        signal=detect_signal_bos(
+                            candles, w["pivot_n"], w["fib_level"],
+                            w["entry_mode"], w["rr"]
+                        )
 
                     if signal and key not in open_signals:
                         cooldown=interval*3
@@ -458,18 +583,18 @@ def run():
                             open_signals[key]={
                                 **signal,
                                 "symbol":symbol,"timeframe":timeframe,
-                                "label":w["label"],"entry_time":now,
+                                "label":w["label"],"engine":engine,"entry_time":now,
                                 "entry_balance":acc["balance"]
                             }
-                            print(f"[{now_str}] ✅ ENTRY: {symbol} {timeframe} {signal['direction']} @ ${signal['entry']}")
+                            print(f"[{now_str}] ✅ ENTRY ({engine}): {symbol} {timeframe} {signal['direction']} @ ${signal['entry']}")
                     else:
                         state=f"open" if key in open_signals else "no signal"
-                        print(f"[{now_str}] {symbol} {timeframe} — {state}")
+                        print(f"[{now_str}] {symbol} {timeframe} ({engine}) — {state}")
 
                     time.sleep(0.5)
 
                 except Exception as e:
-                    print(f"[{now_str}] Scan error {symbol} {timeframe}: {e}")
+                    print(f"[{now_str}] Scan error {symbol} {timeframe} ({engine}): {e}")
                     time.sleep(2)
 
             # Check SL/TP on open positions
@@ -504,13 +629,14 @@ def run():
                         new_bal   = round(acc["balance"]+pnl,4)
                         acc       = update_account(new_bal,won,pnl)
 
-                        w_info = next((w for w in WATCHLIST if f"{w['symbol']}_{w['timeframe']}"==key), WATCHLIST[0])
+                        w_info = next((w for w in ALL_WATCHLIST
+                                       if f"{w['symbol']}_{w['timeframe']}_{w['engine']}"==key), ALL_WATCHLIST[0])
                         log_trade({
                             "symbol":sig["symbol"],"timeframe":sig["timeframe"],
                             "direction":direction,"entry":sig["entry"],
                             "exit_price":exit_price,"sl":sig["sl"],"tp":sig["tp"],
                             "rr":sig["rr"],"pnl":pnl,"won":won,"balance":new_bal,
-                            "label":sig["label"],
+                            "label":sig["label"],"engine":sig["engine"],
                             "created_at":datetime.now(timezone.utc).isoformat(),
                         })
 
