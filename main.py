@@ -1463,3 +1463,98 @@ def diagnose_ema_filters(symbol: str = "DOGE/USDT", tf: str = "5m",
             "sample": crosses[:15],
         },
     }
+
+@app.get("/diagnose-candle-quality")
+def diagnose_candle_quality(period_start: str = "2025-01-01", period_end: str = "2026-01-01"):
+    """
+    Checks candle data integrity for all pairs/timeframes:
+    - Actual vs expected candle count (gaps)
+    - Duplicate timestamps
+    - OHLC sanity (high>=low, high>=open/close, low<=open/close)
+    - Zero/negative prices
+    - Sample first & last candle (human-readable date) for spot-check vs TradingView
+    """
+    from datetime import datetime as dt, timezone as tz
+
+    PAIRS = ["DOGE/USDT","XLM/USDT","XRP/USDT","TRX/USDT","ARB/USDT","ADA/USDT"]
+    TFS   = ["1m","5m","15m","1h"]
+    TF_MINUTES = {"1m":1,"5m":5,"15m":15,"1h":60}
+
+    start_ms = int(dt.strptime(period_start,"%Y-%m-%d").replace(tzinfo=tz.utc).timestamp()*1000)
+    end_ms   = int(dt.strptime(period_end,  "%Y-%m-%d").replace(tzinfo=tz.utc).timestamp()*1000)
+    total_minutes = (end_ms - start_ms) / 60000
+
+    results = []
+    for symbol in PAIRS:
+        for tf in TFS:
+            q=(f"symbol=eq.{symbol}&timeframe=eq.{tf}"
+               f"&ts=gte.{start_ms}&ts=lte.{end_ms}"
+               f"&order=ts.asc&select=ts,open,high,low,close,volume")
+            rows=[]; offset=0
+            while True:
+                page_q = q + f"&limit=10000&offset={offset}"
+                res = httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{page_q}", headers=HEADERS, timeout=60)
+                if res.status_code != 200: break
+                batch = res.json()
+                if not batch: break
+                rows += batch
+                if len(batch) < 10000: break
+                offset += 10000
+
+            if not rows:
+                results.append({"symbol":symbol,"tf":tf,"status":"NO DATA"})
+                continue
+
+            expected = int(total_minutes / TF_MINUTES[tf])
+            actual = len(rows)
+
+            # Duplicate timestamps
+            ts_list = [r["ts"] for r in rows]
+            dup_count = len(ts_list) - len(set(ts_list))
+
+            # Gap check — find largest gap
+            tf_ms = TF_MINUTES[tf]*60*1000
+            max_gap_ms = 0
+            gap_count = 0
+            for i in range(1,len(ts_list)):
+                gap = ts_list[i] - ts_list[i-1]
+                if gap > tf_ms:
+                    gap_count += 1
+                    max_gap_ms = max(max_gap_ms, gap)
+
+            # OHLC sanity
+            ohlc_violations = 0
+            zero_or_neg = 0
+            for r in rows:
+                o,h,l,c = float(r["open"]),float(r["high"]),float(r["low"]),float(r["close"])
+                if h < l or h < o or h < c or l > o or l > c:
+                    ohlc_violations += 1
+                if o<=0 or h<=0 or l<=0 or c<=0:
+                    zero_or_neg += 1
+
+            first_ts = ts_list[0]
+            last_ts  = ts_list[-1]
+
+            results.append({
+                "symbol": symbol, "tf": tf,
+                "actual_candles": actual,
+                "expected_candles": expected,
+                "completeness_pct": round(actual/expected*100, 2) if expected>0 else None,
+                "duplicate_timestamps": dup_count,
+                "gap_count": gap_count,
+                "max_gap_minutes": round(max_gap_ms/60000, 1),
+                "ohlc_violations": ohlc_violations,
+                "zero_or_negative_prices": zero_or_neg,
+                "first_candle": {
+                    "ts": first_ts,
+                    "date": dt.fromtimestamp(first_ts/1000, tz=tz.utc).isoformat(),
+                    "ohlc": [rows[0]["open"],rows[0]["high"],rows[0]["low"],rows[0]["close"]],
+                },
+                "last_candle": {
+                    "ts": last_ts,
+                    "date": dt.fromtimestamp(last_ts/1000, tz=tz.utc).isoformat(),
+                    "ohlc": [rows[-1]["open"],rows[-1]["high"],rows[-1]["low"],rows[-1]["close"]],
+                },
+            })
+
+    return {"success": True, "period": [period_start, period_end], "results": results}
