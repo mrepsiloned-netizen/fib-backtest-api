@@ -1065,7 +1065,7 @@ def _run_matrix_thread():
     finally:
         _matrix_running = False
 
-@app.post("/run-matrix")
+@app.api_route("/run-matrix", methods=["GET","POST"])
 def run_matrix(mode: str = "ema"):
     global _matrix_thread, _matrix_running
     if _matrix_running:
