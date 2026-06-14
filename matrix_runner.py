@@ -46,12 +46,11 @@ EMA_TIMEFRAMES  = ["1m","5m","15m"]
 EMA_FAST_LIST   = [9, 12]
 EMA_SLOW_LIST   = [21, 26]
 EMA_RR_LIST     = [1.5, 2.0]
-EMA_RSI_OPTS    = [False, True]
 EMA_VOL_OPTS    = [False, True]
 EMA_GAP_OPTS    = [False, True]
 EMA_HTF_OPTS    = [False, True]
 EMA_TOTAL = (len(EMA_PAIRS_LIST)*len(EMA_TIMEFRAMES)*len(EMA_FAST_LIST)*
-             len(EMA_SLOW_LIST)*len(EMA_RR_LIST)*len(EMA_RSI_OPTS)*
+             len(EMA_SLOW_LIST)*len(EMA_RR_LIST)*
              len(EMA_VOL_OPTS)*len(EMA_GAP_OPTS)*len(EMA_HTF_OPTS))
 
 RISK_PCT  = 0.02
@@ -83,7 +82,7 @@ def get_candles(symbol, timeframe, ps=None, pe=None):
     while True:
         q=(f"symbol=eq.{symbol}&timeframe=eq.{timeframe}"
            f"&ts=gte.{start_ms}&ts=lte.{end_ms}"
-           f"&order=ts.asc&limit=10000&offset={offset}&select=open,high,low,close")
+           f"&order=ts.asc&limit=10000&offset={offset}&select=open,high,low,close,volume")
         res=httpx.get(f"{SUPABASE_URL}/rest/v1/candles?{q}",headers=HEADERS,timeout=60)
         if res.status_code==200:
             batch=res.json()
@@ -316,29 +315,14 @@ def backtest(H, L, C, O, n, N, rr, fib_level, entry_mode,
 # ── EMA CROSS BACKTEST ─────────────────────────────────────────
 def backtest_ema(H, L, C, O, V, n, rr,
                  ema_fast, ema_slow,
-                 use_rsi, use_volume, use_ema_gap, use_htf_mult,
+                 use_volume, use_ema_gap, use_htf_mult,
                  htf_mult=5):
     def calc_ema(arr, period):
         k=2/(period+1); out=np.empty(len(arr)); out[0]=arr[0]
         for i in range(1,len(arr)): out[i]=arr[i]*k+out[i-1]*(1-k)
         return out
 
-    def calc_rsi(arr, period=14):
-        rsi=np.full(len(arr),50.0)
-        g=np.zeros(len(arr)); l_=np.zeros(len(arr))
-        for i in range(1,len(arr)):
-            d=arr[i]-arr[i-1]; g[i]=max(d,0); l_[i]=max(-d,0)
-        ag=al=0.0
-        for i in range(1,period+1): ag+=g[i]; al+=l_[i]
-        ag/=period; al/=period
-        rsi[period]=100 if al==0 else 100-100/(1+ag/al)
-        for i in range(period+1,len(arr)):
-            ag=(ag*(period-1)+g[i])/period; al=(al*(period-1)+l_[i])/period
-            rsi[i]=100 if al==0 else 100-100/(1+ag/al)
-        return rsi
-
     ef=calc_ema(C,ema_fast); es=calc_ema(C,ema_slow)
-    rsi_v=calc_rsi(C) if use_rsi else None
     hf=calc_ema(C,ema_fast*htf_mult) if use_htf_mult else None
     hs=calc_ema(C,ema_slow*htf_mult) if use_htf_mult else None
 
@@ -377,9 +361,6 @@ def backtest_ema(H, L, C, O, V, n, rr,
         if not cross_up and not cross_dn: continue
         side="long" if cross_up else "short"
 
-        if use_rsi and rsi_v is not None:
-            if side=="long"  and rsi_v[i]<50: continue
-            if side=="short" and rsi_v[i]>50: continue
         if use_volume and vol_ma[i]>0:
             if V[i]<=vol_ma[i]: continue
         if use_ema_gap:
@@ -504,13 +485,13 @@ def run_ema(grand_total, done, saved, errors, buf, start, last_tg):
         V=np.array([r.get("volume",0) for r in rows],dtype=float)
         n=len(rows); print(f"  {n} candles")
 
-        for ef_p,es_p,rr,use_rsi,use_vol,use_gap,use_htf in itertools.product(
+        for ef_p,es_p,rr,use_vol,use_gap,use_htf in itertools.product(
             EMA_FAST_LIST,EMA_SLOW_LIST,EMA_RR_LIST,
-            EMA_RSI_OPTS,EMA_VOL_OPTS,EMA_GAP_OPTS,EMA_HTF_OPTS
+            EMA_VOL_OPTS,EMA_GAP_OPTS,EMA_HTF_OPTS
         ):
-            filters="+".join(f for f,v in [("rsi",use_rsi),("vol",use_vol),("gap",use_gap),("htf",use_htf)] if v) or "none"
+            filters="+".join(f for f,v in [("vol",use_vol),("gap",use_gap),("htf",use_htf)] if v) or "none"
             try:
-                s=backtest_ema(H,L,C,O,V,n,rr,ef_p,es_p,use_rsi,use_vol,use_gap,use_htf)
+                s=backtest_ema(H,L,C,O,V,n,rr,ef_p,es_p,use_vol,use_gap,use_htf)
             except Exception as e:
                 s=None; errors+=1; print(f"  EMA error: {e}")
 
