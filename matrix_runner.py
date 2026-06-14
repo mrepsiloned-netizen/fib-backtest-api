@@ -40,6 +40,15 @@ BOS_TOTAL = (len(BOS_PAIRS)*len(BOS_TIMEFRAMES)*len(BOS_ENTRY_MODES)*
              len(BOS_PIVOT_NS)*len(BOS_RR_RATIOS)*len(BOS_FIB_LEVELS)*
              len(BOS_EMA_PAIRS)*len(BOS_ADX_MINS))
 
+# Currently-live paper trader configs — stability check across periods
+BOS_LOCKED_CONFIGS = [
+    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":3,"rr":1.5,"fib_level":0.5, "entry_mode":"reclaim"},
+    {"symbol":"XLM/USDT", "timeframe":"5m", "pivot_n":5,"rr":1.5,"fib_level":0.5, "entry_mode":"reclaim"},
+    {"symbol":"TRX/USDT", "timeframe":"1h", "pivot_n":3,"rr":2.0,"fib_level":0.5, "entry_mode":"reclaim"},
+    {"symbol":"ARB/USDT", "timeframe":"15m","pivot_n":5,"rr":1.5,"fib_level":0.5, "entry_mode":"rejection"},
+    {"symbol":"XRP/USDT", "timeframe":"1h", "pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim"},
+]
+
 # ── EMA CROSS VARIABLE SPACE ───────────────────────────────────
 EMA_PAIRS_LIST  = ["DOGE/USDT","XLM/USDT","XRP/USDT","TRX/USDT","ARB/USDT"]
 EMA_TIMEFRAMES  = ["1m","5m","15m"]
@@ -63,6 +72,8 @@ EMA_TOTAL = (len(EMA_PAIRS_LIST)*len(EMA_TIMEFRAMES)*len(EMA_FAST_LIST)*
              len(EMA_SLOW_LIST)*len(EMA_RR_LIST)*
              len(EMA_VOL_OPTS)*len(EMA_GAP_OPTS)*len(EMA_HTF_OPTS)*
              len(EMA_PERIODS))
+
+BOS_STABILITY_TOTAL = len(BOS_LOCKED_CONFIGS) * len(EMA_PERIODS)  # reuse same 3 periods
 
 RISK_PCT  = 0.02
 MIN_SWING = 0.002
@@ -480,6 +491,53 @@ def run_bos(grand_total, done, saved, errors, buf, start, last_tg):
     return done, saved, errors, buf, last_tg
 
 
+# ── PHASE: BOS STABILITY CHECK (live paper trader configs) ─────
+def run_bos_stability(grand_total, done, saved, errors, buf, start, last_tg):
+    print("\n=== BOS Pullback — stability check (live configs) ===")
+    for cfg in BOS_LOCKED_CONFIGS:
+        symbol, tf = cfg["symbol"], cfg["timeframe"]
+        for period_label, ps, pe in EMA_PERIODS:
+            print(f"\n{symbol} {tf} [{period_label}]...")
+            set_status("compute","running",done,grand_total,f"BOS-stability {symbol} {tf} {period_label}")
+            rows=get_candles(symbol,tf,ps,pe)
+            if not rows: print("  No candles — skip"); done+=1; continue
+
+            H=np.array([r["high"]  for r in rows],dtype=float)
+            L=np.array([r["low"]   for r in rows],dtype=float)
+            C=np.array([r["close"] for r in rows],dtype=float)
+            O=np.array([r["open"]  for r in rows],dtype=float)
+            n=len(rows); print(f"  {n} candles")
+
+            try:
+                s=backtest(H,L,C,O,n,cfg["pivot_n"],cfg["rr"],cfg["fib_level"],
+                           cfg["entry_mode"],None,None,False,None,0.0)
+            except Exception as e:
+                s=None; errors+=1; print(f"  error: {e}")
+
+            buf.append({
+                "combo_key":f"{symbol}|{tf}|bos_pullback_live|{cfg['entry_mode']}|{cfg['pivot_n']}|{cfg['rr']}|{cfg['fib_level']}|off|0|{period_label}",
+                "pair":symbol.replace("/USDT",""),"timeframe":tf,
+                "engine":"bos_pullback_live","entry_mode":cfg["entry_mode"],
+                "pivot_n":cfg["pivot_n"],"rr":cfg["rr"],"fib_level":cfg["fib_level"],
+                "ema_pair":"off","adx_min":0,"filters":period_label,
+                "period_start":ps,"period_end":pe,
+                "success":s is not None,
+                "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
+                "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
+                "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
+                "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
+                "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
+                "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
+                "computed_at":datetime.now(timezone.utc).isoformat(),
+            })
+            if s: saved+=1
+            done+=1
+            set_status("compute","running",done,grand_total,f"BOS-stability {symbol} {tf} {period_label}")
+
+    if buf: save_rows(buf); buf=[]
+    return done, saved, errors, buf, last_tg
+
+
 # ── PHASE: EMA CROSS ───────────────────────────────────────────
 def run_ema(grand_total, done, saved, errors, buf, start, last_tg):
     print("\n=== EMA Cross (stability sweep across periods) ===")
@@ -544,6 +602,7 @@ def main_compute(mode="ema"):
     engines_to_clear = []
     if mode in ("ema","all"): engines_to_clear.append("ema_cross")
     if mode in ("bos","all"): engines_to_clear.append("bos_pullback")
+    if mode in ("bos","all"): engines_to_clear.append("bos_pullback_live")
 
     for eng in engines_to_clear:
         try:
@@ -552,21 +611,24 @@ def main_compute(mode="ema"):
             print(f"Cleared old {eng} results")
         except: pass
 
-    grand_total = (EMA_TOTAL if mode=="ema" else BOS_TOTAL if mode=="bos" else EMA_TOTAL+BOS_TOTAL)
+    bos_total = BOS_TOTAL + BOS_STABILITY_TOTAL
+    grand_total = (EMA_TOTAL if mode=="ema" else bos_total if mode=="bos" else EMA_TOTAL+bos_total)
 
     engine_label = ("EMA Cross only" if mode=="ema" else
-                    "BOS Pullback only" if mode=="bos" else
+                    "BOS Pullback + stability check" if mode=="bos" else
                     "BOS Pullback + EMA Cross")
     period_str = " / ".join(f"{lbl}({ps}→{pe})" for lbl,ps,pe in EMA_PERIODS) if mode in ("ema","all") else f"{PERIOD_START} → {PERIOD_END}"
     tg(f"""🔢 <b>Matrix Runner v9 — {engine_label}</b>
 Total combos: {grand_total:,}
-{"EMA periods: " + period_str if mode in ("ema","all") else "Period: " + period_str}""")
+{"EMA periods: " + period_str if mode in ("ema","all") else "Period: " + period_str}
+{("BOS sweep: " + format(BOS_TOTAL,",") + " | Live config stability: " + format(BOS_STABILITY_TOTAL,",") + " (×3 periods)") if mode in ("bos","all") else ""}""")
 
     saved=0; errors=0; done=0
     start=time.time(); last_tg=time.time(); buf=[]
 
     if mode in ("bos","all"):
         done,saved,errors,buf,last_tg = run_bos(grand_total,done,saved,errors,buf,start,last_tg)
+        done,saved,errors,buf,last_tg = run_bos_stability(grand_total,done,saved,errors,buf,start,last_tg)
     if mode in ("ema","all"):
         done,saved,errors,buf,last_tg = run_ema(grand_total,done,saved,errors,buf,start,last_tg)
 
