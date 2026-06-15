@@ -1,5 +1,5 @@
 # ============================================================
-# WADDLE PAPER TRADER v8
+# WADDLE PAPER TRADER v10
 # Dual Engine: BOS Pullback + EMA Cross
 #   BOS Pullback — Pine Script P1-P2-P3 v6.5
 #     5 pairs: DOGE/15m, XLM/5m, TRX/1h, ARB/15m, XRP/1h
@@ -37,15 +37,26 @@ SCAN_INTERVALS = {
 }
 
 # ── WATCHLISTS ────────────────────────────────────────────────
+# BOS Pullback — final 5 configs (1 per pair), selected via:
+#   Stage 1: full sweep (19,440 combos) → top-5 per pair by Sharpe
+#   Stage 2: top-5 stability check across 2025/2026YTD/L30D
+#   Stage 3: 18-month consistency check (% profitable months)
+# ARB excluded from BOS (already covered by EMA Cross below).
 BOS_WATCHLIST = [
-    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":3,"rr":1.5,"fib_level":0.5, "entry_mode":"reclaim",   "label":"DOGE 15m BOS",  "engine":"bos_pullback"},
-    {"symbol":"XLM/USDT", "timeframe":"5m", "pivot_n":5,"rr":1.5,"fib_level":0.5, "entry_mode":"reclaim",   "label":"XLM 5m BOS",   "engine":"bos_pullback"},
-    {"symbol":"TRX/USDT", "timeframe":"1h", "pivot_n":3,"rr":2.0,"fib_level":0.5, "entry_mode":"reclaim",   "label":"TRX 1h BOS",   "engine":"bos_pullback"},
-    {"symbol":"ARB/USDT", "timeframe":"15m","pivot_n":5,"rr":1.5,"fib_level":0.5, "entry_mode":"rejection", "label":"ARB 15m BOS",  "engine":"bos_pullback"},
-    {"symbol":"XRP/USDT", "timeframe":"1h", "pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim",  "label":"XRP 1h BOS",   "engine":"bos_pullback"},
+    # ADA — 89% of 18 months profitable, avg +6.09%/mo, std 6.08% (best ratio)
+    {"symbol":"ADA/USDT", "timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.382,"entry_mode":"reclaim",  "ema_pair":"89/144","adx_min":25,"label":"ADA 15m BOS", "engine":"bos_pullback"},
+    # DOGE — upgraded from runner-up: 72% profitable, 132 trades/18mo
+    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim",  "ema_pair":"34/55", "adx_min":15,"label":"DOGE 15m BOS","engine":"bos_pullback"},
+    # XLM — 78% profitable, avg +5.99%/mo
+    {"symbol":"XLM/USDT", "timeframe":"15m","pivot_n":5,"rr":4.0,"fib_level":0.382,"entry_mode":"reclaim",  "ema_pair":"89/144","adx_min":25,"label":"XLM 15m BOS", "engine":"bos_pullback"},
+    # TRX — upgraded from runner-up: 78% profitable (was 67%)
+    {"symbol":"TRX/USDT", "timeframe":"1h", "pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"89/144","adx_min":15,"label":"TRX 1h BOS",  "engine":"bos_pullback"},
+    # XRP — upgraded from runner-up: 72% profitable (was 61%), 133 trades/18mo
+    {"symbol":"XRP/USDT", "timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,  "entry_mode":"reclaim",  "ema_pair":"55/89", "adx_min":25,"label":"XRP 15m BOS", "engine":"bos_pullback"},
 ]
 
 # EMA Cross — locked from stability sweep (2025 full / 2026 YTD / L30D all profitable)
+# UNCHANGED — do not modify, already running and validated.
 EMA_WATCHLIST = [
     {"symbol":"ARB/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":False,"use_gap":True, "use_htf":False,"label":"ARB 5m EMA12/26 gap","engine":"ema_cross"},
     {"symbol":"XLM/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":21,"rr":2.0,"use_vol":False,"use_gap":True, "use_htf":False,"label":"XLM 5m EMA12/21 gap","engine":"ema_cross"},
@@ -53,6 +64,7 @@ EMA_WATCHLIST = [
 ]
 
 ALL_WATCHLIST = BOS_WATCHLIST + EMA_WATCHLIST
+
 
 # ── SUPABASE ──────────────────────────────────────────────────
 def get_account():
@@ -139,11 +151,19 @@ def send_entry_bos(w, signal, acc):
     total_ret= round((balance-START_BALANCE)/START_BALANCE*100,2)
     wr       = round(acc["wins"]/acc["total_trades"]*100,1) if acc["total_trades"]>0 else 0
     emoji    = "🟢" if signal["direction"]=="LONG" else "🔴"
+    ema_pair = w.get("ema_pair","off")
+    adx_min  = w.get("adx_min",0)
+    filt_str = []
+    if ema_pair!="off": filt_str.append(f"EMA{ema_pair}")
+    if adx_min>0: filt_str.append(f"ADX≥{adx_min}")
+    filt_str = " + ".join(filt_str) if filt_str else "none"
 
     tg(f"""{emoji} <b>ENTRY — {w['symbol']} {w['timeframe'].upper()}</b>
 
+<b>Variant:</b>  {w['label']}
 <b>Strategy:</b> BOS Pullback | {signal['direction']}
 <b>Entry mode:</b> {w['entry_mode'].capitalize()}
+<b>Filters:</b>  {filt_str}
 
 <b>P1:</b> ${signal['p1']}
 <b>P2:</b> ${signal['p2']} (SL anchor)
@@ -162,7 +182,7 @@ def send_entry_bos(w, signal, acc):
 <b>Stats:</b> {acc['total_trades']} trades · {acc['wins']}W {acc['losses']}L · {wr}% WR
 <b>Total return:</b> {'+' if total_ret>=0 else ''}{total_ret}%
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-📊 Paper trade v8""")
+📊 Paper trade v10""")
 
 def send_entry_ema(w, signal, acc):
     balance  = acc["balance"]
@@ -192,7 +212,7 @@ def send_entry_ema(w, signal, acc):
 <b>Stats:</b> {acc['total_trades']} trades · {acc['wins']}W {acc['losses']}L · {wr}% WR
 <b>Total return:</b> {'+' if total_ret>=0 else ''}{total_ret}%
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-📊 Paper trade v8""")
+📊 Paper trade v10""")
 
 def send_exit(w, signal, exit_price, won, pnl, acc):
     emoji    = "✅" if won else "❌"
@@ -203,6 +223,7 @@ def send_exit(w, signal, exit_price, won, pnl, acc):
 
     tg(f"""{emoji} <b>TRADE CLOSED — {w['symbol']} {w['timeframe'].upper()}</b>
 
+<b>Variant:</b>  {w['label']}
 <b>Strategy:</b> {strategy}
 <b>Result:</b>    {result}
 <b>Direction:</b> {signal['direction']}
@@ -219,7 +240,7 @@ def send_exit(w, signal, exit_price, won, pnl, acc):
 
 <b>All time:</b> {acc['total_trades']} trades · {acc['wins']}W {acc['losses']}L · {wr}% WR
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-📊 Paper trade v8""")
+📊 Paper trade v10""")
 
 def send_daily_summary(open_signals):
     try:
@@ -263,7 +284,8 @@ def reset_machine(m):
              p3=None,p3_bar=None,ttl=None,fib=None,c_watch=None)
 
 def step_machine(m, ci, H, L, C, O, n, N,
-                 conf_high, conf_low, fib_level, entry_mode, mac):
+                 conf_high, conf_low, fib_level, entry_mode, mac,
+                 ema_f=None, ema_s=None, use_ema=False, adx_v=None, adx_thr=0.0):
     """
     Returns a signal dict if entry triggered, else None.
     Modifies m (state machine) and mac (macro trend) in place.
@@ -344,6 +366,12 @@ def step_machine(m, ci, H, L, C, O, n, N,
 
         if not trig or ep is None: return None
 
+        # EMA / ADX filter check (Pine Script aligned)
+        if use_ema and ema_f is not None:
+            if side=="bull" and ema_f[ci]<=ema_s[ci]: return None
+            if side=="bear" and ema_f[ci]>=ema_s[ci]: return None
+        if adx_v is not None and adx_v[ci]<adx_thr: return None
+
         # Build signal
         sl=m["p2"]*(1+STOP_BUF) if side=="bear" else m["p2"]*(1-STOP_BUF)
         rng2=(m["p3"]-m["p2"]) if side=="bull" else (m["p2"]-m["p3"])
@@ -367,11 +395,13 @@ def step_machine(m, ci, H, L, C, O, n, N,
 
     return None
 
-def detect_signal_bos(candles, N, fib_level, entry_mode, rr):
+def detect_signal_bos(candles, N, fib_level, entry_mode, rr, ema_pair="off", adx_min=0):
     """
     Run BOS Pullback state machine on candle history.
     Returns signal dict or None.
     Uses last confirmed candle (candles[-2]) as current.
+    ema_pair: "off" or "fast/slow" e.g. "144/169" — only trade in EMA trend direction
+    adx_min:  0 = off, else minimum ADX(14) to allow entry
     """
     if len(candles) < N*2+10: return None
 
@@ -380,6 +410,15 @@ def detect_signal_bos(candles, N, fib_level, entry_mode, rr):
     C=np.array([c[4] for c in candles],dtype=float)
     O=np.array([c[1] for c in candles],dtype=float)
     n=len(candles)
+
+    use_ema = ema_pair!="off"
+    ema_f=ema_s=adx_v=None
+    if use_ema:
+        f,s_=map(int,ema_pair.split("/"))
+        ema_f=calc_ema(C,f); ema_s=calc_ema(C,s_)
+    adx_thr=float(adx_min)
+    if adx_min>0:
+        adx_v=calc_adx(H,L,C,14)
 
     # Strict confirmed fractals (confirmed at bar i+N)
     conf_high,conf_low={},{}
@@ -401,8 +440,10 @@ def detect_signal_bos(candles, N, fib_level, entry_mode, rr):
         elif mac["trend"]==-1:
             if mac["ext"] is None or L[ci]<mac["ext"]: mac["ext"]=float(L[ci]); mac["ext_idx"]=ci
 
-        bs=step_machine(bull,ci,H,L,C,O,n,N,conf_high,conf_low,fib_level,entry_mode,mac)
-        be=step_machine(bear,ci,H,L,C,O,n,N,conf_high,conf_low,fib_level,entry_mode,mac)
+        bs=step_machine(bull,ci,H,L,C,O,n,N,conf_high,conf_low,fib_level,entry_mode,mac,
+                        ema_f,ema_s,use_ema,adx_v,adx_thr)
+        be=step_machine(bear,ci,H,L,C,O,n,N,conf_high,conf_low,fib_level,entry_mode,mac,
+                        ema_f,ema_s,use_ema,adx_v,adx_thr)
 
         if bs: last_signal=bs
         if be: last_signal=be
@@ -433,6 +474,23 @@ def calc_ema(arr, period):
     k=2/(period+1); out=np.empty(len(arr)); out[0]=arr[0]
     for i in range(1,len(arr)): out[i]=arr[i]*k+out[i-1]*(1-k)
     return out
+
+def calc_adx(H,L,C,period):
+    n=len(H); adx_=np.zeros(n); pdm=np.zeros(n); mdm=np.zeros(n); tr=np.zeros(n)
+    for i in range(1,n):
+        pdm[i]=max(H[i]-H[i-1],0) if H[i]-H[i-1]>L[i-1]-L[i] else 0
+        mdm[i]=max(L[i-1]-L[i],0) if L[i-1]-L[i]>H[i]-H[i-1] else 0
+        tr[i]=max(H[i]-L[i],abs(H[i]-C[i-1]),abs(L[i]-C[i-1]))
+    st_=sum(tr[1:period+1]); sp=sum(pdm[1:period+1]); sm=sum(mdm[1:period+1])
+    dx=np.zeros(n)
+    for i in range(period+1,n):
+        st_=st_-st_/period+tr[i]; sp=sp-sp/period+pdm[i]; sm=sm-sm/period+mdm[i]
+        pi_=(sp/st_*100) if st_>0 else 0; mi_=(sm/st_*100) if st_>0 else 0
+        s=pi_+mi_; dx[i]=abs(pi_-mi_)/s*100 if s>0 else 0
+    s2=period*2
+    if s2<n: adx_[s2]=sum(dx[period+1:s2+1])/period
+    for i in range(s2+1,n): adx_[i]=(adx_[i-1]*(period-1)+dx[i])/period
+    return adx_
 
 def detect_signal_ema_cross(candles, ema_fast, ema_slow, rr,
                              use_vol, use_gap, use_htf, htf_mult=5):
@@ -492,14 +550,17 @@ def detect_signal_ema_cross(candles, ema_fast, ema_slow, rr,
 
 # ── MAIN LOOP ─────────────────────────────────────────────────
 def run():
-    print("🤖 Waddle Paper Trader v8 — Dual Engine starting...")
+    print("🤖 Waddle Paper Trader v10 — Dual Engine starting...")
     acc = init_account()
-    bos_str = "\n".join([f"• {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R {w['entry_mode']} fib={w['fib_level']}" for w in BOS_WATCHLIST])
-    ema_str = "\n".join([f"• {w['symbol']} {w['timeframe'].upper()} EMA{w['ema_fast']}/{w['ema_slow']} {w['rr']}R "
+    bos_str = "\n".join([f"• {w['label']}: {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R {w['entry_mode']} fib={w['fib_level']}"
+                          + (f" EMA{w['ema_pair']}" if w.get('ema_pair','off')!='off' else "")
+                          + (f" ADX≥{w['adx_min']}" if w.get('adx_min',0)>0 else "")
+                          for w in BOS_WATCHLIST])
+    ema_str = "\n".join([f"• {w['label']}: {w['symbol']} {w['timeframe'].upper()} EMA{w['ema_fast']}/{w['ema_slow']} {w['rr']}R "
                           f"[{'+'.join(f for f,v in [('vol',w['use_vol']),('gap',w['use_gap']),('htf',w['use_htf'])] if v) or 'none'}]"
                           for w in EMA_WATCHLIST])
-    tg(f"""🤖 <b>Waddle Paper Trader v8 LIVE</b>
-<b>Dual Engine:</b> BOS Pullback + EMA Cross
+    tg(f"""🤖 <b>Waddle Paper Trader v10 LIVE</b>
+<b>Dual Engine:</b> BOS Pullback (5 configs, 1 per pair — 18mo validated) + EMA Cross (3 configs)
 
 <b>Account:</b> ${acc['balance']:.2f}
 <b>Risk per trade:</b> {RISK_PCT*100:.0f}%
@@ -510,7 +571,7 @@ def run():
 <b>EMA Cross watchlist:</b>
 {ema_str}
 
-📊 Paper trading active""")
+📊 Each trade tagged with its variant label — query paper_trades grouped by 'label' for post-mortem comparison after ~1 month.""")
 
     exchange      = ccxt.kucoin({"enableRateLimit":True})
     open_signals  = {}
@@ -571,7 +632,8 @@ def run():
                     else:
                         signal=detect_signal_bos(
                             candles, w["pivot_n"], w["fib_level"],
-                            w["entry_mode"], w["rr"]
+                            w["entry_mode"], w["rr"],
+                            w.get("ema_pair","off"), w.get("adx_min",0)
                         )
 
                     if signal and key not in open_signals:
