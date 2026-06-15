@@ -155,6 +155,46 @@ BOS_RUNNERUPS = [
 ]
 BOS_RUNNERUP_MONTHLY_TOTAL = len(BOS_RUNNERUPS) * len(MONTHLY_PERIODS)
 
+# ── EMA CROSS — TOP-5-PER-PAIR CANDIDATES (Stage 2: stability check) ────
+# From 2025_full sweep, top 5 by Sharpe per pair (incl. DOGE/XRP — earlier
+# "exclude" verdict was based on aggregates; individual configs may survive).
+def _parse_ema_filters(s):
+    return {"use_vol":"vol" in s, "use_gap":"gap" in s, "use_htf":"htf" in s}
+
+EMA_LOCKED_CONFIGS = [
+    # ARB — top 5
+    {"symbol":"ARB/USDT","timeframe":"15m","ema_fast":12,"ema_slow":21,"rr":1.5,**_parse_ema_filters("vol+gap+htf")},
+    {"symbol":"ARB/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":21,"rr":2.0,**_parse_ema_filters("vol+gap")},
+    {"symbol":"ARB/USDT","timeframe":"15m","ema_fast":9, "ema_slow":21,"rr":2.0,**_parse_ema_filters("gap")},
+    {"symbol":"ARB/USDT","timeframe":"15m","ema_fast":9, "ema_slow":21,"rr":2.0,**_parse_ema_filters("vol+gap")},
+    {"symbol":"ARB/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":26,"rr":2.0,**_parse_ema_filters("vol+gap")},
+    # XLM — top 5
+    {"symbol":"XLM/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":21,"rr":1.5,**_parse_ema_filters("vol+gap+htf")},
+    {"symbol":"XLM/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":21,"rr":1.5,**_parse_ema_filters("gap+htf")},
+    {"symbol":"XLM/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":21,"rr":2.0,**_parse_ema_filters("gap+htf")},
+    {"symbol":"XLM/USDT","timeframe":"15m","ema_fast":12,"ema_slow":26,"rr":2.0,**_parse_ema_filters("gap+htf")},
+    {"symbol":"XLM/USDT","timeframe":"15m","ema_fast":9, "ema_slow":21,"rr":2.0,**_parse_ema_filters("vol+gap+htf")},
+    # TRX — top 5
+    {"symbol":"TRX/USDT","timeframe":"15m","ema_fast":9,"ema_slow":26,"rr":1.5,**_parse_ema_filters("vol+gap+htf")},
+    {"symbol":"TRX/USDT","timeframe":"15m","ema_fast":9,"ema_slow":26,"rr":1.5,**_parse_ema_filters("gap+htf")},
+    {"symbol":"TRX/USDT","timeframe":"15m","ema_fast":9,"ema_slow":26,"rr":1.5,**_parse_ema_filters("gap")},
+    {"symbol":"TRX/USDT","timeframe":"15m","ema_fast":9,"ema_slow":26,"rr":1.5,**_parse_ema_filters("vol+gap")},
+    {"symbol":"TRX/USDT","timeframe":"15m","ema_fast":9,"ema_slow":21,"rr":2.0,**_parse_ema_filters("vol+gap")},
+    # DOGE — top 5 (re-testing despite earlier aggregate exclusion)
+    {"symbol":"DOGE/USDT","timeframe":"1m","ema_fast":12,"ema_slow":21,"rr":1.5,**_parse_ema_filters("gap")},
+    {"symbol":"DOGE/USDT","timeframe":"1m","ema_fast":12,"ema_slow":21,"rr":2.0,**_parse_ema_filters("gap")},
+    {"symbol":"DOGE/USDT","timeframe":"5m","ema_fast":12,"ema_slow":26,"rr":2.0,**_parse_ema_filters("gap+htf")},
+    {"symbol":"DOGE/USDT","timeframe":"5m","ema_fast":12,"ema_slow":26,"rr":1.5,**_parse_ema_filters("gap+htf")},
+    {"symbol":"DOGE/USDT","timeframe":"5m","ema_fast":9, "ema_slow":21,"rr":2.0,**_parse_ema_filters("gap+htf")},
+    # XRP — top 5 (re-testing despite earlier aggregate exclusion)
+    {"symbol":"XRP/USDT","timeframe":"1m", "ema_fast":12,"ema_slow":26,"rr":2.0,**_parse_ema_filters("vol+gap")},
+    {"symbol":"XRP/USDT","timeframe":"15m","ema_fast":12,"ema_slow":26,"rr":1.5,**_parse_ema_filters("vol+gap+htf")},
+    {"symbol":"XRP/USDT","timeframe":"5m", "ema_fast":9, "ema_slow":21,"rr":2.0,**_parse_ema_filters("vol+gap+htf")},
+    {"symbol":"XRP/USDT","timeframe":"15m","ema_fast":9, "ema_slow":21,"rr":1.5,**_parse_ema_filters("vol+gap+htf")},
+    {"symbol":"XRP/USDT","timeframe":"15m","ema_fast":12,"ema_slow":26,"rr":1.5,**_parse_ema_filters("gap+htf")},
+]
+EMA_STABILITY_TOTAL = len(EMA_LOCKED_CONFIGS) * len(EMA_PERIODS)
+
 RISK_PCT  = 0.02
 MIN_SWING = 0.002
 STOP_BUF  = 0.001
@@ -686,8 +726,57 @@ def run_bos_monthly(grand_total, done, saved, errors, buf, start, last_tg,
     return done, saved, errors, buf, last_tg
 
 
+# ── PHASE: EMA CROSS — Stage 2 stability check (top-5-per-pair) ────────
+def run_ema_stability(grand_total, done, saved, errors, buf, start, last_tg):
+    print("\n=== EMA Cross — stability check (top-5-per-pair candidates) ===")
+    for cfg in EMA_LOCKED_CONFIGS:
+        symbol, tf = cfg["symbol"], cfg["timeframe"]
+        for period_label, ps, pe in EMA_PERIODS:
+            print(f"\n{symbol} {tf} EMA{cfg['ema_fast']}/{cfg['ema_slow']} [{period_label}]...")
+            set_status("compute","running",done,grand_total,f"EMA-stability {symbol} {tf} {period_label}")
+            rows=get_candles(symbol,tf,ps,pe)
+            if not rows: print("  No candles — skip"); done+=1; continue
 
-def run_ema(grand_total, done, saved, errors, buf, start, last_tg):
+            H=np.array([r["high"]  for r in rows],dtype=float)
+            L=np.array([r["low"]   for r in rows],dtype=float)
+            C=np.array([r["close"] for r in rows],dtype=float)
+            O=np.array([r["open"]  for r in rows],dtype=float)
+            V=np.array([r.get("volume",0) for r in rows],dtype=float)
+            n=len(rows)
+
+            filters="+".join(f for f,v in [("vol",cfg["use_vol"]),("gap",cfg["use_gap"]),("htf",cfg["use_htf"])] if v) or "none"
+
+            try:
+                s=backtest_ema(H,L,C,O,V,n,cfg["rr"],cfg["ema_fast"],cfg["ema_slow"],
+                               cfg["use_vol"],cfg["use_gap"],cfg["use_htf"])
+            except Exception as e:
+                s=None; errors+=1; print(f"  error: {e}")
+
+            buf.append({
+                "combo_key":f"{symbol}|{tf}|ema_cross_live|cross|{cfg['ema_fast']}/{cfg['ema_slow']}|{cfg['rr']}|0|{filters}|{period_label}",
+                "pair":symbol.replace("/USDT",""),"timeframe":tf,
+                "engine":"ema_cross_live","entry_mode":"cross",
+                "pivot_n":0,"rr":cfg["rr"],"fib_level":0,
+                "ema_pair":f"{cfg['ema_fast']}/{cfg['ema_slow']}","adx_min":0,"filters":f"{period_label}|{filters}",
+                "period_start":ps,"period_end":pe,
+                "success":s is not None,
+                "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
+                "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
+                "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
+                "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
+                "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
+                "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
+                "computed_at":datetime.now(timezone.utc).isoformat(),
+            })
+            if s: saved+=1
+            done+=1
+            set_status("compute","running",done,grand_total,f"EMA-stability {symbol} {tf} {period_label}")
+
+    if buf: save_rows(buf); buf=[]
+    return done, saved, errors, buf, last_tg
+
+
+
     print("\n=== EMA Cross (stability sweep across periods) ===")
     for period_label, ps, pe in EMA_PERIODS:
         print(f"\n--- PERIOD: {period_label} ({ps} → {pe}) ---")
@@ -753,6 +842,7 @@ def main_compute(mode="ema"):
     if mode in ("bos","bos_stability","all"): engines_to_clear.append("bos_pullback_live")
     if mode=="bos_monthly": engines_to_clear.append("bos_pullback_monthly")
     if mode=="bos_monthly_runnerup": engines_to_clear.append("bos_pullback_monthly_runnerup")
+    if mode=="ema_stability": engines_to_clear.append("ema_cross_live")
 
     for eng in engines_to_clear:
         try:
@@ -766,15 +856,17 @@ def main_compute(mode="ema"):
                     BOS_STABILITY_TOTAL if mode=="bos_stability" else
                     BOS_MONTHLY_TOTAL if mode=="bos_monthly" else
                     BOS_RUNNERUP_MONTHLY_TOTAL if mode=="bos_monthly_runnerup" else
+                    EMA_STABILITY_TOTAL if mode=="ema_stability" else
                     bos_total if mode=="bos" else EMA_TOTAL+bos_total)
 
     engine_label = ("EMA Cross only" if mode=="ema" else
                     "BOS stability check only" if mode=="bos_stability" else
                     "BOS monthly consistency check" if mode=="bos_monthly" else
                     "BOS monthly — runner-up configs (DOGE/TRX/XRP)" if mode=="bos_monthly_runnerup" else
+                    "EMA Cross stability check (top-5-per-pair)" if mode=="ema_stability" else
                     "BOS Pullback + stability check" if mode=="bos" else
                     "BOS Pullback + EMA Cross")
-    period_str = " / ".join(f"{lbl}({ps}→{pe})" for lbl,ps,pe in EMA_PERIODS) if mode in ("ema","all") else f"{PERIOD_START} → {PERIOD_END}"
+    period_str = " / ".join(f"{lbl}({ps}→{pe})" for lbl,ps,pe in EMA_PERIODS) if mode in ("ema","all","ema_stability") else f"{PERIOD_START} → {PERIOD_END}"
     extra = ""
     if mode in ("bos","all"):
         extra = "BOS sweep: " + format(BOS_TOTAL,",") + " | Live config stability: " + format(BOS_STABILITY_TOTAL,",") + " (×3 periods)"
@@ -782,9 +874,11 @@ def main_compute(mode="ema"):
         extra = f"5 winning configs × {len(MONTHLY_PERIODS)} months ({MONTHLY_PERIODS[0][0]} → {MONTHLY_PERIODS[-1][0]})"
     elif mode=="bos_monthly_runnerup":
         extra = f"12 runner-up configs (DOGE/TRX/XRP ×4) × {len(MONTHLY_PERIODS)} months"
+    elif mode=="ema_stability":
+        extra = f"25 candidates (5 pairs × top-5, incl. DOGE/XRP) × {len(EMA_PERIODS)} periods"
     tg(f"""🔢 <b>Matrix Runner v9 — {engine_label}</b>
 Total combos: {grand_total:,}
-{"EMA periods: " + period_str if mode in ("ema","all") else "Period: " + period_str}
+{"EMA periods: " + period_str if mode in ("ema","all","ema_stability") else "Period: " + period_str}
 {extra}""")
 
     saved=0; errors=0; done=0
@@ -797,6 +891,8 @@ Total combos: {grand_total:,}
     if mode=="bos_monthly_runnerup":
         done,saved,errors,buf,last_tg = run_bos_monthly(grand_total,done,saved,errors,buf,start,last_tg,
                                                           configs=BOS_RUNNERUPS, engine_name="bos_pullback_monthly_runnerup")
+    if mode=="ema_stability":
+        done,saved,errors,buf,last_tg = run_ema_stability(grand_total,done,saved,errors,buf,start,last_tg)
     if mode in ("bos","all"):
         done,saved,errors,buf,last_tg = run_bos(grand_total,done,saved,errors,buf,start,last_tg)
         done,saved,errors,buf,last_tg = run_bos_stability(grand_total,done,saved,errors,buf,start,last_tg)
