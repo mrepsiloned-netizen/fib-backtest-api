@@ -40,13 +40,39 @@ BOS_TOTAL = (len(BOS_PAIRS)*len(BOS_TIMEFRAMES)*len(BOS_ENTRY_MODES)*
              len(BOS_PIVOT_NS)*len(BOS_RR_RATIOS)*len(BOS_FIB_LEVELS)*
              len(BOS_EMA_PAIRS)*len(BOS_ADX_MINS))
 
-# Candidate configs from corrected full-year sweep — stability check across periods
+# Top-5 candidate configs per pair (5 pairs × 5 = 25), from corrected full-year sweep.
+# Stability check across 3 periods finds which of the top-5 per pair is most consistent.
 BOS_LOCKED_CONFIGS = [
-    {"symbol":"ADA/USDT", "timeframe":"15m","pivot_n":8,"rr":2.0,"fib_level":0.382,"entry_mode":"reclaim",  "ema_pair":"off",    "adx_min":25},
-    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim",  "ema_pair":"off",    "adx_min":15},
-    {"symbol":"XLM/USDT", "timeframe":"15m","pivot_n":5,"rr":3.0,"fib_level":0.382,"entry_mode":"reclaim",  "ema_pair":"144/169","adx_min":15},
-    {"symbol":"TRX/USDT", "timeframe":"1h", "pivot_n":3,"rr":4.0,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"off",    "adx_min":15},
-    {"symbol":"XRP/USDT", "timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,  "entry_mode":"reclaim",  "ema_pair":"55/89",  "adx_min":25},
+    # ADA — top 5
+    {"symbol":"ADA/USDT","timeframe":"15m","pivot_n":8,"rr":2.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":25},
+    {"symbol":"ADA/USDT","timeframe":"15m","pivot_n":8,"rr":2.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"89/144","adx_min":25},
+    {"symbol":"ADA/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":25},
+    {"symbol":"ADA/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"89/144","adx_min":25},
+    {"symbol":"ADA/USDT","timeframe":"15m","pivot_n":8,"rr":2.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"off","adx_min":25},
+    # DOGE — top 5
+    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"34/55","adx_min":15},
+    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":15},
+    {"symbol":"DOGE/USDT","timeframe":"1h","pivot_n":8,"rr":3.0,"fib_level":0.5,"entry_mode":"rejection","ema_pair":"55/89","adx_min":0},
+    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"89/144","adx_min":15},
+    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"off","adx_min":15},
+    # XLM — top 5
+    {"symbol":"XLM/USDT","timeframe":"15m","pivot_n":5,"rr":4.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":25},
+    {"symbol":"XLM/USDT","timeframe":"15m","pivot_n":5,"rr":4.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"89/144","adx_min":25},
+    {"symbol":"XLM/USDT","timeframe":"15m","pivot_n":8,"rr":3.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":15},
+    {"symbol":"XLM/USDT","timeframe":"15m","pivot_n":8,"rr":3.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"89/144","adx_min":15},
+    {"symbol":"XLM/USDT","timeframe":"15m","pivot_n":5,"rr":3.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":25},
+    # TRX — top 5
+    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"55/89","adx_min":15},
+    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"89/144","adx_min":15},
+    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"144/169","adx_min":15},
+    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":4.0,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"off","adx_min":15},
+    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":3.0,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"off","adx_min":0},
+    # XRP — top 5
+    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"55/89","adx_min":25},
+    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":1.5,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"55/89","adx_min":25},
+    {"symbol":"XRP/USDT","timeframe":"1h","pivot_n":5,"rr":4.0,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"off","adx_min":15},
+    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":3.0,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"55/89","adx_min":25},
+    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"34/55","adx_min":25},
 ]
 
 # ── EMA CROSS VARIABLE SPACE ───────────────────────────────────
