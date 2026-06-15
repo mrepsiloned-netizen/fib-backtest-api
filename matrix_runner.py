@@ -134,6 +134,27 @@ BOS_WINNERS = [
 ]
 BOS_MONTHLY_TOTAL = len(BOS_WINNERS) * len(MONTHLY_PERIODS)
 
+# Runner-up configs (the other 4 of top-5) for the 3 weakest pairs from monthly check
+# (DOGE 56%, TRX 67%, XRP 61% profitable months) — see if any beats the current winner
+BOS_RUNNERUPS = [
+    # DOGE — remaining 4 (winner was 1h RR3.0 fib0.5 EMA55/89 ADX0 rejection)
+    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"34/55","adx_min":15},
+    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":15},
+    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"89/144","adx_min":15},
+    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"off","adx_min":15},
+    # TRX — remaining 4 (winner was 1h RR1.5 fib0.618 EMA55/89 ADX15 rejection)
+    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"89/144","adx_min":15},
+    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"144/169","adx_min":15},
+    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":4.0,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"off","adx_min":15},
+    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":3.0,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"off","adx_min":0},
+    # XRP — remaining 4 (winner was 1h RR4.0 fib0.618 off ADX15 reclaim)
+    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"55/89","adx_min":25},
+    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":1.5,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"55/89","adx_min":25},
+    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":3.0,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"55/89","adx_min":25},
+    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"34/55","adx_min":25},
+]
+BOS_RUNNERUP_MONTHLY_TOTAL = len(BOS_RUNNERUPS) * len(MONTHLY_PERIODS)
+
 RISK_PCT  = 0.02
 MIN_SWING = 0.002
 STOP_BUF  = 0.001
@@ -607,9 +628,11 @@ def run_bos_stability(grand_total, done, saved, errors, buf, start, last_tg):
 
 
 # ── PHASE: BOS MONTHLY CONSISTENCY CHECK (winning configs) ──────
-def run_bos_monthly(grand_total, done, saved, errors, buf, start, last_tg):
-    print("\n=== BOS Pullback — monthly consistency check (winning configs) ===")
-    for cfg in BOS_WINNERS:
+def run_bos_monthly(grand_total, done, saved, errors, buf, start, last_tg,
+                    configs=None, engine_name="bos_pullback_monthly"):
+    configs = configs if configs is not None else BOS_WINNERS
+    print(f"\n=== BOS Pullback — monthly consistency check ({engine_name}) ===")
+    for cfg in configs:
         symbol, tf = cfg["symbol"], cfg["timeframe"]
         ep=cfg.get("ema_pair","off")
         ax=cfg.get("adx_min",0)
@@ -640,9 +663,9 @@ def run_bos_monthly(grand_total, done, saved, errors, buf, start, last_tg):
                 s=None; errors+=1; print(f"  error: {e}")
 
             buf.append({
-                "combo_key":f"{symbol}|{tf}|bos_pullback_monthly|{cfg['entry_mode']}|{cfg['pivot_n']}|{cfg['rr']}|{cfg['fib_level']}|{ep}|{ax}|{month_label}",
+                "combo_key":f"{symbol}|{tf}|{engine_name}|{cfg['entry_mode']}|{cfg['pivot_n']}|{cfg['rr']}|{cfg['fib_level']}|{ep}|{ax}|{month_label}",
                 "pair":symbol.replace("/USDT",""),"timeframe":tf,
-                "engine":"bos_pullback_monthly","entry_mode":cfg["entry_mode"],
+                "engine":engine_name,"entry_mode":cfg["entry_mode"],
                 "pivot_n":cfg["pivot_n"],"rr":cfg["rr"],"fib_level":cfg["fib_level"],
                 "ema_pair":ep,"adx_min":ax,"filters":month_label,
                 "period_start":ps,"period_end":pe,
@@ -729,6 +752,7 @@ def main_compute(mode="ema"):
     if mode in ("bos","all"): engines_to_clear.append("bos_pullback")
     if mode in ("bos","bos_stability","all"): engines_to_clear.append("bos_pullback_live")
     if mode=="bos_monthly": engines_to_clear.append("bos_pullback_monthly")
+    if mode=="bos_monthly_runnerup": engines_to_clear.append("bos_pullback_monthly_runnerup")
 
     for eng in engines_to_clear:
         try:
@@ -741,11 +765,13 @@ def main_compute(mode="ema"):
     grand_total = (EMA_TOTAL if mode=="ema" else
                     BOS_STABILITY_TOTAL if mode=="bos_stability" else
                     BOS_MONTHLY_TOTAL if mode=="bos_monthly" else
+                    BOS_RUNNERUP_MONTHLY_TOTAL if mode=="bos_monthly_runnerup" else
                     bos_total if mode=="bos" else EMA_TOTAL+bos_total)
 
     engine_label = ("EMA Cross only" if mode=="ema" else
                     "BOS stability check only" if mode=="bos_stability" else
                     "BOS monthly consistency check" if mode=="bos_monthly" else
+                    "BOS monthly — runner-up configs (DOGE/TRX/XRP)" if mode=="bos_monthly_runnerup" else
                     "BOS Pullback + stability check" if mode=="bos" else
                     "BOS Pullback + EMA Cross")
     period_str = " / ".join(f"{lbl}({ps}→{pe})" for lbl,ps,pe in EMA_PERIODS) if mode in ("ema","all") else f"{PERIOD_START} → {PERIOD_END}"
@@ -754,6 +780,8 @@ def main_compute(mode="ema"):
         extra = "BOS sweep: " + format(BOS_TOTAL,",") + " | Live config stability: " + format(BOS_STABILITY_TOTAL,",") + " (×3 periods)"
     elif mode=="bos_monthly":
         extra = f"5 winning configs × {len(MONTHLY_PERIODS)} months ({MONTHLY_PERIODS[0][0]} → {MONTHLY_PERIODS[-1][0]})"
+    elif mode=="bos_monthly_runnerup":
+        extra = f"12 runner-up configs (DOGE/TRX/XRP ×4) × {len(MONTHLY_PERIODS)} months"
     tg(f"""🔢 <b>Matrix Runner v9 — {engine_label}</b>
 Total combos: {grand_total:,}
 {"EMA periods: " + period_str if mode in ("ema","all") else "Period: " + period_str}
@@ -766,6 +794,9 @@ Total combos: {grand_total:,}
         done,saved,errors,buf,last_tg = run_bos_stability(grand_total,done,saved,errors,buf,start,last_tg)
     if mode=="bos_monthly":
         done,saved,errors,buf,last_tg = run_bos_monthly(grand_total,done,saved,errors,buf,start,last_tg)
+    if mode=="bos_monthly_runnerup":
+        done,saved,errors,buf,last_tg = run_bos_monthly(grand_total,done,saved,errors,buf,start,last_tg,
+                                                          configs=BOS_RUNNERUPS, engine_name="bos_pullback_monthly_runnerup")
     if mode in ("bos","all"):
         done,saved,errors,buf,last_tg = run_bos(grand_total,done,saved,errors,buf,start,last_tg)
         done,saved,errors,buf,last_tg = run_bos_stability(grand_total,done,saved,errors,buf,start,last_tg)
