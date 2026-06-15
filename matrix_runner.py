@@ -40,13 +40,13 @@ BOS_TOTAL = (len(BOS_PAIRS)*len(BOS_TIMEFRAMES)*len(BOS_ENTRY_MODES)*
              len(BOS_PIVOT_NS)*len(BOS_RR_RATIOS)*len(BOS_FIB_LEVELS)*
              len(BOS_EMA_PAIRS)*len(BOS_ADX_MINS))
 
-# Currently-live paper trader configs — stability check across periods
+# Candidate configs from corrected full-year sweep — stability check across periods
 BOS_LOCKED_CONFIGS = [
-    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":3,"rr":1.5,"fib_level":0.5, "entry_mode":"reclaim"},
-    {"symbol":"XLM/USDT", "timeframe":"5m", "pivot_n":5,"rr":1.5,"fib_level":0.5, "entry_mode":"reclaim"},
-    {"symbol":"TRX/USDT", "timeframe":"1h", "pivot_n":3,"rr":2.0,"fib_level":0.5, "entry_mode":"reclaim"},
-    {"symbol":"ARB/USDT", "timeframe":"15m","pivot_n":5,"rr":1.5,"fib_level":0.5, "entry_mode":"rejection"},
-    {"symbol":"XRP/USDT", "timeframe":"1h", "pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim"},
+    {"symbol":"ADA/USDT", "timeframe":"15m","pivot_n":8,"rr":2.0,"fib_level":0.382,"entry_mode":"reclaim",  "ema_pair":"off",    "adx_min":25},
+    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim",  "ema_pair":"off",    "adx_min":15},
+    {"symbol":"XLM/USDT", "timeframe":"15m","pivot_n":5,"rr":3.0,"fib_level":0.382,"entry_mode":"reclaim",  "ema_pair":"144/169","adx_min":15},
+    {"symbol":"TRX/USDT", "timeframe":"1h", "pivot_n":3,"rr":4.0,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"off",    "adx_min":15},
+    {"symbol":"XRP/USDT", "timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,  "entry_mode":"reclaim",  "ema_pair":"55/89",  "adx_min":25},
 ]
 
 # ── EMA CROSS VARIABLE SPACE ───────────────────────────────────
@@ -508,18 +508,27 @@ def run_bos_stability(grand_total, done, saved, errors, buf, start, last_tg):
             O=np.array([r["open"]  for r in rows],dtype=float)
             n=len(rows); print(f"  {n} candles")
 
+            ep=cfg.get("ema_pair","off")
+            ax=cfg.get("adx_min",0)
+            use_ema=ep!="off"
+            ef=es=adx_v=None
+            if use_ema:
+                f,s_=map(int,ep.split("/")); ef,es=calc_ema(C,f),calc_ema(C,s_)
+            if ax>0:
+                adx_v=calc_adx(H,L,C,14)
+
             try:
                 s=backtest(H,L,C,O,n,cfg["pivot_n"],cfg["rr"],cfg["fib_level"],
-                           cfg["entry_mode"],None,None,False,None,0.0)
+                           cfg["entry_mode"],ef,es,use_ema,adx_v,float(ax))
             except Exception as e:
                 s=None; errors+=1; print(f"  error: {e}")
 
             buf.append({
-                "combo_key":f"{symbol}|{tf}|bos_pullback_live|{cfg['entry_mode']}|{cfg['pivot_n']}|{cfg['rr']}|{cfg['fib_level']}|off|0|{period_label}",
+                "combo_key":f"{symbol}|{tf}|bos_pullback_live|{cfg['entry_mode']}|{cfg['pivot_n']}|{cfg['rr']}|{cfg['fib_level']}|{ep}|{ax}|{period_label}",
                 "pair":symbol.replace("/USDT",""),"timeframe":tf,
                 "engine":"bos_pullback_live","entry_mode":cfg["entry_mode"],
                 "pivot_n":cfg["pivot_n"],"rr":cfg["rr"],"fib_level":cfg["fib_level"],
-                "ema_pair":"off","adx_min":0,"filters":period_label,
+                "ema_pair":ep,"adx_min":ax,"filters":period_label,
                 "period_start":ps,"period_end":pe,
                 "success":s is not None,
                 "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
@@ -602,7 +611,7 @@ def main_compute(mode="ema"):
     engines_to_clear = []
     if mode in ("ema","all"): engines_to_clear.append("ema_cross")
     if mode in ("bos","all"): engines_to_clear.append("bos_pullback")
-    if mode in ("bos","all"): engines_to_clear.append("bos_pullback_live")
+    if mode in ("bos","bos_stability","all"): engines_to_clear.append("bos_pullback_live")
 
     for eng in engines_to_clear:
         try:
@@ -612,9 +621,12 @@ def main_compute(mode="ema"):
         except: pass
 
     bos_total = BOS_TOTAL + BOS_STABILITY_TOTAL
-    grand_total = (EMA_TOTAL if mode=="ema" else bos_total if mode=="bos" else EMA_TOTAL+bos_total)
+    grand_total = (EMA_TOTAL if mode=="ema" else
+                    BOS_STABILITY_TOTAL if mode=="bos_stability" else
+                    bos_total if mode=="bos" else EMA_TOTAL+bos_total)
 
     engine_label = ("EMA Cross only" if mode=="ema" else
+                    "BOS stability check only" if mode=="bos_stability" else
                     "BOS Pullback + stability check" if mode=="bos" else
                     "BOS Pullback + EMA Cross")
     period_str = " / ".join(f"{lbl}({ps}→{pe})" for lbl,ps,pe in EMA_PERIODS) if mode in ("ema","all") else f"{PERIOD_START} → {PERIOD_END}"
@@ -626,6 +638,8 @@ Total combos: {grand_total:,}
     saved=0; errors=0; done=0
     start=time.time(); last_tg=time.time(); buf=[]
 
+    if mode=="bos_stability":
+        done,saved,errors,buf,last_tg = run_bos_stability(grand_total,done,saved,errors,buf,start,last_tg)
     if mode in ("bos","all"):
         done,saved,errors,buf,last_tg = run_bos(grand_total,done,saved,errors,buf,start,last_tg)
         done,saved,errors,buf,last_tg = run_bos_stability(grand_total,done,saved,errors,buf,start,last_tg)
