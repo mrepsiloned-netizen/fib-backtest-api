@@ -9,7 +9,7 @@
 #   prefetch  → fetch candles
 # ============================================================
 
-import os, time, httpx, itertools, io, csv as csv_mod
+import os, time, httpx, itertools, io, csv as csv_mod, math, statistics
 import numpy as np
 from datetime import datetime, timezone, timedelta
 
@@ -728,7 +728,6 @@ def backtest_divergence(H, L, C, O, n, rr, tf,
     avg_win=gross_win/wins if wins>0 else 0
     avg_loss=gross_loss/losses if losses>0 else 0
     if len(pnl_series)>1:
-        import statistics
         mu=statistics.mean(pnl_series); sd=statistics.stdev(pnl_series)
         sharpe_=(mu/sd)*math.sqrt(252) if sd>0 else 0
     else: sharpe_=0
