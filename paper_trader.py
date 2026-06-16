@@ -1,5 +1,5 @@
 # ============================================================
-# WADDLE PAPER TRADER v10
+# WADDLE PAPER TRADER v11
 # Dual Engine: BOS Pullback + EMA Cross
 #   BOS Pullback — Pine Script P1-P2-P3 v6.5
 #     5 pairs: DOGE/15m, XLM/5m, TRX/1h, ARB/15m, XRP/1h
@@ -55,12 +55,16 @@ BOS_WATCHLIST = [
     {"symbol":"XRP/USDT", "timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,  "entry_mode":"reclaim",  "ema_pair":"55/89", "adx_min":25,"label":"XRP 15m BOS", "engine":"bos_pullback"},
 ]
 
-# EMA Cross — locked from stability sweep (2025 full / 2026 YTD / L30D all profitable)
-# UNCHANGED — do not modify, already running and validated.
+# EMA Cross — final 2 configs, from full 3-stage validation:
+#   Stage 1: full sweep → top-5 per pair
+#   Stage 2: 3-period stability (2025/2026YTD/L30D)
+#   Stage 3: 18-month consistency — ARB 72%, XLM 61% profitable months
+# TRX dropped (4 zero-trade months, only 34 trades/18mo)
+# XRP dropped (44% profitable months — worse than coin flip)
+# DOGE dropped (all configs failed 2026 YTD — regime change)
 EMA_WATCHLIST = [
-    {"symbol":"ARB/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":False,"use_gap":True, "use_htf":False,"label":"ARB 5m EMA12/26 gap","engine":"ema_cross"},
-    {"symbol":"XLM/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":21,"rr":2.0,"use_vol":False,"use_gap":True, "use_htf":False,"label":"XLM 5m EMA12/21 gap","engine":"ema_cross"},
-    {"symbol":"TRX/USDT","timeframe":"15m","ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":True, "use_gap":False,"use_htf":True, "label":"TRX 15m EMA12/26 vol+htf","engine":"ema_cross"},
+    {"symbol":"ARB/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":True, "use_gap":True,"use_htf":False,"label":"ARB 5m EMA12/26 vol+gap","engine":"ema_cross"},
+    {"symbol":"XLM/USDT","timeframe":"15m","ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":False,"use_gap":True,"use_htf":True, "label":"XLM 15m EMA12/26 gap+htf","engine":"ema_cross"},
 ]
 
 ALL_WATCHLIST = BOS_WATCHLIST + EMA_WATCHLIST
@@ -182,7 +186,7 @@ def send_entry_bos(w, signal, acc):
 <b>Stats:</b> {acc['total_trades']} trades · {acc['wins']}W {acc['losses']}L · {wr}% WR
 <b>Total return:</b> {'+' if total_ret>=0 else ''}{total_ret}%
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-📊 Paper trade v10""")
+📊 Paper trade v11""")
 
 def send_entry_ema(w, signal, acc):
     balance  = acc["balance"]
@@ -212,7 +216,7 @@ def send_entry_ema(w, signal, acc):
 <b>Stats:</b> {acc['total_trades']} trades · {acc['wins']}W {acc['losses']}L · {wr}% WR
 <b>Total return:</b> {'+' if total_ret>=0 else ''}{total_ret}%
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-📊 Paper trade v10""")
+📊 Paper trade v11""")
 
 def send_exit(w, signal, exit_price, won, pnl, acc):
     emoji    = "✅" if won else "❌"
@@ -240,7 +244,7 @@ def send_exit(w, signal, exit_price, won, pnl, acc):
 
 <b>All time:</b> {acc['total_trades']} trades · {acc['wins']}W {acc['losses']}L · {wr}% WR
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-📊 Paper trade v10""")
+📊 Paper trade v11""")
 
 def send_daily_summary(open_signals):
     try:
@@ -550,7 +554,7 @@ def detect_signal_ema_cross(candles, ema_fast, ema_slow, rr,
 
 # ── MAIN LOOP ─────────────────────────────────────────────────
 def run():
-    print("🤖 Waddle Paper Trader v10 — Dual Engine starting...")
+    print("🤖 Waddle Paper Trader v11 — Dual Engine starting...")
     acc = init_account()
     bos_str = "\n".join([f"• {w['label']}: {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R {w['entry_mode']} fib={w['fib_level']}"
                           + (f" EMA{w['ema_pair']}" if w.get('ema_pair','off')!='off' else "")
@@ -559,7 +563,7 @@ def run():
     ema_str = "\n".join([f"• {w['label']}: {w['symbol']} {w['timeframe'].upper()} EMA{w['ema_fast']}/{w['ema_slow']} {w['rr']}R "
                           f"[{'+'.join(f for f,v in [('vol',w['use_vol']),('gap',w['use_gap']),('htf',w['use_htf'])] if v) or 'none'}]"
                           for w in EMA_WATCHLIST])
-    tg(f"""🤖 <b>Waddle Paper Trader v10 LIVE</b>
+    tg(f"""🤖 <b>Waddle Paper Trader v11 LIVE</b>
 <b>Dual Engine:</b> BOS Pullback (5 configs, 1 per pair — 18mo validated) + EMA Cross (3 configs)
 
 <b>Account:</b> ${acc['balance']:.2f}
