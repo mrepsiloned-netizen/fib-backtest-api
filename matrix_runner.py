@@ -204,6 +204,20 @@ EMA_WINNERS = [
 ]
 EMA_MONTHLY_TOTAL = len(EMA_WINNERS) * len(MONTHLY_PERIODS)
 
+# ── RSI DIVERGENCE VARIABLE SPACE ──────────────────────────────
+DIV_PAIRS       = ["DOGE/USDT","XLM/USDT","XRP/USDT","ADA/USDT","TRX/USDT","ARB/USDT"]
+DIV_TIMEFRAMES  = ["15m","1h","4h"]
+DIV_RSI_PERIODS = [10, 14]
+DIV_RSI_THRESH  = [30, 40]      # RSI must be below this (long) / above 100-this (short)
+DIV_PIVOT_NS    = [3, 5]        # fractal lookback each side
+DIV_LOOKBACKS   = [30, 60]      # candles to search for second pivot
+DIV_MACD_CONF   = [False, True] # require MACD histogram divergence too
+DIV_ADX_MAXS    = [0, 20]       # 0=off, 20=only fire when NOT strongly trending
+DIV_RR_RATIOS   = [1.5, 2.0, 3.0]
+DIV_TOTAL = (len(DIV_PAIRS)*len(DIV_TIMEFRAMES)*len(DIV_RSI_PERIODS)*
+             len(DIV_RSI_THRESH)*len(DIV_PIVOT_NS)*len(DIV_LOOKBACKS)*
+             len(DIV_MACD_CONF)*len(DIV_ADX_MAXS)*len(DIV_RR_RATIOS))
+
 RISK_PCT  = 0.02
 MIN_SWING = 0.002
 STOP_BUF  = 0.001
@@ -275,6 +289,20 @@ def calc_adx(H,L,C,period):
     if s2<n: adx_[s2]=sum(dx[period+1:s2+1])/period
     for i in range(s2+1,n): adx_[i]=(adx_[i-1]*(period-1)+dx[i])/period
     return adx_
+
+def calc_rsi(C, period=14):
+    n=len(C); rsi=np.full(n,50.0)
+    g=np.zeros(n); l_=np.zeros(n)
+    for i in range(1,n):
+        d=C[i]-C[i-1]; g[i]=max(d,0); l_[i]=max(-d,0)
+    ag=al=0.0
+    for i in range(1,period+1): ag+=g[i]; al+=l_[i]
+    ag/=period; al/=period
+    rsi[period]=100 if al==0 else 100-100/(1+ag/al)
+    for i in range(period+1,n):
+        ag=(ag*(period-1)+g[i])/period; al=(al*(period-1)+l_[i])/period
+        rsi[i]=100 if al==0 else 100-100/(1+ag/al)
+    return rsi
 
 # ── BACKTEST — Pine Script P1-P2-P3 v6.5 ──────────────────────
 def backtest(H, L, C, O, n, N, rr, fib_level, entry_mode,
@@ -562,6 +590,157 @@ def backtest_ema(H, L, C, O, V, n, rr,
     }
 
 
+# ── DIVERGENCE BACKTEST ENGINE ─────────────────────────────────
+def calc_macd_histogram(C, fast=12, slow=26, signal=9):
+    ef=calc_ema(C,fast); es=calc_ema(C,slow)
+    macd=ef-es; sig=calc_ema(macd,signal)
+    return macd-sig  # histogram
+
+def backtest_divergence(H, L, C, O, n, rr, tf,
+                        rsi_period, rsi_thresh, pivot_n, lookback,
+                        use_macd_conf, adx_max):
+    """
+    RSI Divergence Engine:
+    - Bullish: price makes lower low, RSI makes higher low, RSI < rsi_thresh → long
+    - Bearish: price makes higher high, RSI makes lower high, RSI > (100-rsi_thresh) → short
+    - Optional: require MACD histogram divergence to match (double divergence filter)
+    - Optional: ADX < adx_max to avoid trading in strong trends (0=off)
+    - SL: swing low/high × buffer
+    - TP: fixed RR
+    """
+    rsi_v  = calc_rsi(C, rsi_period)
+    hist   = calc_macd_histogram(C) if use_macd_conf else None
+    adx_v  = calc_adx(H,L,C,14) if adx_max>0 else None
+
+    balance=1000.0; peak=1000.0
+    wins=losses=trades=0
+    gross_win=gross_loss=total_fees=0.0
+    pnl_series=[]
+    in_trade=False; direction=None
+    ep=sl=tp=0.0
+
+    STOP_BUF=0.001
+    FEE_ENTRY=0.0002; FEE_TP=0.0002; FEE_SL=0.00055
+
+    # Pre-identify pivot lows and highs (confirmed N bars either side)
+    def is_pivot_low(i):
+        return (i>=pivot_n and i<n-pivot_n and
+                all(L[i]<=L[i-j] for j in range(1,pivot_n+1)) and
+                all(L[i]<=L[i+j] for j in range(1,pivot_n+1)))
+    def is_pivot_high(i):
+        return (i>=pivot_n and i<n-pivot_n and
+                all(H[i]>=H[i-j] for j in range(1,pivot_n+1)) and
+                all(H[i]>=H[i+j] for j in range(1,pivot_n+1)))
+
+    pivot_lows  = [i for i in range(pivot_n, n-pivot_n) if is_pivot_low(i)]
+    pivot_highs = [i for i in range(pivot_n, n-pivot_n) if is_pivot_high(i)]
+
+    start_i = max(pivot_n*2+lookback, rsi_period*2+1)
+
+    for ci in range(start_i, n-1):
+        # Exit check
+        if in_trade:
+            hi_c=H[ci]; lo_c=L[ci]
+            if direction=="long":
+                if lo_c<=sl:
+                    pnl=balance*RISK_PCT*(sl/ep-1)-balance*RISK_PCT*FEE_SL
+                    balance+=pnl; losses+=1; gross_loss+=abs(pnl)
+                    total_fees+=balance*RISK_PCT*FEE_SL
+                    pnl_series.append(pnl); in_trade=False
+                elif hi_c>=tp:
+                    pnl=balance*RISK_PCT*(tp/ep-1)-balance*RISK_PCT*FEE_TP
+                    balance+=pnl; wins+=1; gross_win+=pnl
+                    total_fees+=balance*RISK_PCT*FEE_TP
+                    pnl_series.append(pnl); in_trade=False
+            else:
+                if hi_c>=sl:
+                    pnl=balance*RISK_PCT*(ep/sl-1)-balance*RISK_PCT*FEE_SL
+                    balance+=pnl; losses+=1; gross_loss+=abs(pnl)
+                    total_fees+=balance*RISK_PCT*FEE_SL
+                    pnl_series.append(pnl); in_trade=False
+                elif lo_c<=tp:
+                    pnl=balance*RISK_PCT*(ep/tp-1)-balance*RISK_PCT*FEE_TP
+                    balance+=pnl; wins+=1; gross_win+=pnl
+                    total_fees+=balance*RISK_PCT*FEE_TP
+                    pnl_series.append(pnl); in_trade=False
+            if balance>peak: peak=balance
+            if in_trade: continue
+
+        if in_trade: continue
+
+        # ADX filter — only fire in low-trend regime
+        if adx_max>0 and adx_v is not None and adx_v[ci]>adx_max:
+            continue
+
+        # Find recent pivot lows within lookback for bullish divergence
+        recent_lows=[i for i in pivot_lows if ci-lookback<=i<ci-pivot_n]
+        if len(recent_lows)>=2:
+            p2=recent_lows[-1]; p1=recent_lows[-2]  # p2=newer, p1=older
+            # Bullish: price lower low, RSI higher low, RSI oversold
+            if (L[p2]<L[p1] and rsi_v[p2]>rsi_v[p1] and rsi_v[ci]<rsi_thresh):
+                # Optional MACD histogram confirmation
+                macd_ok=True
+                if use_macd_conf and hist is not None:
+                    macd_ok=(hist[p2]>hist[p1])  # histogram also diverging
+                if macd_ok:
+                    entry_p=float(O[ci+1]) if ci+1<n else float(C[ci])
+                    sl_p=float(L[p2])*(1-STOP_BUF)
+                    rpp=abs(entry_p-sl_p)
+                    if rpp>0 and entry_p>sl_p:
+                        tp_p=entry_p+rpp*rr
+                        ep=entry_p; sl=sl_p; tp=tp_p
+                        fee=balance*RISK_PCT*FEE_ENTRY
+                        balance-=fee; total_fees+=fee
+                        in_trade=True; direction="long"; trades+=1
+                        continue
+
+        # Find recent pivot highs within lookback for bearish divergence
+        recent_highs=[i for i in pivot_highs if ci-lookback<=i<ci-pivot_n]
+        if len(recent_highs)>=2:
+            p2=recent_highs[-1]; p1=recent_highs[-2]
+            # Bearish: price higher high, RSI lower high, RSI overbought
+            if (H[p2]>H[p1] and rsi_v[p2]<rsi_v[p1] and rsi_v[ci]>(100-rsi_thresh)):
+                macd_ok=True
+                if use_macd_conf and hist is not None:
+                    macd_ok=(hist[p2]<hist[p1])
+                if macd_ok:
+                    entry_p=float(O[ci+1]) if ci+1<n else float(C[ci])
+                    sl_p=float(H[p2])*(1+STOP_BUF)
+                    rpp=abs(sl_p-entry_p)
+                    if rpp>0 and entry_p<sl_p:
+                        tp_p=entry_p-rpp*rr
+                        ep=entry_p; sl=sl_p; tp=tp_p
+                        fee=balance*RISK_PCT*FEE_ENTRY
+                        balance-=fee; total_fees+=fee
+                        in_trade=True; direction="short"; trades+=1
+
+    if trades==0: return None
+    total=wins+losses
+    wr=wins/total*100 if total>0 else 0
+    ret=(balance-1000)/1000*100
+    TF_MINS={"1m":1,"5m":5,"15m":15,"1h":60,"4h":240}
+    days=(n*TF_MINS.get(tf,60))/1440
+    cagr_=((balance/1000)**(365/days)-1)*100 if days>0 else 0
+    dd=0.0; pk=1000.0
+    for p in pnl_series:
+        pk=max(pk,pk+p); dd=max(dd,(pk-(pk+p))/pk*100 if pk>0 else 0)
+    pf=gross_win/gross_loss if gross_loss>0 else 999
+    avg_win=gross_win/wins if wins>0 else 0
+    avg_loss=gross_loss/losses if losses>0 else 0
+    if len(pnl_series)>1:
+        import statistics
+        mu=statistics.mean(pnl_series); sd=statistics.stdev(pnl_series)
+        sharpe_=(mu/sd)*math.sqrt(252) if sd>0 else 0
+    else: sharpe_=0
+    kf=(wr/100-(1-wr/100)/rr)*100 if rr>0 else 0
+    return {"return_pct":round(ret,4),"cagr":round(cagr_,4),
+            "max_dd":round(dd,4),"sharpe":round(sharpe_,4),
+            "pf":round(pf,4),"wr":round(wr,4),
+            "trades":trades,"wins":wins,"losses":losses,
+            "avg_win":round(avg_win,4),"avg_loss":round(avg_loss,4),
+            "total_fees":round(total_fees,4),"kelly":round(kf,3)}
+
+
 # ── PHASE: BOS PULLBACK ────────────────────────────────────────
 def run_bos(grand_total, done, saved, errors, buf, start, last_tg):
     print("\n=== BOS Pullback ===")
@@ -836,7 +1015,64 @@ def run_ema_monthly(grand_total, done, saved, errors, buf, start, last_tg):
     return done, saved, errors, buf, last_tg
 
 
-# ── PHASE: EMA CROSS FULL SWEEP ────────────────────────────────
+# ── PHASE: RSI DIVERGENCE FULL SWEEP ──────────────────────────
+def run_divergence(grand_total, done, saved, errors, buf, start, last_tg):
+    print("\n=== RSI Divergence sweep ===")
+    for symbol, tf in itertools.product(DIV_PAIRS, DIV_TIMEFRAMES):
+        print(f"\nLoading {symbol} {tf}...")
+        set_status("compute","running",done,grand_total,f"DIV {symbol} {tf}")
+        rows=get_candles(symbol,tf)
+        if not rows: print("  No candles — skip"); continue
+
+        H=np.array([r["high"]  for r in rows],dtype=float)
+        L=np.array([r["low"]   for r in rows],dtype=float)
+        C=np.array([r["close"] for r in rows],dtype=float)
+        O=np.array([r["open"]  for r in rows],dtype=float)
+        n=len(rows); print(f"  {n} candles")
+
+        for rsi_p,rsi_th,piv_n,lb,macd_c,adx_mx,rr in itertools.product(
+            DIV_RSI_PERIODS,DIV_RSI_THRESH,DIV_PIVOT_NS,
+            DIV_LOOKBACKS,DIV_MACD_CONF,DIV_ADX_MAXS,DIV_RR_RATIOS
+        ):
+            filters="+".join(f for f,v in [("macd",macd_c),("adxmax",adx_mx>0)] if v) or "none"
+            label=f"rsi{rsi_p}_th{rsi_th}_n{piv_n}_lb{lb}_{filters}"
+            try:
+                s=backtest_divergence(H,L,C,O,n,rr,tf,
+                                      rsi_p,rsi_th,piv_n,lb,macd_c,adx_mx)
+            except Exception as e:
+                s=None; errors+=1; print(f"  DIV error: {e}")
+
+            buf.append({
+                "combo_key":f"{symbol}|{tf}|rsi_divergence|div|{rsi_p}/{rsi_th}|{rr}|{piv_n}|{label}",
+                "pair":symbol.replace("/USDT",""),"timeframe":tf,
+                "engine":"rsi_divergence","entry_mode":"div",
+                "pivot_n":piv_n,"rr":rr,"fib_level":0,
+                "ema_pair":f"rsi{rsi_p}","adx_min":adx_mx,"filters":label,
+                "period_start":PERIOD_START,"period_end":PERIOD_END,
+                "success":s is not None,
+                "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
+                "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
+                "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
+                "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
+                "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
+                "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
+                "computed_at":datetime.now(timezone.utc).isoformat(),
+            })
+            if s: saved+=1
+            done+=1
+            if len(buf)>=500: save_rows(buf); buf=[]
+            if time.time()-last_tg>600:
+                el=time.time()-start; rate=done/el if el>0 else 0; eta=(grand_total-done)/rate if rate>0 else 0
+                tg(f"⏳ DIV Phase\nDone: {done:,}/{grand_total:,} ({done/grand_total*100:.1f}%)\nETA: {eta/60:.0f}min\n{symbol} {tf}")
+                set_status("compute","running",done,grand_total,f"DIV {symbol} {tf}")
+                last_tg=time.time()
+
+        if buf: save_rows(buf); buf=[]
+        print(f"  Done {symbol} {tf} — {saved:,} saved so far")
+    return done, saved, errors, buf, last_tg
+
+
+
 def run_ema(grand_total, done, saved, errors, buf, start, last_tg):
     print("\n=== EMA Cross (stability sweep across periods) ===")
     for period_label, ps, pe in EMA_PERIODS:
@@ -905,6 +1141,7 @@ def main_compute(mode="ema"):
     if mode=="bos_monthly_runnerup": engines_to_clear.append("bos_pullback_monthly_runnerup")
     if mode=="ema_stability": engines_to_clear.append("ema_cross_live")
     if mode=="ema_monthly": engines_to_clear.append("ema_cross_monthly")
+    if mode in ("div","all"): engines_to_clear.append("rsi_divergence")
 
     for eng in engines_to_clear:
         try:
@@ -920,6 +1157,7 @@ def main_compute(mode="ema"):
                     BOS_RUNNERUP_MONTHLY_TOTAL if mode=="bos_monthly_runnerup" else
                     EMA_STABILITY_TOTAL if mode=="ema_stability" else
                     EMA_MONTHLY_TOTAL if mode=="ema_monthly" else
+                    DIV_TOTAL if mode=="div" else
                     bos_total if mode=="bos" else EMA_TOTAL+bos_total)
 
     engine_label = ("EMA Cross only" if mode=="ema" else
@@ -928,6 +1166,7 @@ def main_compute(mode="ema"):
                     "BOS monthly — runner-up configs (DOGE/TRX/XRP)" if mode=="bos_monthly_runnerup" else
                     "EMA Cross stability check (top-5-per-pair)" if mode=="ema_stability" else
                     "EMA Cross monthly consistency check" if mode=="ema_monthly" else
+                    "RSI Divergence sweep" if mode=="div" else
                     "BOS Pullback + stability check" if mode=="bos" else
                     "BOS Pullback + EMA Cross")
     period_str = " / ".join(f"{lbl}({ps}→{pe})" for lbl,ps,pe in EMA_PERIODS) if mode in ("ema","all","ema_stability") else f"{PERIOD_START} → {PERIOD_END}"
@@ -942,6 +1181,8 @@ def main_compute(mode="ema"):
         extra = f"25 candidates (5 pairs × top-5, incl. DOGE/XRP) × {len(EMA_PERIODS)} periods"
     elif mode=="ema_monthly":
         extra = f"4 winning configs (ARB/XLM/TRX/XRP) × {len(MONTHLY_PERIODS)} months"
+    elif mode=="div":
+        extra = f"{DIV_TOTAL:,} combos — RSI divergence, 6 pairs × 3 TFs × variable space"
     tg(f"""🔢 <b>Matrix Runner v9 — {engine_label}</b>
 Total combos: {grand_total:,}
 {"EMA periods: " + period_str if mode in ("ema","all","ema_stability") else "Period: " + period_str}
@@ -961,6 +1202,8 @@ Total combos: {grand_total:,}
         done,saved,errors,buf,last_tg = run_ema_stability(grand_total,done,saved,errors,buf,start,last_tg)
     if mode=="ema_monthly":
         done,saved,errors,buf,last_tg = run_ema_monthly(grand_total,done,saved,errors,buf,start,last_tg)
+    if mode in ("div","all"):
+        done,saved,errors,buf,last_tg = run_divergence(grand_total,done,saved,errors,buf,start,last_tg)
     if mode in ("bos","all"):
         done,saved,errors,buf,last_tg = run_bos(grand_total,done,saved,errors,buf,start,last_tg)
         done,saved,errors,buf,last_tg = run_bos_stability(grand_total,done,saved,errors,buf,start,last_tg)
