@@ -195,6 +195,15 @@ EMA_LOCKED_CONFIGS = [
 ]
 EMA_STABILITY_TOTAL = len(EMA_LOCKED_CONFIGS) * len(EMA_PERIODS)
 
+# Stage 3 — EMA Cross monthly consistency check (winners from stage 2)
+EMA_WINNERS = [
+    {"symbol":"ARB/USDT", "timeframe":"5m", "ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":True, "use_gap":True, "use_htf":False},
+    {"symbol":"XLM/USDT", "timeframe":"15m","ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":False,"use_gap":True, "use_htf":True},
+    {"symbol":"TRX/USDT", "timeframe":"15m","ema_fast":9, "ema_slow":26,"rr":1.5,"use_vol":True, "use_gap":True, "use_htf":True},
+    {"symbol":"XRP/USDT", "timeframe":"5m", "ema_fast":9, "ema_slow":21,"rr":2.0,"use_vol":True, "use_gap":True, "use_htf":True},
+]
+EMA_MONTHLY_TOTAL = len(EMA_WINNERS) * len(MONTHLY_PERIODS)
+
 RISK_PCT  = 0.02
 MIN_SWING = 0.002
 STOP_BUF  = 0.001
@@ -777,6 +786,58 @@ def run_ema_stability(grand_total, done, saved, errors, buf, start, last_tg):
 
 
 
+# ── PHASE: EMA CROSS MONTHLY CONSISTENCY CHECK ─────────────────
+def run_ema_monthly(grand_total, done, saved, errors, buf, start, last_tg):
+    print("\n=== EMA Cross — monthly consistency check (winning configs) ===")
+    for cfg in EMA_WINNERS:
+        symbol, tf = cfg["symbol"], cfg["timeframe"]
+        filters="+".join(f for f,v in [("vol",cfg["use_vol"]),("gap",cfg["use_gap"]),("htf",cfg["use_htf"])] if v) or "none"
+
+        for month_label, ps, pe in MONTHLY_PERIODS:
+            print(f"\n{symbol} {tf} EMA{cfg['ema_fast']}/{cfg['ema_slow']} [{month_label}]...")
+            set_status("compute","running",done,grand_total,f"EMA-monthly {symbol} {tf} {month_label}")
+            rows=get_candles(symbol,tf,ps,pe)
+            if not rows: print("  No candles — skip"); done+=1; continue
+
+            H=np.array([r["high"]  for r in rows],dtype=float)
+            L=np.array([r["low"]   for r in rows],dtype=float)
+            C=np.array([r["close"] for r in rows],dtype=float)
+            O=np.array([r["open"]  for r in rows],dtype=float)
+            V=np.array([r.get("volume",0) for r in rows],dtype=float)
+            n=len(rows)
+
+            try:
+                s=backtest_ema(H,L,C,O,V,n,cfg["rr"],cfg["ema_fast"],cfg["ema_slow"],
+                               cfg["use_vol"],cfg["use_gap"],cfg["use_htf"])
+            except Exception as e:
+                s=None; errors+=1; print(f"  error: {e}")
+
+            buf.append({
+                "combo_key":f"{symbol}|{tf}|ema_cross_monthly|cross|{cfg['ema_fast']}/{cfg['ema_slow']}|{cfg['rr']}|0|{filters}|{month_label}",
+                "pair":symbol.replace("/USDT",""),"timeframe":tf,
+                "engine":"ema_cross_monthly","entry_mode":"cross",
+                "pivot_n":0,"rr":cfg["rr"],"fib_level":0,
+                "ema_pair":f"{cfg['ema_fast']}/{cfg['ema_slow']}","adx_min":0,"filters":month_label,
+                "period_start":ps,"period_end":pe,
+                "success":s is not None,
+                "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
+                "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
+                "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
+                "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
+                "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
+                "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
+                "computed_at":datetime.now(timezone.utc).isoformat(),
+            })
+            if s: saved+=1
+            done+=1
+            set_status("compute","running",done,grand_total,f"EMA-monthly {symbol} {tf} {month_label}")
+
+    if buf: save_rows(buf); buf=[]
+    return done, saved, errors, buf, last_tg
+
+
+# ── PHASE: EMA CROSS FULL SWEEP ────────────────────────────────
+def run_ema(grand_total, done, saved, errors, buf, start, last_tg):
     print("\n=== EMA Cross (stability sweep across periods) ===")
     for period_label, ps, pe in EMA_PERIODS:
         print(f"\n--- PERIOD: {period_label} ({ps} → {pe}) ---")
@@ -843,6 +904,7 @@ def main_compute(mode="ema"):
     if mode=="bos_monthly": engines_to_clear.append("bos_pullback_monthly")
     if mode=="bos_monthly_runnerup": engines_to_clear.append("bos_pullback_monthly_runnerup")
     if mode=="ema_stability": engines_to_clear.append("ema_cross_live")
+    if mode=="ema_monthly": engines_to_clear.append("ema_cross_monthly")
 
     for eng in engines_to_clear:
         try:
@@ -857,6 +919,7 @@ def main_compute(mode="ema"):
                     BOS_MONTHLY_TOTAL if mode=="bos_monthly" else
                     BOS_RUNNERUP_MONTHLY_TOTAL if mode=="bos_monthly_runnerup" else
                     EMA_STABILITY_TOTAL if mode=="ema_stability" else
+                    EMA_MONTHLY_TOTAL if mode=="ema_monthly" else
                     bos_total if mode=="bos" else EMA_TOTAL+bos_total)
 
     engine_label = ("EMA Cross only" if mode=="ema" else
@@ -864,6 +927,7 @@ def main_compute(mode="ema"):
                     "BOS monthly consistency check" if mode=="bos_monthly" else
                     "BOS monthly — runner-up configs (DOGE/TRX/XRP)" if mode=="bos_monthly_runnerup" else
                     "EMA Cross stability check (top-5-per-pair)" if mode=="ema_stability" else
+                    "EMA Cross monthly consistency check" if mode=="ema_monthly" else
                     "BOS Pullback + stability check" if mode=="bos" else
                     "BOS Pullback + EMA Cross")
     period_str = " / ".join(f"{lbl}({ps}→{pe})" for lbl,ps,pe in EMA_PERIODS) if mode in ("ema","all","ema_stability") else f"{PERIOD_START} → {PERIOD_END}"
@@ -876,6 +940,8 @@ def main_compute(mode="ema"):
         extra = f"12 runner-up configs (DOGE/TRX/XRP ×4) × {len(MONTHLY_PERIODS)} months"
     elif mode=="ema_stability":
         extra = f"25 candidates (5 pairs × top-5, incl. DOGE/XRP) × {len(EMA_PERIODS)} periods"
+    elif mode=="ema_monthly":
+        extra = f"4 winning configs (ARB/XLM/TRX/XRP) × {len(MONTHLY_PERIODS)} months"
     tg(f"""🔢 <b>Matrix Runner v9 — {engine_label}</b>
 Total combos: {grand_total:,}
 {"EMA periods: " + period_str if mode in ("ema","all","ema_stability") else "Period: " + period_str}
@@ -893,6 +959,8 @@ Total combos: {grand_total:,}
                                                           configs=BOS_RUNNERUPS, engine_name="bos_pullback_monthly_runnerup")
     if mode=="ema_stability":
         done,saved,errors,buf,last_tg = run_ema_stability(grand_total,done,saved,errors,buf,start,last_tg)
+    if mode=="ema_monthly":
+        done,saved,errors,buf,last_tg = run_ema_monthly(grand_total,done,saved,errors,buf,start,last_tg)
     if mode in ("bos","all"):
         done,saved,errors,buf,last_tg = run_bos(grand_total,done,saved,errors,buf,start,last_tg)
         done,saved,errors,buf,last_tg = run_bos_stability(grand_total,done,saved,errors,buf,start,last_tg)
