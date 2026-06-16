@@ -1226,8 +1226,8 @@ def main_prefetch():
     ex=ccxt.kucoin({"enableRateLimit":True})
     tg("📥 <b>Prefetch Started — all TFs including 1m</b>")
     sh={**HEADERS,"Prefer":"return=minimal,resolution=ignore-duplicates"}
-    all_pairs=list(set(BOS_PAIRS)|set(EMA_PAIRS_LIST))
-    all_tfs  =list(set(BOS_TIMEFRAMES)|set(EMA_TIMEFRAMES))
+    all_pairs=list(set(BOS_PAIRS)|set(EMA_PAIRS_LIST)|set(DIV_PAIRS))
+    all_tfs  =list(set(BOS_TIMEFRAMES)|set(EMA_TIMEFRAMES)|set(DIV_TIMEFRAMES))
     s_ms=int(datetime.strptime(PERIOD_START,"%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
     e_ms=int(datetime.now(timezone.utc).timestamp()*1000)  # up to now, covers 2026 YTD + L30D
     for sym,tf in itertools.product(all_pairs,all_tfs):
