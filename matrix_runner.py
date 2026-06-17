@@ -660,7 +660,7 @@ def backtest_divergence(H, L, C, O, n, rr, tf,
     gross_win=gross_loss=total_fees=0.0
     pnl_series=[]
     in_trade=False; direction=None
-    ep=sl=tp=0.0
+    ep=sl=tp=pos_size=notional=0.0
 
     STOP_BUF=0.001
     FEE_ENTRY=0.0002; FEE_TP=0.0002; FEE_SL=0.00055
@@ -674,25 +674,29 @@ def backtest_divergence(H, L, C, O, n, rr, tf,
             hi_c=H[ci]; lo_c=L[ci]
             if direction=="long":
                 if lo_c<=sl:
-                    pnl=balance*RISK_PCT*(sl/ep-1)-balance*RISK_PCT*FEE_SL
-                    balance+=pnl; losses+=1; gross_loss+=abs(pnl)
-                    total_fees+=balance*RISK_PCT*FEE_SL
+                    gross=(sl-ep)*pos_size
+                    fee=notional*FEE_SL
+                    pnl=gross-fee
+                    balance+=pnl; losses+=1; gross_loss+=abs(pnl); total_fees+=fee
                     pnl_series.append(pnl); in_trade=False
                 elif hi_c>=tp:
-                    pnl=balance*RISK_PCT*(tp/ep-1)-balance*RISK_PCT*FEE_TP
-                    balance+=pnl; wins+=1; gross_win+=pnl
-                    total_fees+=balance*RISK_PCT*FEE_TP
+                    gross=(tp-ep)*pos_size
+                    fee=notional*FEE_TP
+                    pnl=gross-fee
+                    balance+=pnl; wins+=1; gross_win+=pnl; total_fees+=fee
                     pnl_series.append(pnl); in_trade=False
             else:
                 if hi_c>=sl:
-                    pnl=balance*RISK_PCT*(ep/sl-1)-balance*RISK_PCT*FEE_SL
-                    balance+=pnl; losses+=1; gross_loss+=abs(pnl)
-                    total_fees+=balance*RISK_PCT*FEE_SL
+                    gross=(ep-sl)*pos_size
+                    fee=notional*FEE_SL
+                    pnl=gross-fee
+                    balance+=pnl; losses+=1; gross_loss+=abs(pnl); total_fees+=fee
                     pnl_series.append(pnl); in_trade=False
                 elif lo_c<=tp:
-                    pnl=balance*RISK_PCT*(ep/tp-1)-balance*RISK_PCT*FEE_TP
-                    balance+=pnl; wins+=1; gross_win+=pnl
-                    total_fees+=balance*RISK_PCT*FEE_TP
+                    gross=(ep-tp)*pos_size
+                    fee=notional*FEE_TP
+                    pnl=gross-fee
+                    balance+=pnl; wins+=1; gross_win+=pnl; total_fees+=fee
                     pnl_series.append(pnl); in_trade=False
             if balance>peak: peak=balance
             if in_trade: continue
@@ -722,7 +726,9 @@ def backtest_divergence(H, L, C, O, n, rr, tf,
                     if rpp>0 and entry_p>sl_p:
                         tp_p=entry_p+rpp*rr
                         ep=entry_p; sl=sl_p; tp=tp_p
-                        fee=balance*RISK_PCT*FEE_ENTRY
+                        pos_size=balance*RISK_PCT/rpp
+                        notional=pos_size*entry_p
+                        fee=notional*FEE_ENTRY
                         balance-=fee; total_fees+=fee
                         in_trade=True; direction="long"; trades+=1
                         continue
@@ -745,7 +751,9 @@ def backtest_divergence(H, L, C, O, n, rr, tf,
                     if rpp>0 and entry_p<sl_p:
                         tp_p=entry_p-rpp*rr
                         ep=entry_p; sl=sl_p; tp=tp_p
-                        fee=balance*RISK_PCT*FEE_ENTRY
+                        pos_size=balance*RISK_PCT/rpp
+                        notional=pos_size*entry_p
+                        fee=notional*FEE_ENTRY
                         balance-=fee; total_fees+=fee
                         in_trade=True; direction="short"; trades+=1
 
