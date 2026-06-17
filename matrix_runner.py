@@ -275,6 +275,7 @@ def calc_ema(arr, period):
 
 def calc_adx(H,L,C,period):
     n=len(H); adx_=np.zeros(n); pdm=np.zeros(n); mdm=np.zeros(n); tr=np.zeros(n)
+    if n<=period*2+1: return adx_  # not enough data — return zeros (no trend signal)
     for i in range(1,n):
         pdm[i]=max(H[i]-H[i-1],0) if H[i]-H[i-1]>L[i-1]-L[i] else 0
         mdm[i]=max(L[i-1]-L[i],0) if L[i-1]-L[i]>H[i]-H[i-1] else 0
@@ -292,6 +293,7 @@ def calc_adx(H,L,C,period):
 
 def calc_rsi(C, period=14):
     n=len(C); rsi=np.full(n,50.0)
+    if n<=period: return rsi  # not enough data — return neutral RSI
     g=np.zeros(n); l_=np.zeros(n)
     for i in range(1,n):
         d=C[i]-C[i-1]; g[i]=max(d,0); l_[i]=max(-d,0)
@@ -608,6 +610,10 @@ def backtest_divergence(H, L, C, O, n, rr, tf,
     - SL: swing low/high × buffer
     - TP: fixed RR
     """
+    min_required = max(pivot_n*2+lookback, rsi_period*2+1, 60)
+    if n < min_required:
+        return None  # not enough candles for reliable signal detection
+
     rsi_v  = calc_rsi(C, rsi_period)
     hist   = calc_macd_histogram(C) if use_macd_conf else None
     adx_v  = calc_adx(H,L,C,14) if adx_max>0 else None
