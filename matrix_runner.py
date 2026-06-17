@@ -598,37 +598,17 @@ def calc_macd_histogram(C, fast=12, slow=26, signal=9):
     macd=ef-es; sig=calc_ema(macd,signal)
     return macd-sig  # histogram
 
-def backtest_divergence(H, L, C, O, n, rr, tf,
-                        rsi_period, rsi_thresh, pivot_n, lookback,
-                        use_macd_conf, adx_max):
+def precompute_divergence_inputs(H, L, C, pivot_n, rsi_period, use_macd_conf, adx_max):
     """
-    RSI Divergence Engine:
-    - Bullish: price makes lower low, RSI makes higher low, RSI < rsi_thresh → long
-    - Bearish: price makes higher high, RSI makes lower high, RSI > (100-rsi_thresh) → short
-    - Optional: require MACD histogram divergence to match (double divergence filter)
-    - Optional: ADX < adx_max to avoid trading in strong trends (0=off)
-    - SL: swing low/high × buffer
-    - TP: fixed RR
+    Cacheable pre-computation — call ONCE per (pivot_n, rsi_period, macd, adx_max)
+    combination per symbol/timeframe, not once per full parameter sweep combo.
+    Returns dict with pivot_lows, pivot_highs, rsi_v, hist, adx_v.
     """
-    min_required = max(pivot_n*2+lookback, rsi_period*2+1, 60)
-    if n < min_required:
-        return None  # not enough candles for reliable signal detection
-
+    n=len(C)
     rsi_v  = calc_rsi(C, rsi_period)
     hist   = calc_macd_histogram(C) if use_macd_conf else None
     adx_v  = calc_adx(H,L,C,14) if adx_max>0 else None
 
-    balance=1000.0; peak=1000.0
-    wins=losses=trades=0
-    gross_win=gross_loss=total_fees=0.0
-    pnl_series=[]
-    in_trade=False; direction=None
-    ep=sl=tp=0.0
-
-    STOP_BUF=0.001
-    FEE_ENTRY=0.0002; FEE_TP=0.0002; FEE_SL=0.00055
-
-    # Pre-identify pivot lows and highs (confirmed N bars either side)
     def is_pivot_low(i):
         return (i>=pivot_n and i<n-pivot_n and
                 all(L[i]<=L[i-j] for j in range(1,pivot_n+1)) and
@@ -641,6 +621,51 @@ def backtest_divergence(H, L, C, O, n, rr, tf,
     pivot_lows  = [i for i in range(pivot_n, n-pivot_n) if is_pivot_low(i)]
     pivot_highs = [i for i in range(pivot_n, n-pivot_n) if is_pivot_high(i)]
 
+    return {"pivot_lows":pivot_lows,"pivot_highs":pivot_highs,
+            "rsi_v":rsi_v,"hist":hist,"adx_v":adx_v}
+
+
+def backtest_divergence(H, L, C, O, n, rr, tf,
+                        rsi_period, rsi_thresh, pivot_n, lookback,
+                        use_macd_conf, adx_max, precomputed=None):
+    """
+    RSI Divergence Engine:
+    - Bullish: price makes lower low, RSI makes higher low, RSI < rsi_thresh → long
+    - Bearish: price makes higher high, RSI makes lower high, RSI > (100-rsi_thresh) → short
+    - Optional: require MACD histogram divergence to match (double divergence filter)
+    - Optional: ADX < adx_max to avoid trading in strong trends (0=off)
+    - SL: swing low/high × buffer
+    - TP: fixed RR
+
+    Pass `precomputed` (from precompute_divergence_inputs) to skip redundant
+    pivot/RSI/MACD/ADX recalculation across rr sweeps — these don't depend on rr.
+    """
+    min_required = max(pivot_n*2+lookback, rsi_period*2+1, 60)
+    if n < min_required:
+        return None  # not enough candles for reliable signal detection
+
+    if precomputed is not None:
+        pivot_lows  = precomputed["pivot_lows"]
+        pivot_highs = precomputed["pivot_highs"]
+        rsi_v       = precomputed["rsi_v"]
+        hist        = precomputed["hist"]
+        adx_v       = precomputed["adx_v"]
+    else:
+        pre = precompute_divergence_inputs(H,L,C,pivot_n,rsi_period,use_macd_conf,adx_max)
+        pivot_lows, pivot_highs = pre["pivot_lows"], pre["pivot_highs"]
+        rsi_v, hist, adx_v = pre["rsi_v"], pre["hist"], pre["adx_v"]
+
+    balance=1000.0; peak=1000.0
+    wins=losses=trades=0
+    gross_win=gross_loss=total_fees=0.0
+    pnl_series=[]
+    in_trade=False; direction=None
+    ep=sl=tp=0.0
+
+    STOP_BUF=0.001
+    FEE_ENTRY=0.0002; FEE_TP=0.0002; FEE_SL=0.00055
+
+    import bisect
     start_i = max(pivot_n*2+lookback, rsi_period*2+1)
 
     for ci in range(start_i, n-1):
@@ -678,8 +703,10 @@ def backtest_divergence(H, L, C, O, n, rr, tf,
         if adx_max>0 and adx_v is not None and adx_v[ci]>adx_max:
             continue
 
-        # Find recent pivot lows within lookback for bullish divergence
-        recent_lows=[i for i in pivot_lows if ci-lookback<=i<ci-pivot_n]
+        # Find recent pivot lows within lookback for bullish divergence (bisect: O(log p))
+        lo_bound = bisect.bisect_left(pivot_lows, ci-lookback)
+        hi_bound = bisect.bisect_left(pivot_lows, ci-pivot_n)
+        recent_lows = pivot_lows[lo_bound:hi_bound]
         if len(recent_lows)>=2:
             p2=recent_lows[-1]; p1=recent_lows[-2]  # p2=newer, p1=older
             # Bullish: price lower low, RSI higher low, RSI oversold
@@ -700,8 +727,10 @@ def backtest_divergence(H, L, C, O, n, rr, tf,
                         in_trade=True; direction="long"; trades+=1
                         continue
 
-        # Find recent pivot highs within lookback for bearish divergence
-        recent_highs=[i for i in pivot_highs if ci-lookback<=i<ci-pivot_n]
+        # Find recent pivot highs within lookback for bearish divergence (bisect: O(log p))
+        lo_bound_h = bisect.bisect_left(pivot_highs, ci-lookback)
+        hi_bound_h = bisect.bisect_left(pivot_highs, ci-pivot_n)
+        recent_highs = pivot_highs[lo_bound_h:hi_bound_h]
         if len(recent_highs)>=2:
             p2=recent_highs[-1]; p1=recent_highs[-2]
             # Bearish: price higher high, RSI lower high, RSI overbought
@@ -1022,7 +1051,7 @@ def run_ema_monthly(grand_total, done, saved, errors, buf, start, last_tg):
 
 # ── PHASE: RSI DIVERGENCE FULL SWEEP ──────────────────────────
 def run_divergence(grand_total, done, saved, errors, buf, start, last_tg):
-    print("\n=== RSI Divergence sweep ===")
+    print("\n=== RSI Divergence sweep (cached pivots/RSI per outer combo) ===")
     for symbol, tf in itertools.product(DIV_PAIRS, DIV_TIMEFRAMES):
         print(f"\nLoading {symbol} {tf}...")
         set_status("compute","running",done,grand_total,f"DIV {symbol} {tf}")
@@ -1035,42 +1064,51 @@ def run_divergence(grand_total, done, saved, errors, buf, start, last_tg):
         O=np.array([r["open"]  for r in rows],dtype=float)
         n=len(rows); print(f"  {n} candles")
 
-        for rsi_p,rsi_th,piv_n,lb,macd_c,adx_mx,rr in itertools.product(
-            DIV_RSI_PERIODS,DIV_RSI_THRESH,DIV_PIVOT_NS,
-            DIV_LOOKBACKS,DIV_MACD_CONF,DIV_ADX_MAXS,DIV_RR_RATIOS
+        # Outer loop: only the params that change pivots/RSI/MACD/ADX (expensive)
+        for rsi_p,piv_n,macd_c,adx_mx in itertools.product(
+            DIV_RSI_PERIODS,DIV_PIVOT_NS,DIV_MACD_CONF,DIV_ADX_MAXS
         ):
-            filters="+".join(f for f,v in [("macd",macd_c),("adxmax",adx_mx>0)] if v) or "none"
-            label=f"rsi{rsi_p}_th{rsi_th}_n{piv_n}_lb{lb}_{filters}"
             try:
-                s=backtest_divergence(H,L,C,O,n,rr,tf,
-                                      rsi_p,rsi_th,piv_n,lb,macd_c,adx_mx)
+                precomputed = precompute_divergence_inputs(H,L,C,piv_n,rsi_p,macd_c,adx_mx)
             except Exception as e:
-                s=None; errors+=1; print(f"  DIV error: {e}")
+                print(f"  Precompute error: {e}")
+                continue
 
-            buf.append({
-                "combo_key":f"{symbol}|{tf}|rsi_divergence|div|{rsi_p}/{rsi_th}|{rr}|{piv_n}|{label}",
-                "pair":symbol.replace("/USDT",""),"timeframe":tf,
-                "engine":"rsi_divergence","entry_mode":"div",
-                "pivot_n":piv_n,"rr":rr,"fib_level":0,
-                "ema_pair":f"rsi{rsi_p}","adx_min":adx_mx,"filters":label,
-                "period_start":PERIOD_START,"period_end":PERIOD_END,
-                "success":s is not None,
-                "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
-                "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
-                "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
-                "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
-                "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
-                "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
-                "computed_at":datetime.now(timezone.utc).isoformat(),
-            })
-            if s: saved+=1
-            done+=1
-            if len(buf)>=500: save_rows(buf); buf=[]
-            if time.time()-last_tg>600:
-                el=time.time()-start; rate=done/el if el>0 else 0; eta=(grand_total-done)/rate if rate>0 else 0
-                tg(f"⏳ DIV Phase\nDone: {done:,}/{grand_total:,} ({done/grand_total*100:.1f}%)\nETA: {eta/60:.0f}min\n{symbol} {tf}")
-                set_status("compute","running",done,grand_total,f"DIV {symbol} {tf}")
-                last_tg=time.time()
+            # Inner loop: cheap params (lookback just filters the cached pivot list, rr/thresh don't touch pivots at all)
+            for rsi_th,lb,rr in itertools.product(DIV_RSI_THRESH,DIV_LOOKBACKS,DIV_RR_RATIOS):
+                filters="+".join(f for f,v in [("macd",macd_c),("adxmax",adx_mx>0)] if v) or "none"
+                label=f"rsi{rsi_p}_th{rsi_th}_n{piv_n}_lb{lb}_{filters}"
+                try:
+                    s=backtest_divergence(H,L,C,O,n,rr,tf,
+                                          rsi_p,rsi_th,piv_n,lb,macd_c,adx_mx,
+                                          precomputed=precomputed)
+                except Exception as e:
+                    s=None; errors+=1; print(f"  DIV error: {e}")
+
+                buf.append({
+                    "combo_key":f"{symbol}|{tf}|rsi_divergence|div|{rsi_p}/{rsi_th}|{rr}|{piv_n}|{label}",
+                    "pair":symbol.replace("/USDT",""),"timeframe":tf,
+                    "engine":"rsi_divergence","entry_mode":"div",
+                    "pivot_n":piv_n,"rr":rr,"fib_level":0,
+                    "ema_pair":f"rsi{rsi_p}","adx_min":adx_mx,"filters":label,
+                    "period_start":PERIOD_START,"period_end":PERIOD_END,
+                    "success":s is not None,
+                    "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
+                    "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
+                    "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
+                    "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
+                    "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
+                    "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
+                    "computed_at":datetime.now(timezone.utc).isoformat(),
+                })
+                if s: saved+=1
+                done+=1
+                if len(buf)>=500: save_rows(buf); buf=[]
+                if time.time()-last_tg>600:
+                    el=time.time()-start; rate=done/el if el>0 else 0; eta=(grand_total-done)/rate if rate>0 else 0
+                    tg(f"⏳ DIV Phase\nDone: {done:,}/{grand_total:,} ({done/grand_total*100:.1f}%)\nETA: {eta/60:.0f}min\n{symbol} {tf}")
+                    set_status("compute","running",done,grand_total,f"DIV {symbol} {tf}")
+                    last_tg=time.time()
 
         if buf: save_rows(buf); buf=[]
         print(f"  Done {symbol} {tf} — {saved:,} saved so far")
