@@ -142,6 +142,43 @@ def matrix_results_count(engine: str = None, stage: str = None, passed_only: boo
         return {"success": False, "error": str(e)}
 
 
+@app.get("/matrix-results/test-write")
+def matrix_results_test_write():
+    """
+    Diagnostic: writes ONE test row, then immediately tries to read it back.
+    Isolates whether the problem is in the write or in the read.
+    """
+    test_row = {
+        "pair": "TESTPAIR", "timeframe": "15m", "engine": "diagnostic_test", "stage": "test",
+        "period_label": None, "period_start": "2025-01-01", "period_end": "2026-01-01",
+        "params": {"test": True, "n": 1},
+        "return_pct": 1.0, "cagr": 1.0, "max_dd": 1.0, "sharpe": 1.0,
+        "profit_factor": 1.0, "win_rate": 50.0, "trades": 30, "wins": 15, "losses": 15,
+        "avg_win": 1.0, "avg_loss": 1.0, "kelly_full": 1.0, "total_fees": 0.1,
+        "passed_filter": True,
+    }
+    write_headers = {**HEADERS, "Prefer": "return=representation"}
+    write_res = httpx.post(f"{SUPABASE_URL}/rest/v1/matrix_results", json=[test_row],
+                            headers=write_headers, timeout=30)
+
+    read_res = httpx.get(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.diagnostic_test&select=*",
+                          headers=HEADERS, timeout=30)
+
+    # Clean up the test row regardless of outcome
+    try:
+        httpx.delete(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.diagnostic_test",
+                     headers=HEADERS, timeout=30)
+    except: pass
+
+    return {
+        "write_status": write_res.status_code,
+        "write_body": write_res.text[:1000],
+        "read_status": read_res.status_code,
+        "read_body": read_res.text[:1000],
+        "row_was_persisted": read_res.status_code==200 and len(read_res.json())>0,
+    }
+
+
 @app.get("/matrix-results/export")
 def matrix_results_export(engine: str = None, stage: str = None, passed_only: bool = False):
     """Export results as CSV. Set passed_only=true to only get validated combos."""
