@@ -145,8 +145,9 @@ def matrix_results_count(engine: str = None, stage: str = None, passed_only: boo
 @app.get("/matrix-results/test-write")
 def matrix_results_test_write():
     """
-    Diagnostic: writes ONE test row, then immediately tries to read it back.
-    Isolates whether the problem is in the write or in the read.
+    Diagnostic: writes ONE test row using matrix_runner.py's EXACT headers
+    (return=minimal,resolution=ignore-duplicates), then reads it back.
+    Isolates whether the Prefer header combo is the actual culprit.
     """
     test_row = {
         "pair": "TESTPAIR", "timeframe": "15m", "engine": "diagnostic_test", "stage": "test",
@@ -157,25 +158,40 @@ def matrix_results_test_write():
         "avg_win": 1.0, "avg_loss": 1.0, "kelly_full": 1.0, "total_fees": 0.1,
         "passed_filter": True,
     }
-    write_headers = {**HEADERS, "Prefer": "return=representation"}
-    write_res = httpx.post(f"{SUPABASE_URL}/rest/v1/matrix_results", json=[test_row],
-                            headers=write_headers, timeout=30)
 
-    read_res = httpx.get(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.diagnostic_test&select=*",
-                          headers=HEADERS, timeout=30)
+    # Test A: main.py's working headers (return=representation override)
+    headers_a = {**HEADERS, "Prefer": "return=representation"}
+    write_a = httpx.post(f"{SUPABASE_URL}/rest/v1/matrix_results", json=[test_row],
+                          headers=headers_a, timeout=30)
 
-    # Clean up the test row regardless of outcome
+    # Test B: matrix_runner.py's EXACT headers (the ones actually used in the real sweep)
+    headers_b = {
+        "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal,resolution=ignore-duplicates",
+    }
+    test_row_b = dict(test_row); test_row_b["engine"] = "diagnostic_test_b"
+    write_b = httpx.post(f"{SUPABASE_URL}/rest/v1/matrix_results", json=[test_row_b],
+                          headers=headers_b, timeout=30)
+
+    read_a = httpx.get(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.diagnostic_test&select=*", headers=HEADERS, timeout=30)
+    read_b = httpx.get(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.diagnostic_test_b&select=*", headers=HEADERS, timeout=30)
+
+    # Cleanup
     try:
-        httpx.delete(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.diagnostic_test",
-                     headers=HEADERS, timeout=30)
+        httpx.delete(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.diagnostic_test", headers=HEADERS, timeout=30)
+        httpx.delete(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.diagnostic_test_b", headers=HEADERS, timeout=30)
     except: pass
 
     return {
-        "write_status": write_res.status_code,
-        "write_body": write_res.text[:1000],
-        "read_status": read_res.status_code,
-        "read_body": read_res.text[:1000],
-        "row_was_persisted": read_res.status_code==200 and len(read_res.json())>0,
+        "test_A_return_representation": {
+            "write_status": write_a.status_code, "write_body": write_a.text[:300],
+            "read_status": read_a.status_code, "persisted": read_a.status_code==200 and len(read_a.json())>0,
+        },
+        "test_B_return_minimal_matrix_runner_headers": {
+            "write_status": write_b.status_code, "write_body": write_b.text[:300],
+            "read_status": read_b.status_code, "persisted": read_b.status_code==200 and len(read_b.json())>0,
+        },
     }
 
 
