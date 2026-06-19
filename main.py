@@ -142,6 +142,65 @@ def matrix_results_count(engine: str = None, stage: str = None, passed_only: boo
         return {"success": False, "error": str(e)}
 
 
+@app.get("/matrix-results/test-thread")
+def matrix_results_test_thread():
+    """
+    Diagnostic: runs the exact same batch write, but from INSIDE a background
+    thread (matching how the real sweep executes), to isolate whether threading
+    context itself is the problem.
+    """
+    import threading, time as time_mod
+
+    result = {"done": False, "write_status": None, "write_body": None, "exception": None}
+
+    def _threaded_write():
+        try:
+            rows = [{
+                "pair": "THREADTEST", "timeframe": "15m", "engine": "diagnostic_thread", "stage": "test",
+                "period_label": None, "period_start": "2025-01-01", "period_end": "2026-01-01",
+                "params": {"i": i},
+                "return_pct": 5.0, "cagr": 1.0, "max_dd": 5.0, "sharpe": 1.2,
+                "profit_factor": 1.2, "win_rate": 50.0, "trades": 30, "wins": 15, "losses": 15,
+                "avg_win": 1.0, "avg_loss": 1.0, "kelly_full": 1.0, "total_fees": 0.1,
+                "passed_filter": True,
+            } for i in range(50)]
+
+            headers_runner = {
+                "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal,resolution=ignore-duplicates",
+            }
+            write_res = httpx.post(f"{SUPABASE_URL}/rest/v1/matrix_results", json=rows,
+                                    headers=headers_runner, timeout=30)
+            result["write_status"] = write_res.status_code
+            result["write_body"] = write_res.text[:300]
+        except Exception as e:
+            result["exception"] = str(e)
+        finally:
+            result["done"] = True
+
+    t = threading.Thread(target=_threaded_write, daemon=True)
+    t.start()
+    t.join(timeout=15)  # wait for the thread to finish (request stays open)
+
+    time_mod.sleep(1)
+    read_res = httpx.get(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.diagnostic_thread&select=id",
+                          headers={**HEADERS,"Prefer":"count=exact"}, timeout=30)
+    count = read_res.headers.get("content-range","?/0").split("/")[-1]
+
+    try:
+        httpx.delete(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.diagnostic_thread", headers=HEADERS, timeout=30)
+    except: pass
+
+    return {
+        "thread_completed": result["done"],
+        "write_status": result["write_status"],
+        "write_body": result["write_body"],
+        "exception": result["exception"],
+        "rows_actually_persisted": count,
+    }
+
+
 @app.get("/matrix-results/test-batch")
 def matrix_results_test_batch():
     """
