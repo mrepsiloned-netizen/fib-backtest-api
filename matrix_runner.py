@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 # ============================================================
-# WADDLE MATRIX RUNNER v9
-# Default: EMA Cross only (Engine 6)
-# Args:
-#   (none)    → EMA Cross only
-#   bos       → BOS Pullback only
-#   all       → both engines
-#   prefetch  → fetch candles
+# WADDLE MATRIX RUNNER v2.0 — clean rebuild
+# Single `params` JSONB column per result row — works for any
+# strategy without schema changes. Only validated rows get saved
+# (min 30 trades, Sharpe 0.5-2.5, max drawdown <=35%) except for
+# monthly-stage rows on locked configs, which save in full for
+# visibility into consistency even on weaker months.
+#
+# Usage: /run-matrix?engine=bos&stage=sweep
+#        /run-matrix?engine=bos&stage=stability
+#        /run-matrix?engine=bos&stage=monthly
+#        /run-matrix?engine=ema&stage=sweep|stability|monthly
+#        /run-matrix?engine=div&stage=sweep|stability|monthly
+#        /run-matrix?engine=all&stage=sweep   (runs sweep for all 3)
 # ============================================================
 
-import os, time, httpx, itertools, io, csv as csv_mod, math, statistics
+import os, time, httpx, itertools, io, csv as csv_mod, math, statistics, json, bisect
 import numpy as np
 from datetime import datetime, timezone, timedelta
 
@@ -25,202 +31,18 @@ HEADERS = {
     "Prefer": "return=minimal,resolution=ignore-duplicates",
 }
 
-# ── BOS PULLBACK VARIABLE SPACE ────────────────────────────────
-BOS_PAIRS       = ["DOGE/USDT","XLM/USDT","XRP/USDT","ADA/USDT","TRX/USDT","ARB/USDT"]
-BOS_TIMEFRAMES  = ["5m","15m","1h"]
-BOS_ENTRY_MODES = ["rejection","reclaim"]
-BOS_PIVOT_NS    = [3,5,8]
-BOS_RR_RATIOS   = [1.5,2.0,3.0,4.0]
-BOS_FIB_LEVELS  = [0.382,0.5,0.618]
-BOS_EMA_PAIRS   = ["off","34/55","55/89","89/144","144/169"]
-BOS_ADX_MINS    = [0,15,25]
-PERIOD_START    = "2025-01-01"
-PERIOD_END      = "2026-01-01"
-BOS_TOTAL = (len(BOS_PAIRS)*len(BOS_TIMEFRAMES)*len(BOS_ENTRY_MODES)*
-             len(BOS_PIVOT_NS)*len(BOS_RR_RATIOS)*len(BOS_FIB_LEVELS)*
-             len(BOS_EMA_PAIRS)*len(BOS_ADX_MINS))
-
-# Top-5 candidate configs per pair (5 pairs × 5 = 25), from corrected full-year sweep.
-# Stability check across 3 periods finds which of the top-5 per pair is most consistent.
-BOS_LOCKED_CONFIGS = [
-    # ADA — top 5
-    {"symbol":"ADA/USDT","timeframe":"15m","pivot_n":8,"rr":2.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":25},
-    {"symbol":"ADA/USDT","timeframe":"15m","pivot_n":8,"rr":2.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"89/144","adx_min":25},
-    {"symbol":"ADA/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":25},
-    {"symbol":"ADA/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"89/144","adx_min":25},
-    {"symbol":"ADA/USDT","timeframe":"15m","pivot_n":8,"rr":2.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"off","adx_min":25},
-    # DOGE — top 5
-    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"34/55","adx_min":15},
-    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":15},
-    {"symbol":"DOGE/USDT","timeframe":"1h","pivot_n":8,"rr":3.0,"fib_level":0.5,"entry_mode":"rejection","ema_pair":"55/89","adx_min":0},
-    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"89/144","adx_min":15},
-    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"off","adx_min":15},
-    # XLM — top 5
-    {"symbol":"XLM/USDT","timeframe":"15m","pivot_n":5,"rr":4.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":25},
-    {"symbol":"XLM/USDT","timeframe":"15m","pivot_n":5,"rr":4.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"89/144","adx_min":25},
-    {"symbol":"XLM/USDT","timeframe":"15m","pivot_n":8,"rr":3.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":15},
-    {"symbol":"XLM/USDT","timeframe":"15m","pivot_n":8,"rr":3.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"89/144","adx_min":15},
-    {"symbol":"XLM/USDT","timeframe":"15m","pivot_n":5,"rr":3.0,"fib_level":0.382,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":25},
-    # TRX — top 5
-    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"55/89","adx_min":15},
-    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"89/144","adx_min":15},
-    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"144/169","adx_min":15},
-    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":4.0,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"off","adx_min":15},
-    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":3.0,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"off","adx_min":0},
-    # XRP — top 5
-    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"55/89","adx_min":25},
-    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":1.5,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"55/89","adx_min":25},
-    {"symbol":"XRP/USDT","timeframe":"1h","pivot_n":5,"rr":4.0,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"off","adx_min":15},
-    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":3.0,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"55/89","adx_min":25},
-    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"34/55","adx_min":25},
-]
-
-# ── EMA CROSS VARIABLE SPACE ───────────────────────────────────
-EMA_PAIRS_LIST  = ["DOGE/USDT","XLM/USDT","XRP/USDT","TRX/USDT","ARB/USDT"]
-EMA_TIMEFRAMES  = ["1m","5m","15m"]
-EMA_FAST_LIST   = [9, 12]
-EMA_SLOW_LIST   = [21, 26]
-EMA_RR_LIST     = [1.5, 2.0]
-EMA_VOL_OPTS    = [False, True]
-EMA_GAP_OPTS    = [False, True]
-EMA_HTF_OPTS    = [False, True]
-
-# Stability test — same combos across different time windows
-_TODAY     = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-_L30D_START= (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
-EMA_PERIODS = [
-    ("2025_full", "2025-01-01", "2026-01-01"),
-    ("2026_ytd",  "2026-01-01", _TODAY),
-    ("l30d",      _L30D_START,  _TODAY),
-]
-
-EMA_TOTAL = (len(EMA_PAIRS_LIST)*len(EMA_TIMEFRAMES)*len(EMA_FAST_LIST)*
-             len(EMA_SLOW_LIST)*len(EMA_RR_LIST)*
-             len(EMA_VOL_OPTS)*len(EMA_GAP_OPTS)*len(EMA_HTF_OPTS)*
-             len(EMA_PERIODS))
-
-BOS_STABILITY_TOTAL = len(BOS_LOCKED_CONFIGS) * len(EMA_PERIODS)  # reuse same 3 periods
-
-# ── MONTHLY STABILITY CHECK ─────────────────────────────────────
-# Generate calendar-month periods from 2025-01 through the current month
-def _gen_monthly_periods():
-    periods = []
-    y, m = 2025, 1
-    now = datetime.now(timezone.utc)
-    while (y, m) <= (now.year, now.month):
-        start = f"{y}-{m:02d}-01"
-        if m == 12:
-            ny, nm = y+1, 1
-        else:
-            ny, nm = y, m+1
-        end_dt = datetime(ny, nm, 1, tzinfo=timezone.utc)
-        if end_dt > now: end_dt = now
-        end = end_dt.strftime("%Y-%m-%d")
-        if end > start:
-            periods.append((f"{y}-{m:02d}", start, end))
-        y, m = ny, nm
-    return periods
-
-MONTHLY_PERIODS = _gen_monthly_periods()
-
-# The 5 winning configs from the top-5-per-pair stability check (2026-06-15)
-# Each profitable across 2025_full / 2026_ytd / l30d. Now testing month-by-month.
-BOS_WINNERS = [
-    {"symbol":"ADA/USDT", "timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.382,"entry_mode":"reclaim",  "ema_pair":"89/144","adx_min":25},
-    {"symbol":"DOGE/USDT","timeframe":"1h", "pivot_n":8,"rr":3.0,"fib_level":0.5,  "entry_mode":"rejection","ema_pair":"55/89", "adx_min":0},
-    {"symbol":"XLM/USDT", "timeframe":"15m","pivot_n":5,"rr":4.0,"fib_level":0.382,"entry_mode":"reclaim",  "ema_pair":"89/144","adx_min":25},
-    {"symbol":"TRX/USDT", "timeframe":"1h", "pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"55/89", "adx_min":15},
-    {"symbol":"XRP/USDT", "timeframe":"1h", "pivot_n":5,"rr":4.0,"fib_level":0.618,"entry_mode":"reclaim",  "ema_pair":"off",   "adx_min":15},
-]
-BOS_MONTHLY_TOTAL = len(BOS_WINNERS) * len(MONTHLY_PERIODS)
-
-# Runner-up configs (the other 4 of top-5) for the 3 weakest pairs from monthly check
-# (DOGE 56%, TRX 67%, XRP 61% profitable months) — see if any beats the current winner
-BOS_RUNNERUPS = [
-    # DOGE — remaining 4 (winner was 1h RR3.0 fib0.5 EMA55/89 ADX0 rejection)
-    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"34/55","adx_min":15},
-    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"144/169","adx_min":15},
-    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"89/144","adx_min":15},
-    {"symbol":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"off","adx_min":15},
-    # TRX — remaining 4 (winner was 1h RR1.5 fib0.618 EMA55/89 ADX15 rejection)
-    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"89/144","adx_min":15},
-    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"144/169","adx_min":15},
-    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":4.0,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"off","adx_min":15},
-    {"symbol":"TRX/USDT","timeframe":"1h","pivot_n":3,"rr":3.0,"fib_level":0.618,"entry_mode":"reclaim","ema_pair":"off","adx_min":0},
-    # XRP — remaining 4 (winner was 1h RR4.0 fib0.618 off ADX15 reclaim)
-    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"55/89","adx_min":25},
-    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":1.5,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"55/89","adx_min":25},
-    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":3.0,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"55/89","adx_min":25},
-    {"symbol":"XRP/USDT","timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,"entry_mode":"reclaim","ema_pair":"34/55","adx_min":25},
-]
-BOS_RUNNERUP_MONTHLY_TOTAL = len(BOS_RUNNERUPS) * len(MONTHLY_PERIODS)
-
-# ── EMA CROSS — TOP-5-PER-PAIR CANDIDATES (Stage 2: stability check) ────
-# From 2025_full sweep, top 5 by Sharpe per pair (incl. DOGE/XRP — earlier
-# "exclude" verdict was based on aggregates; individual configs may survive).
-def _parse_ema_filters(s):
-    return {"use_vol":"vol" in s, "use_gap":"gap" in s, "use_htf":"htf" in s}
-
-EMA_LOCKED_CONFIGS = [
-    # ARB — top 5
-    {"symbol":"ARB/USDT","timeframe":"15m","ema_fast":12,"ema_slow":21,"rr":1.5,**_parse_ema_filters("vol+gap+htf")},
-    {"symbol":"ARB/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":21,"rr":2.0,**_parse_ema_filters("vol+gap")},
-    {"symbol":"ARB/USDT","timeframe":"15m","ema_fast":9, "ema_slow":21,"rr":2.0,**_parse_ema_filters("gap")},
-    {"symbol":"ARB/USDT","timeframe":"15m","ema_fast":9, "ema_slow":21,"rr":2.0,**_parse_ema_filters("vol+gap")},
-    {"symbol":"ARB/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":26,"rr":2.0,**_parse_ema_filters("vol+gap")},
-    # XLM — top 5
-    {"symbol":"XLM/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":21,"rr":1.5,**_parse_ema_filters("vol+gap+htf")},
-    {"symbol":"XLM/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":21,"rr":1.5,**_parse_ema_filters("gap+htf")},
-    {"symbol":"XLM/USDT","timeframe":"5m", "ema_fast":12,"ema_slow":21,"rr":2.0,**_parse_ema_filters("gap+htf")},
-    {"symbol":"XLM/USDT","timeframe":"15m","ema_fast":12,"ema_slow":26,"rr":2.0,**_parse_ema_filters("gap+htf")},
-    {"symbol":"XLM/USDT","timeframe":"15m","ema_fast":9, "ema_slow":21,"rr":2.0,**_parse_ema_filters("vol+gap+htf")},
-    # TRX — top 5
-    {"symbol":"TRX/USDT","timeframe":"15m","ema_fast":9,"ema_slow":26,"rr":1.5,**_parse_ema_filters("vol+gap+htf")},
-    {"symbol":"TRX/USDT","timeframe":"15m","ema_fast":9,"ema_slow":26,"rr":1.5,**_parse_ema_filters("gap+htf")},
-    {"symbol":"TRX/USDT","timeframe":"15m","ema_fast":9,"ema_slow":26,"rr":1.5,**_parse_ema_filters("gap")},
-    {"symbol":"TRX/USDT","timeframe":"15m","ema_fast":9,"ema_slow":26,"rr":1.5,**_parse_ema_filters("vol+gap")},
-    {"symbol":"TRX/USDT","timeframe":"15m","ema_fast":9,"ema_slow":21,"rr":2.0,**_parse_ema_filters("vol+gap")},
-    # DOGE — top 5 (re-testing despite earlier aggregate exclusion)
-    {"symbol":"DOGE/USDT","timeframe":"1m","ema_fast":12,"ema_slow":21,"rr":1.5,**_parse_ema_filters("gap")},
-    {"symbol":"DOGE/USDT","timeframe":"1m","ema_fast":12,"ema_slow":21,"rr":2.0,**_parse_ema_filters("gap")},
-    {"symbol":"DOGE/USDT","timeframe":"5m","ema_fast":12,"ema_slow":26,"rr":2.0,**_parse_ema_filters("gap+htf")},
-    {"symbol":"DOGE/USDT","timeframe":"5m","ema_fast":12,"ema_slow":26,"rr":1.5,**_parse_ema_filters("gap+htf")},
-    {"symbol":"DOGE/USDT","timeframe":"5m","ema_fast":9, "ema_slow":21,"rr":2.0,**_parse_ema_filters("gap+htf")},
-    # XRP — top 5 (re-testing despite earlier aggregate exclusion)
-    {"symbol":"XRP/USDT","timeframe":"1m", "ema_fast":12,"ema_slow":26,"rr":2.0,**_parse_ema_filters("vol+gap")},
-    {"symbol":"XRP/USDT","timeframe":"15m","ema_fast":12,"ema_slow":26,"rr":1.5,**_parse_ema_filters("vol+gap+htf")},
-    {"symbol":"XRP/USDT","timeframe":"5m", "ema_fast":9, "ema_slow":21,"rr":2.0,**_parse_ema_filters("vol+gap+htf")},
-    {"symbol":"XRP/USDT","timeframe":"15m","ema_fast":9, "ema_slow":21,"rr":1.5,**_parse_ema_filters("vol+gap+htf")},
-    {"symbol":"XRP/USDT","timeframe":"15m","ema_fast":12,"ema_slow":26,"rr":1.5,**_parse_ema_filters("gap+htf")},
-]
-EMA_STABILITY_TOTAL = len(EMA_LOCKED_CONFIGS) * len(EMA_PERIODS)
-
-# Stage 3 — EMA Cross monthly consistency check (winners from stage 2)
-EMA_WINNERS = [
-    {"symbol":"ARB/USDT", "timeframe":"5m", "ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":True, "use_gap":True, "use_htf":False},
-    {"symbol":"XLM/USDT", "timeframe":"15m","ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":False,"use_gap":True, "use_htf":True},
-    {"symbol":"TRX/USDT", "timeframe":"15m","ema_fast":9, "ema_slow":26,"rr":1.5,"use_vol":True, "use_gap":True, "use_htf":True},
-    {"symbol":"XRP/USDT", "timeframe":"5m", "ema_fast":9, "ema_slow":21,"rr":2.0,"use_vol":True, "use_gap":True, "use_htf":True},
-]
-EMA_MONTHLY_TOTAL = len(EMA_WINNERS) * len(MONTHLY_PERIODS)
-
-# ── RSI DIVERGENCE VARIABLE SPACE ──────────────────────────────
-DIV_PAIRS       = ["DOGE/USDT","XLM/USDT","XRP/USDT","ADA/USDT","TRX/USDT","ARB/USDT"]
-DIV_TIMEFRAMES  = ["15m","1h","4h"]
-DIV_RSI_PERIODS = [10, 14]
-DIV_RSI_THRESH  = [30, 40]      # RSI must be below this (long) / above 100-this (short)
-DIV_PIVOT_NS    = [3, 5]        # fractal lookback each side
-DIV_LOOKBACKS   = [30, 60]      # candles to search for second pivot
-DIV_MACD_CONF   = [False, True] # require MACD histogram divergence too
-DIV_ADX_MAXS    = [0, 20]       # 0=off, 20=only fire when NOT strongly trending
-DIV_RR_RATIOS   = [1.5, 2.0, 3.0]
-DIV_TOTAL = (len(DIV_PAIRS)*len(DIV_TIMEFRAMES)*len(DIV_RSI_PERIODS)*
-             len(DIV_RSI_THRESH)*len(DIV_PIVOT_NS)*len(DIV_LOOKBACKS)*
-             len(DIV_MACD_CONF)*len(DIV_ADX_MAXS)*len(DIV_RR_RATIOS))
-
 RISK_PCT  = 0.02
 MIN_SWING = 0.002
 STOP_BUF  = 0.001
+PERIOD_START = "2025-01-01"
+
+# ── VALIDATION FILTER (Algovibes methodology) ──────────────────
+def passes_filter(s):
+    if s is None: return False
+    if s["trades"] < 30: return False
+    if not (0.5 <= s["sharpe"] <= 2.5): return False
+    if s["max_dd"] > 35: return False
+    return True
 
 # ── HELPERS ────────────────────────────────────────────────────
 def tg(msg):
@@ -240,7 +62,7 @@ def set_status(phase, status, done, total, detail=""):
 
 def get_candles(symbol, timeframe, ps=None, pe=None):
     ps = ps or PERIOD_START
-    pe = pe or PERIOD_END
+    pe = pe or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     start_ms=int(datetime.strptime(ps,"%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
     end_ms  =int(datetime.strptime(pe,"%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
     rows=[]; offset=0
@@ -255,17 +77,39 @@ def get_candles(symbol, timeframe, ps=None, pe=None):
             rows+=batch
             if len(batch)<1000: break
             offset+=len(batch)
-        else: break
-    if len(rows)<50: return None
+        else:
+            break
     return rows
 
 def save_rows(rows):
     if not rows: return
     try:
-        httpx.post(f"{SUPABASE_URL}/rest/v1/matrix_results",
-                   json=rows,headers=HEADERS,timeout=30)
+        httpx.post(f"{SUPABASE_URL}/rest/v1/matrix_results", json=rows,
+                   headers=HEADERS, timeout=30)
     except Exception as e:
-        print(f"Save error: {e}")
+        print(f"save_rows error: {e}")
+
+def make_row(pair, tf, engine, stage, period_label, ps, pe, params, s):
+    return {
+        "pair": pair, "timeframe": tf, "engine": engine, "stage": stage,
+        "period_label": period_label, "period_start": ps, "period_end": pe,
+        "params": json.dumps(params),
+        "return_pct": s["return_pct"] if s else None,
+        "cagr": s["cagr"] if s else None,
+        "max_dd": s["max_dd"] if s else None,
+        "sharpe": s["sharpe"] if s else None,
+        "profit_factor": s["pf"] if s else None,
+        "win_rate": s["wr"] if s else None,
+        "trades": s["trades"] if s else 0,
+        "wins": s["wins"] if s else 0,
+        "losses": s["losses"] if s else 0,
+        "avg_win": s["avg_win"] if s else None,
+        "avg_loss": s["avg_loss"] if s else None,
+        "kelly_full": s["kelly"] if s else None,
+        "total_fees": s.get("total_fees") if s else None,
+        "passed_filter": passes_filter(s) if s else False,
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 # ── INDICATORS ─────────────────────────────────────────────────
 def calc_ema(arr, period):
@@ -783,541 +627,342 @@ def backtest_divergence(H, L, C, O, n, rr, tf,
             "total_fees":round(total_fees,4),"kelly":round(kf,3)}
 
 
-# ── PHASE: BOS PULLBACK ────────────────────────────────────────
-def run_bos(grand_total, done, saved, errors, buf, start, last_tg):
-    print("\n=== BOS Pullback ===")
-    for symbol,tf in itertools.product(BOS_PAIRS, BOS_TIMEFRAMES):
-        print(f"\nLoading {symbol} {tf}...")
-        set_status("compute","running",done,grand_total,f"BOS {symbol} {tf}")
+
+# ── VARIABLE SPACES ──────────────────────────────────────────
+BOS_PAIRS       = ["DOGE/USDT","XLM/USDT","XRP/USDT","ADA/USDT","TRX/USDT","ARB/USDT"]
+BOS_TIMEFRAMES  = ["5m","15m","1h"]
+BOS_ENTRY_MODES = ["rejection","reclaim"]
+BOS_PIVOT_NS    = [3,5,8]
+BOS_RR_RATIOS   = [1.5,2.0,3.0,4.0]
+BOS_FIB_LEVELS  = [0.382,0.5,0.618]
+BOS_EMA_PAIRS   = ["off","34/55","55/89","89/144","144/169"]
+BOS_ADX_MINS    = [0,15,25]
+
+EMA_PAIRS_LIST  = ["DOGE/USDT","XLM/USDT","XRP/USDT","TRX/USDT","ARB/USDT"]
+EMA_TIMEFRAMES  = ["1m","5m","15m"]
+EMA_FAST_LIST   = [9, 12]
+EMA_SLOW_LIST   = [21, 26]
+EMA_RR_LIST     = [1.5, 2.0]
+EMA_VOL_OPTS    = [False, True]
+EMA_GAP_OPTS    = [False, True]
+EMA_HTF_OPTS    = [False, True]
+
+DIV_PAIRS       = ["DOGE/USDT","XLM/USDT","XRP/USDT","ADA/USDT","TRX/USDT","ARB/USDT"]
+DIV_TIMEFRAMES  = ["15m","1h","4h"]
+DIV_RSI_PERIODS = [10, 14]
+DIV_RSI_THRESH  = [30, 40]
+DIV_PIVOT_NS    = [3, 5]
+DIV_LOOKBACKS   = [30, 60]
+DIV_MACD_CONF   = [False, True]
+DIV_ADX_MAXS    = [0, 20]
+DIV_RR_RATIOS   = [1.5, 2.0, 3.0]
+
+# Three test periods for stability stage
+_TODAY      = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+_L30D_START = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+STABILITY_PERIODS = [
+    ("2025_full", "2025-01-01", "2026-01-01"),
+    ("2026_ytd",  "2026-01-01", _TODAY),
+    ("l30d",      _L30D_START,  _TODAY),
+]
+
+def gen_monthly_periods():
+    periods = []
+    y, m = 2025, 1
+    now = datetime.now(timezone.utc)
+    while (y, m) <= (now.year, now.month):
+        start = f"{y}-{m:02d}-01"
+        ny, nm = (y+1, 1) if m == 12 else (y, m+1)
+        end_dt = datetime(ny, nm, 1, tzinfo=timezone.utc)
+        if end_dt > now: end_dt = now
+        end = end_dt.strftime("%Y-%m-%d")
+        if end > start: periods.append((f"{y}-{m:02d}", start, end))
+        y, m = ny, nm
+    return periods
+
+MONTHLY_PERIODS = gen_monthly_periods()
+
+# ── LOCKED CONFIGS (validated, currently live in paper_trader.py) ──
+BOS_LOCKED = [
+    {"pair":"ADA/USDT", "timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.382,"entry_mode":"reclaim",  "ema_pair":"89/144","adx_min":25},
+    {"pair":"DOGE/USDT","timeframe":"15m","pivot_n":8,"rr":1.5,"fib_level":0.618,"entry_mode":"reclaim",  "ema_pair":"34/55", "adx_min":15},
+    {"pair":"XLM/USDT", "timeframe":"15m","pivot_n":5,"rr":4.0,"fib_level":0.382,"entry_mode":"reclaim",  "ema_pair":"89/144","adx_min":25},
+    {"pair":"TRX/USDT", "timeframe":"1h", "pivot_n":3,"rr":1.5,"fib_level":0.618,"entry_mode":"rejection","ema_pair":"89/144","adx_min":15},
+    {"pair":"XRP/USDT", "timeframe":"15m","pivot_n":3,"rr":2.0,"fib_level":0.5,  "entry_mode":"reclaim",  "ema_pair":"55/89", "adx_min":25},
+]
+EMA_LOCKED = [
+    {"pair":"ARB/USDT", "timeframe":"5m", "ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":True, "use_gap":True, "use_htf":False},
+    {"pair":"XLM/USDT", "timeframe":"15m","ema_fast":12,"ema_slow":26,"rr":2.0,"use_vol":False,"use_gap":True, "use_htf":True},
+]
+
+# ── EXECUTION HELPERS — run one backtest given engine+params ───
+def run_bos_backtest(H,L,C,O,n, p):
+    ep=p.get("ema_pair","off"); ax=p.get("adx_min",0)
+    use_ema = ep!="off"
+    ef=es=adx_v=None
+    if use_ema:
+        f,s_=map(int,ep.split("/")); ef,es=calc_ema(C,f),calc_ema(C,s_)
+    if ax>0:
+        adx_v=calc_adx(H,L,C,14)
+    return backtest(H,L,C,O,n,p["pivot_n"],p["rr"],p["fib_level"],p["entry_mode"],
+                    ef,es,use_ema,adx_v,float(ax))
+
+def run_ema_backtest(H,L,C,O,V,n, p):
+    return backtest_ema(H,L,C,O,V,n,p["rr"],p["ema_fast"],p["ema_slow"],
+                        p["use_vol"],p["use_gap"],p["use_htf"])
+
+def run_div_backtest(H,L,C,O,n,tf, p, precomputed=None):
+    return backtest_divergence(H,L,C,O,n,p["rr"],tf,
+                               p["rsi_period"],p["rsi_thresh"],p["pivot_n"],
+                               p["lookback"],p["use_macd"],p["adx_max"],
+                               precomputed=precomputed)
+
+# ── PHASE: SWEEP (Stage 1 — broad parameter search per engine) ──
+def run_sweep(engine, grand_total, done, saved, errors, buf, start, last_tg):
+    if engine=="bos":
+        pairs, tfs = BOS_PAIRS, BOS_TIMEFRAMES
+        param_iter = lambda: itertools.product(BOS_ENTRY_MODES,BOS_PIVOT_NS,BOS_RR_RATIOS,
+                                                BOS_FIB_LEVELS,BOS_EMA_PAIRS,BOS_ADX_MINS)
+    elif engine=="ema":
+        pairs, tfs = EMA_PAIRS_LIST, EMA_TIMEFRAMES
+        param_iter = lambda: itertools.product(EMA_FAST_LIST,EMA_SLOW_LIST,EMA_RR_LIST,
+                                                EMA_VOL_OPTS,EMA_GAP_OPTS,EMA_HTF_OPTS)
+    elif engine=="div":
+        pairs, tfs = DIV_PAIRS, DIV_TIMEFRAMES
+    else:
+        return done,saved,errors,buf,last_tg
+
+    for symbol, tf in itertools.product(pairs, tfs):
+        set_status("compute","running",done,grand_total,f"{engine} sweep {symbol} {tf}")
         rows=get_candles(symbol,tf)
-        if not rows: print("  No candles — skip"); continue
-
-        H=np.array([r["high"]  for r in rows],dtype=float)
-        L=np.array([r["low"]   for r in rows],dtype=float)
+        if not rows: continue
+        H=np.array([r["high"] for r in rows],dtype=float)
+        L=np.array([r["low"] for r in rows],dtype=float)
         C=np.array([r["close"] for r in rows],dtype=float)
-        O=np.array([r["open"]  for r in rows],dtype=float)
-        n=len(rows); print(f"  {n} candles")
+        O=np.array([r["open"] for r in rows],dtype=float)
+        V=np.array([r.get("volume",0) for r in rows],dtype=float)
+        n=len(rows)
+        pair=symbol.replace("/USDT","")
 
-        ema_cache={}
-        for ep in BOS_EMA_PAIRS:
-            if ep!="off":
-                f,s=map(int,ep.split("/")); ema_cache[ep]=(calc_ema(C,f),calc_ema(C,s))
-        adx_cache=calc_adx(H,L,C,14)
+        if engine=="bos":
+            for em,N,rr,fib,ep,ax in param_iter():
+                p={"entry_mode":em,"pivot_n":N,"rr":rr,"fib_level":fib,"ema_pair":ep,"adx_min":ax}
+                try: s=run_bos_backtest(H,L,C,O,n,p)
+                except Exception as e: s=None; errors+=1
+                if s and passes_filter(s):
+                    buf.append(make_row(pair,tf,"bos_pullback","sweep",None,PERIOD_START,_TODAY,p,s))
+                    saved+=1
+                done+=1
+                if len(buf)>=300: save_rows(buf); buf=[]
+                if time.time()-last_tg>600:
+                    el=time.time()-start; rate=done/el if el>0 else 0; eta=(grand_total-done)/rate if rate>0 else 0
+                    tg(f"⏳ BOS sweep\nDone: {done:,}/{grand_total:,} ({done/grand_total*100:.1f}%)\nETA: {eta/60:.0f}min\n{symbol} {tf}")
+                    last_tg=time.time()
 
-        for em,N,rr,fib,ep,ax in itertools.product(BOS_ENTRY_MODES,BOS_PIVOT_NS,BOS_RR_RATIOS,BOS_FIB_LEVELS,BOS_EMA_PAIRS,BOS_ADX_MINS):
-            use_ema=ep!="off"
-            ef,es=ema_cache[ep] if use_ema else (None,None)
-            adx_v=adx_cache if ax>0 else None
-            try:
-                s=backtest(H,L,C,O,n,N,rr,fib,em,ef,es,use_ema,adx_v,float(ax))
-            except Exception as e:
-                s=None; errors+=1
+        elif engine=="ema":
+            for ef_p,es_p,rr,uv,ug,uh in param_iter():
+                p={"ema_fast":ef_p,"ema_slow":es_p,"rr":rr,"use_vol":uv,"use_gap":ug,"use_htf":uh}
+                try: s=run_ema_backtest(H,L,C,O,V,n,p)
+                except Exception as e: s=None; errors+=1
+                if s and passes_filter(s):
+                    buf.append(make_row(pair,tf,"ema_cross","sweep",None,PERIOD_START,_TODAY,p,s))
+                    saved+=1
+                done+=1
+                if len(buf)>=300: save_rows(buf); buf=[]
+                if time.time()-last_tg>600:
+                    el=time.time()-start; rate=done/el if el>0 else 0; eta=(grand_total-done)/rate if rate>0 else 0
+                    tg(f"⏳ EMA sweep\nDone: {done:,}/{grand_total:,} ({done/grand_total*100:.1f}%)\nETA: {eta/60:.0f}min\n{symbol} {tf}")
+                    last_tg=time.time()
 
-            buf.append({
-                "combo_key":f"{symbol}|{tf}|bos_pullback|{em}|{N}|{rr}|{fib}|{ep}|{ax}",
-                "pair":symbol.replace("/USDT",""),"timeframe":tf,
-                "engine":"bos_pullback","entry_mode":em,
-                "pivot_n":N,"rr":rr,"fib_level":fib,"ema_pair":ep,"adx_min":ax,"filters":None,
-                "period_start":PERIOD_START,"period_end":PERIOD_END,
-                "success":s is not None,
-                "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
-                "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
-                "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
-                "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
-                "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
-                "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
-                "computed_at":datetime.now(timezone.utc).isoformat(),
-            })
-            if s: saved+=1
-            done+=1
-            if len(buf)>=500: save_rows(buf); buf=[]
+        elif engine=="div":
+            for rsi_p,piv_n,macd_c,adx_mx in itertools.product(DIV_RSI_PERIODS,DIV_PIVOT_NS,DIV_MACD_CONF,DIV_ADX_MAXS):
+                try:
+                    precomputed = precompute_divergence_inputs(H,L,C,piv_n,rsi_p,macd_c,adx_mx)
+                except Exception:
+                    precomputed=None; errors+=1; continue
+                for rsi_th,lb,rr in itertools.product(DIV_RSI_THRESH,DIV_LOOKBACKS,DIV_RR_RATIOS):
+                    p={"rsi_period":rsi_p,"rsi_thresh":rsi_th,"pivot_n":piv_n,"lookback":lb,
+                       "use_macd":macd_c,"adx_max":adx_mx,"rr":rr}
+                    try: s=run_div_backtest(H,L,C,O,n,tf,p,precomputed=precomputed)
+                    except Exception as e: s=None; errors+=1
+                    if s and passes_filter(s):
+                        buf.append(make_row(pair,tf,"rsi_divergence","sweep",None,PERIOD_START,_TODAY,p,s))
+                        saved+=1
+                    done+=1
+                    if len(buf)>=300: save_rows(buf); buf=[]
             if time.time()-last_tg>600:
                 el=time.time()-start; rate=done/el if el>0 else 0; eta=(grand_total-done)/rate if rate>0 else 0
-                tg(f"⏳ BOS Phase\nDone: {done:,}/{grand_total:,} ({done/grand_total*100:.1f}%)\nETA: {eta/60:.0f}min\n{symbol} {tf}")
-                set_status("compute","running",done,grand_total,f"BOS {symbol} {tf}")
+                tg(f"⏳ DIV sweep\nDone: {done:,}/{grand_total:,} ({done/grand_total*100:.1f}%)\nETA: {eta/60:.0f}min\n{symbol} {tf}")
                 last_tg=time.time()
 
         if buf: save_rows(buf); buf=[]
+
     return done, saved, errors, buf, last_tg
 
-
-# ── PHASE: BOS STABILITY CHECK (live paper trader configs) ─────
-def run_bos_stability(grand_total, done, saved, errors, buf, start, last_tg):
-    print("\n=== BOS Pullback — stability check (live configs) ===")
-    for cfg in BOS_LOCKED_CONFIGS:
-        symbol, tf = cfg["symbol"], cfg["timeframe"]
-        for period_label, ps, pe in EMA_PERIODS:
-            print(f"\n{symbol} {tf} [{period_label}]...")
-            set_status("compute","running",done,grand_total,f"BOS-stability {symbol} {tf} {period_label}")
-            rows=get_candles(symbol,tf,ps,pe)
-            if not rows: print("  No candles — skip"); done+=1; continue
-
-            H=np.array([r["high"]  for r in rows],dtype=float)
-            L=np.array([r["low"]   for r in rows],dtype=float)
-            C=np.array([r["close"] for r in rows],dtype=float)
-            O=np.array([r["open"]  for r in rows],dtype=float)
-            n=len(rows); print(f"  {n} candles")
-
-            ep=cfg.get("ema_pair","off")
-            ax=cfg.get("adx_min",0)
-            use_ema=ep!="off"
-            ef=es=adx_v=None
-            if use_ema:
-                f,s_=map(int,ep.split("/")); ef,es=calc_ema(C,f),calc_ema(C,s_)
-            if ax>0:
-                adx_v=calc_adx(H,L,C,14)
-
-            try:
-                s=backtest(H,L,C,O,n,cfg["pivot_n"],cfg["rr"],cfg["fib_level"],
-                           cfg["entry_mode"],ef,es,use_ema,adx_v,float(ax))
-            except Exception as e:
-                s=None; errors+=1; print(f"  error: {e}")
-
-            buf.append({
-                "combo_key":f"{symbol}|{tf}|bos_pullback_live|{cfg['entry_mode']}|{cfg['pivot_n']}|{cfg['rr']}|{cfg['fib_level']}|{ep}|{ax}|{period_label}",
-                "pair":symbol.replace("/USDT",""),"timeframe":tf,
-                "engine":"bos_pullback_live","entry_mode":cfg["entry_mode"],
-                "pivot_n":cfg["pivot_n"],"rr":cfg["rr"],"fib_level":cfg["fib_level"],
-                "ema_pair":ep,"adx_min":ax,"filters":period_label,
-                "period_start":ps,"period_end":pe,
-                "success":s is not None,
-                "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
-                "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
-                "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
-                "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
-                "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
-                "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
-                "computed_at":datetime.now(timezone.utc).isoformat(),
-            })
-            if s: saved+=1
-            done+=1
-            set_status("compute","running",done,grand_total,f"BOS-stability {symbol} {tf} {period_label}")
-
-    if buf: save_rows(buf); buf=[]
-    return done, saved, errors, buf, last_tg
-
-
-# ── PHASE: BOS MONTHLY CONSISTENCY CHECK (winning configs) ──────
-def run_bos_monthly(grand_total, done, saved, errors, buf, start, last_tg,
-                    configs=None, engine_name="bos_pullback_monthly"):
-    configs = configs if configs is not None else BOS_WINNERS
-    print(f"\n=== BOS Pullback — monthly consistency check ({engine_name}) ===")
+# ── PHASE: STABILITY (Stage 2 — locked configs across 3 periods) ──
+def run_stability(engine, configs, grand_total, done, saved, errors, buf, start, last_tg):
     for cfg in configs:
-        symbol, tf = cfg["symbol"], cfg["timeframe"]
-        ep=cfg.get("ema_pair","off")
-        ax=cfg.get("adx_min",0)
-        use_ema=ep!="off"
+        symbol, tf = cfg["pair"], cfg["timeframe"]
+        pair = symbol.replace("/USDT","")
+        for period_label, ps, pe in STABILITY_PERIODS:
+            set_status("compute","running",done,grand_total,f"{engine} stability {symbol} {tf} {period_label}")
+            rows=get_candles(symbol,tf,ps,pe)
+            if not rows: done+=1; continue
+            H=np.array([r["high"] for r in rows],dtype=float)
+            L=np.array([r["low"] for r in rows],dtype=float)
+            C=np.array([r["close"] for r in rows],dtype=float)
+            O=np.array([r["open"] for r in rows],dtype=float)
+            V=np.array([r.get("volume",0) for r in rows],dtype=float)
+            n=len(rows)
 
+            try:
+                if engine=="bos": s=run_bos_backtest(H,L,C,O,n,cfg)
+                elif engine=="ema": s=run_ema_backtest(H,L,C,O,V,n,cfg)
+                elif engine=="div": s=run_div_backtest(H,L,C,O,n,tf,cfg)
+            except Exception as e:
+                s=None; errors+=1
+
+            # Stability stage saves full results regardless of filter — we WANT
+            # to see weaker periods, that's the point of this check.
+            buf.append(make_row(pair,tf,
+                                {"bos":"bos_pullback","ema":"ema_cross","div":"rsi_divergence"}[engine],
+                                "stability",period_label,ps,pe,cfg,s))
+            if s and passes_filter(s): saved+=1
+            done+=1
+            set_status("compute","running",done,grand_total,f"{engine} stability {symbol} {tf} {period_label}")
+
+    if buf: save_rows(buf); buf=[]
+    return done, saved, errors, buf, last_tg
+
+# ── PHASE: MONTHLY (Stage 3 — locked configs, 18 calendar months) ──
+def run_monthly(engine, configs, grand_total, done, saved, errors, buf, start, last_tg):
+    for cfg in configs:
+        symbol, tf = cfg["pair"], cfg["timeframe"]
+        pair = symbol.replace("/USDT","")
         for month_label, ps, pe in MONTHLY_PERIODS:
-            print(f"\n{symbol} {tf} [{month_label}]...")
-            set_status("compute","running",done,grand_total,f"BOS-monthly {symbol} {tf} {month_label}")
+            set_status("compute","running",done,grand_total,f"{engine} monthly {symbol} {tf} {month_label}")
             rows=get_candles(symbol,tf,ps,pe)
-            if not rows: print("  No candles — skip"); done+=1; continue
-
-            H=np.array([r["high"]  for r in rows],dtype=float)
-            L=np.array([r["low"]   for r in rows],dtype=float)
+            if not rows: done+=1; continue
+            H=np.array([r["high"] for r in rows],dtype=float)
+            L=np.array([r["low"] for r in rows],dtype=float)
             C=np.array([r["close"] for r in rows],dtype=float)
-            O=np.array([r["open"]  for r in rows],dtype=float)
-            n=len(rows)
-
-            ef=es=adx_v=None
-            if use_ema:
-                f,s_=map(int,ep.split("/")); ef,es=calc_ema(C,f),calc_ema(C,s_)
-            if ax>0:
-                adx_v=calc_adx(H,L,C,14)
-
-            try:
-                s=backtest(H,L,C,O,n,cfg["pivot_n"],cfg["rr"],cfg["fib_level"],
-                           cfg["entry_mode"],ef,es,use_ema,adx_v,float(ax))
-            except Exception as e:
-                s=None; errors+=1; print(f"  error: {e}")
-
-            buf.append({
-                "combo_key":f"{symbol}|{tf}|{engine_name}|{cfg['entry_mode']}|{cfg['pivot_n']}|{cfg['rr']}|{cfg['fib_level']}|{ep}|{ax}|{month_label}",
-                "pair":symbol.replace("/USDT",""),"timeframe":tf,
-                "engine":engine_name,"entry_mode":cfg["entry_mode"],
-                "pivot_n":cfg["pivot_n"],"rr":cfg["rr"],"fib_level":cfg["fib_level"],
-                "ema_pair":ep,"adx_min":ax,"filters":month_label,
-                "period_start":ps,"period_end":pe,
-                "success":s is not None,
-                "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
-                "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
-                "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
-                "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
-                "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
-                "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
-                "computed_at":datetime.now(timezone.utc).isoformat(),
-            })
-            if s: saved+=1
-            done+=1
-            set_status("compute","running",done,grand_total,f"BOS-monthly {symbol} {tf} {month_label}")
-
-    if buf: save_rows(buf); buf=[]
-    return done, saved, errors, buf, last_tg
-
-
-# ── PHASE: EMA CROSS — Stage 2 stability check (top-5-per-pair) ────────
-def run_ema_stability(grand_total, done, saved, errors, buf, start, last_tg):
-    print("\n=== EMA Cross — stability check (top-5-per-pair candidates) ===")
-    for cfg in EMA_LOCKED_CONFIGS:
-        symbol, tf = cfg["symbol"], cfg["timeframe"]
-        for period_label, ps, pe in EMA_PERIODS:
-            print(f"\n{symbol} {tf} EMA{cfg['ema_fast']}/{cfg['ema_slow']} [{period_label}]...")
-            set_status("compute","running",done,grand_total,f"EMA-stability {symbol} {tf} {period_label}")
-            rows=get_candles(symbol,tf,ps,pe)
-            if not rows: print("  No candles — skip"); done+=1; continue
-
-            H=np.array([r["high"]  for r in rows],dtype=float)
-            L=np.array([r["low"]   for r in rows],dtype=float)
-            C=np.array([r["close"] for r in rows],dtype=float)
-            O=np.array([r["open"]  for r in rows],dtype=float)
-            V=np.array([r.get("volume",0) for r in rows],dtype=float)
-            n=len(rows)
-
-            filters="+".join(f for f,v in [("vol",cfg["use_vol"]),("gap",cfg["use_gap"]),("htf",cfg["use_htf"])] if v) or "none"
-
-            try:
-                s=backtest_ema(H,L,C,O,V,n,cfg["rr"],cfg["ema_fast"],cfg["ema_slow"],
-                               cfg["use_vol"],cfg["use_gap"],cfg["use_htf"])
-            except Exception as e:
-                s=None; errors+=1; print(f"  error: {e}")
-
-            buf.append({
-                "combo_key":f"{symbol}|{tf}|ema_cross_live|cross|{cfg['ema_fast']}/{cfg['ema_slow']}|{cfg['rr']}|0|{filters}|{period_label}",
-                "pair":symbol.replace("/USDT",""),"timeframe":tf,
-                "engine":"ema_cross_live","entry_mode":"cross",
-                "pivot_n":0,"rr":cfg["rr"],"fib_level":0,
-                "ema_pair":f"{cfg['ema_fast']}/{cfg['ema_slow']}","adx_min":0,"filters":f"{period_label}|{filters}",
-                "period_start":ps,"period_end":pe,
-                "success":s is not None,
-                "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
-                "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
-                "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
-                "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
-                "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
-                "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
-                "computed_at":datetime.now(timezone.utc).isoformat(),
-            })
-            if s: saved+=1
-            done+=1
-            set_status("compute","running",done,grand_total,f"EMA-stability {symbol} {tf} {period_label}")
-
-    if buf: save_rows(buf); buf=[]
-    return done, saved, errors, buf, last_tg
-
-
-
-# ── PHASE: EMA CROSS MONTHLY CONSISTENCY CHECK ─────────────────
-def run_ema_monthly(grand_total, done, saved, errors, buf, start, last_tg):
-    print("\n=== EMA Cross — monthly consistency check (winning configs) ===")
-    for cfg in EMA_WINNERS:
-        symbol, tf = cfg["symbol"], cfg["timeframe"]
-        filters="+".join(f for f,v in [("vol",cfg["use_vol"]),("gap",cfg["use_gap"]),("htf",cfg["use_htf"])] if v) or "none"
-
-        for month_label, ps, pe in MONTHLY_PERIODS:
-            print(f"\n{symbol} {tf} EMA{cfg['ema_fast']}/{cfg['ema_slow']} [{month_label}]...")
-            set_status("compute","running",done,grand_total,f"EMA-monthly {symbol} {tf} {month_label}")
-            rows=get_candles(symbol,tf,ps,pe)
-            if not rows: print("  No candles — skip"); done+=1; continue
-
-            H=np.array([r["high"]  for r in rows],dtype=float)
-            L=np.array([r["low"]   for r in rows],dtype=float)
-            C=np.array([r["close"] for r in rows],dtype=float)
-            O=np.array([r["open"]  for r in rows],dtype=float)
+            O=np.array([r["open"] for r in rows],dtype=float)
             V=np.array([r.get("volume",0) for r in rows],dtype=float)
             n=len(rows)
 
             try:
-                s=backtest_ema(H,L,C,O,V,n,cfg["rr"],cfg["ema_fast"],cfg["ema_slow"],
-                               cfg["use_vol"],cfg["use_gap"],cfg["use_htf"])
+                if engine=="bos": s=run_bos_backtest(H,L,C,O,n,cfg)
+                elif engine=="ema": s=run_ema_backtest(H,L,C,O,V,n,cfg)
+                elif engine=="div": s=run_div_backtest(H,L,C,O,n,tf,cfg)
             except Exception as e:
-                s=None; errors+=1; print(f"  error: {e}")
+                s=None; errors+=1
 
-            buf.append({
-                "combo_key":f"{symbol}|{tf}|ema_cross_monthly|cross|{cfg['ema_fast']}/{cfg['ema_slow']}|{cfg['rr']}|0|{filters}|{month_label}",
-                "pair":symbol.replace("/USDT",""),"timeframe":tf,
-                "engine":"ema_cross_monthly","entry_mode":"cross",
-                "pivot_n":0,"rr":cfg["rr"],"fib_level":0,
-                "ema_pair":f"{cfg['ema_fast']}/{cfg['ema_slow']}","adx_min":0,"filters":month_label,
-                "period_start":ps,"period_end":pe,
-                "success":s is not None,
-                "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
-                "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
-                "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
-                "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
-                "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
-                "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
-                "computed_at":datetime.now(timezone.utc).isoformat(),
-            })
-            if s: saved+=1
+            buf.append(make_row(pair,tf,
+                                {"bos":"bos_pullback","ema":"ema_cross","div":"rsi_divergence"}[engine],
+                                "monthly",month_label,ps,pe,cfg,s))
+            if s and passes_filter(s): saved+=1
             done+=1
-            set_status("compute","running",done,grand_total,f"EMA-monthly {symbol} {tf} {month_label}")
+            set_status("compute","running",done,grand_total,f"{engine} monthly {symbol} {tf} {month_label}")
 
     if buf: save_rows(buf); buf=[]
     return done, saved, errors, buf, last_tg
 
+# ── COMBO COUNTING (for progress tracking) ─────────────────────
+def count_sweep(engine):
+    if engine=="bos":
+        return (len(BOS_PAIRS)*len(BOS_TIMEFRAMES)*len(BOS_ENTRY_MODES)*len(BOS_PIVOT_NS)*
+                len(BOS_RR_RATIOS)*len(BOS_FIB_LEVELS)*len(BOS_EMA_PAIRS)*len(BOS_ADX_MINS))
+    if engine=="ema":
+        return (len(EMA_PAIRS_LIST)*len(EMA_TIMEFRAMES)*len(EMA_FAST_LIST)*len(EMA_SLOW_LIST)*
+                len(EMA_RR_LIST)*len(EMA_VOL_OPTS)*len(EMA_GAP_OPTS)*len(EMA_HTF_OPTS))
+    if engine=="div":
+        return (len(DIV_PAIRS)*len(DIV_TIMEFRAMES)*len(DIV_RSI_PERIODS)*len(DIV_RSI_THRESH)*
+                len(DIV_PIVOT_NS)*len(DIV_LOOKBACKS)*len(DIV_MACD_CONF)*len(DIV_ADX_MAXS)*len(DIV_RR_RATIOS))
+    return 0
 
-# ── PHASE: RSI DIVERGENCE FULL SWEEP ──────────────────────────
-def run_divergence(grand_total, done, saved, errors, buf, start, last_tg):
-    print("\n=== RSI Divergence sweep (cached pivots/RSI per outer combo) ===")
-    for symbol, tf in itertools.product(DIV_PAIRS, DIV_TIMEFRAMES):
-        print(f"\nLoading {symbol} {tf}...")
-        set_status("compute","running",done,grand_total,f"DIV {symbol} {tf}")
-        rows=get_candles(symbol,tf)
-        if not rows: print("  No candles — skip"); continue
+def count_stability(engine):
+    n = {"bos":len(BOS_LOCKED), "ema":len(EMA_LOCKED), "div":0}.get(engine,0)
+    return n * len(STABILITY_PERIODS)
 
-        H=np.array([r["high"]  for r in rows],dtype=float)
-        L=np.array([r["low"]   for r in rows],dtype=float)
-        C=np.array([r["close"] for r in rows],dtype=float)
-        O=np.array([r["open"]  for r in rows],dtype=float)
-        n=len(rows); print(f"  {n} candles")
+def count_monthly(engine):
+    n = {"bos":len(BOS_LOCKED), "ema":len(EMA_LOCKED), "div":0}.get(engine,0)
+    return n * len(MONTHLY_PERIODS)
 
-        # Outer loop: only the params that change pivots/RSI/MACD/ADX (expensive)
-        for rsi_p,piv_n,macd_c,adx_mx in itertools.product(
-            DIV_RSI_PERIODS,DIV_PIVOT_NS,DIV_MACD_CONF,DIV_ADX_MAXS
-        ):
-            try:
-                precomputed = precompute_divergence_inputs(H,L,C,piv_n,rsi_p,macd_c,adx_mx)
-            except Exception as e:
-                print(f"  Precompute error: {e}")
-                continue
+# ── MAIN COMPUTE ────────────────────────────────────────────────
+def main_compute(engine="bos", stage="sweep"):
+    engines = ["bos","ema","div"] if engine=="all" else [engine]
 
-            # Inner loop: cheap params (lookback just filters the cached pivot list, rr/thresh don't touch pivots at all)
-            for rsi_th,lb,rr in itertools.product(DIV_RSI_THRESH,DIV_LOOKBACKS,DIV_RR_RATIOS):
-                filters="+".join(f for f,v in [("macd",macd_c),("adxmax",adx_mx>0)] if v) or "none"
-                label=f"rsi{rsi_p}_th{rsi_th}_n{piv_n}_lb{lb}_{filters}"
-                try:
-                    s=backtest_divergence(H,L,C,O,n,rr,tf,
-                                          rsi_p,rsi_th,piv_n,lb,macd_c,adx_mx,
-                                          precomputed=precomputed)
-                except Exception as e:
-                    s=None; errors+=1; print(f"  DIV error: {e}")
+    grand_total = sum(
+        {"sweep":count_sweep,"stability":count_stability,"monthly":count_monthly}[stage](e)
+        for e in engines
+    )
 
-                buf.append({
-                    "combo_key":f"{symbol}|{tf}|rsi_divergence|div|{rsi_p}/{rsi_th}|{rr}|{piv_n}|{label}",
-                    "pair":symbol.replace("/USDT",""),"timeframe":tf,
-                    "engine":"rsi_divergence","entry_mode":"div",
-                    "pivot_n":piv_n,"rr":rr,"fib_level":0,
-                    "ema_pair":f"rsi{rsi_p}","adx_min":adx_mx,"filters":label,
-                    "period_start":PERIOD_START,"period_end":PERIOD_END,
-                    "success":s is not None,
-                    "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
-                    "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
-                    "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
-                    "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
-                    "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
-                    "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
-                    "computed_at":datetime.now(timezone.utc).isoformat(),
-                })
-                if s: saved+=1
-                done+=1
-                if len(buf)>=500: save_rows(buf); buf=[]
-                if time.time()-last_tg>600:
-                    el=time.time()-start; rate=done/el if el>0 else 0; eta=(grand_total-done)/rate if rate>0 else 0
-                    tg(f"⏳ DIV Phase\nDone: {done:,}/{grand_total:,} ({done/grand_total*100:.1f}%)\nETA: {eta/60:.0f}min\n{symbol} {tf}")
-                    set_status("compute","running",done,grand_total,f"DIV {symbol} {tf}")
-                    last_tg=time.time()
-
-        if buf: save_rows(buf); buf=[]
-        print(f"  Done {symbol} {tf} — {saved:,} saved so far")
-    return done, saved, errors, buf, last_tg
-
-
-
-def run_ema(grand_total, done, saved, errors, buf, start, last_tg):
-    print("\n=== EMA Cross (stability sweep across periods) ===")
-    for period_label, ps, pe in EMA_PERIODS:
-        print(f"\n--- PERIOD: {period_label} ({ps} → {pe}) ---")
-        for symbol,tf in itertools.product(EMA_PAIRS_LIST, EMA_TIMEFRAMES):
-            print(f"\nLoading {symbol} {tf} [{period_label}]...")
-            set_status("compute","running",done,grand_total,f"EMA {symbol} {tf} {period_label}")
-            rows=get_candles(symbol,tf,ps,pe)
-            if not rows: print("  No candles — skip"); continue
-
-            H=np.array([r["high"]  for r in rows],dtype=float)
-            L=np.array([r["low"]   for r in rows],dtype=float)
-            C=np.array([r["close"] for r in rows],dtype=float)
-            O=np.array([r["open"]  for r in rows],dtype=float)
-            V=np.array([r.get("volume",0) for r in rows],dtype=float)
-            n=len(rows); print(f"  {n} candles")
-
-            for ef_p,es_p,rr,use_vol,use_gap,use_htf in itertools.product(
-                EMA_FAST_LIST,EMA_SLOW_LIST,EMA_RR_LIST,
-                EMA_VOL_OPTS,EMA_GAP_OPTS,EMA_HTF_OPTS
-            ):
-                filters="+".join(f for f,v in [("vol",use_vol),("gap",use_gap),("htf",use_htf)] if v) or "none"
-                try:
-                    s=backtest_ema(H,L,C,O,V,n,rr,ef_p,es_p,use_vol,use_gap,use_htf)
-                except Exception as e:
-                    s=None; errors+=1; print(f"  EMA error: {e}")
-
-                buf.append({
-                    "combo_key":f"{symbol}|{tf}|ema_cross|cross|{ef_p}/{es_p}|{rr}|0|{filters}|{period_label}",
-                    "pair":symbol.replace("/USDT",""),"timeframe":tf,
-                    "engine":"ema_cross","entry_mode":"cross",
-                    "pivot_n":0,"rr":rr,"fib_level":0,
-                    "ema_pair":f"{ef_p}/{es_p}","adx_min":0,"filters":filters,
-                    "period_start":ps,"period_end":pe,
-                    "success":s is not None,
-                    "return_pct":s["return_pct"] if s else None,"cagr":s["cagr"] if s else None,
-                    "max_dd":s["max_dd"] if s else None,"sharpe":s["sharpe"] if s else None,
-                    "profit_factor":s["pf"] if s else None,"win_rate":s["wr"] if s else None,
-                    "trades":s["trades"] if s else 0,"wins":s["wins"] if s else 0,
-                    "losses":s["losses"] if s else 0,"avg_win":s["avg_win"] if s else None,
-                    "avg_loss":s["avg_loss"] if s else None,"kelly_full":s["kelly"] if s else None,
-                    "computed_at":datetime.now(timezone.utc).isoformat(),
-                })
-                if s: saved+=1
-                done+=1
-                if len(buf)>=500: save_rows(buf); buf=[]
-                if time.time()-last_tg>600:
-                    el=time.time()-start; rate=done/el if el>0 else 0; eta=(grand_total-done)/rate if rate>0 else 0
-                    tg(f"⏳ EMA Phase [{period_label}]\nDone: {done:,}/{grand_total:,} ({done/grand_total*100:.1f}%)\nETA: {eta/60:.0f}min\n{symbol} {tf}")
-                    set_status("compute","running",done,grand_total,f"EMA {symbol} {tf} {period_label}")
-                    last_tg=time.time()
-
-            if buf: save_rows(buf); buf=[]
-            print(f"  Done {symbol} {tf} [{period_label}] — {saved:,} saved so far")
-    return done, saved, errors, buf, last_tg
-
-
-# ── MAIN COMPUTE ───────────────────────────────────────────────
-def main_compute(mode="ema"):
-    # Clear only the engine(s) we're about to rerun
-    engines_to_clear = []
-    if mode in ("ema","all"): engines_to_clear.append("ema_cross")
-    if mode in ("bos","all"): engines_to_clear.append("bos_pullback")
-    if mode in ("bos","bos_stability","all"): engines_to_clear.append("bos_pullback_live")
-    if mode=="bos_monthly": engines_to_clear.append("bos_pullback_monthly")
-    if mode=="bos_monthly_runnerup": engines_to_clear.append("bos_pullback_monthly_runnerup")
-    if mode=="ema_stability": engines_to_clear.append("ema_cross_live")
-    if mode=="ema_monthly": engines_to_clear.append("ema_cross_monthly")
-    if mode in ("div","all"): engines_to_clear.append("rsi_divergence")
-
-    for eng in engines_to_clear:
-        try:
-            httpx.delete(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.{eng}",
-                         headers=HEADERS, timeout=30)
-            print(f"Cleared old {eng} results")
-        except: pass
-
-    bos_total = BOS_TOTAL + BOS_STABILITY_TOTAL
-    grand_total = (EMA_TOTAL if mode=="ema" else
-                    BOS_STABILITY_TOTAL if mode=="bos_stability" else
-                    BOS_MONTHLY_TOTAL if mode=="bos_monthly" else
-                    BOS_RUNNERUP_MONTHLY_TOTAL if mode=="bos_monthly_runnerup" else
-                    EMA_STABILITY_TOTAL if mode=="ema_stability" else
-                    EMA_MONTHLY_TOTAL if mode=="ema_monthly" else
-                    DIV_TOTAL if mode=="div" else
-                    bos_total if mode=="bos" else EMA_TOTAL+bos_total)
-
-    engine_label = ("EMA Cross only" if mode=="ema" else
-                    "BOS stability check only" if mode=="bos_stability" else
-                    "BOS monthly consistency check" if mode=="bos_monthly" else
-                    "BOS monthly — runner-up configs (DOGE/TRX/XRP)" if mode=="bos_monthly_runnerup" else
-                    "EMA Cross stability check (top-5-per-pair)" if mode=="ema_stability" else
-                    "EMA Cross monthly consistency check" if mode=="ema_monthly" else
-                    "RSI Divergence sweep" if mode=="div" else
-                    "BOS Pullback + stability check" if mode=="bos" else
-                    "BOS Pullback + EMA Cross")
-    period_str = " / ".join(f"{lbl}({ps}→{pe})" for lbl,ps,pe in EMA_PERIODS) if mode in ("ema","all","ema_stability") else f"{PERIOD_START} → {PERIOD_END}"
-    extra = ""
-    if mode in ("bos","all"):
-        extra = "BOS sweep: " + format(BOS_TOTAL,",") + " | Live config stability: " + format(BOS_STABILITY_TOTAL,",") + " (×3 periods)"
-    elif mode=="bos_monthly":
-        extra = f"5 winning configs × {len(MONTHLY_PERIODS)} months ({MONTHLY_PERIODS[0][0]} → {MONTHLY_PERIODS[-1][0]})"
-    elif mode=="bos_monthly_runnerup":
-        extra = f"12 runner-up configs (DOGE/TRX/XRP ×4) × {len(MONTHLY_PERIODS)} months"
-    elif mode=="ema_stability":
-        extra = f"25 candidates (5 pairs × top-5, incl. DOGE/XRP) × {len(EMA_PERIODS)} periods"
-    elif mode=="ema_monthly":
-        extra = f"4 winning configs (ARB/XLM/TRX/XRP) × {len(MONTHLY_PERIODS)} months"
-    elif mode=="div":
-        extra = f"{DIV_TOTAL:,} combos — RSI divergence, 6 pairs × 3 TFs × variable space"
-    tg(f"""🔢 <b>Matrix Runner v9 — {engine_label}</b>
+    tg(f"""🔢 <b>Matrix Runner v2.0 — {engine}/{stage}</b>
 Total combos: {grand_total:,}
-{"EMA periods: " + period_str if mode in ("ema","all","ema_stability") else "Period: " + period_str}
-{extra}""")
+Filter: min 30 trades, Sharpe 0.5-2.5, maxDD≤35%
+Only passing combos saved (sweep), full visibility (stability/monthly)""")
 
     saved=0; errors=0; done=0
     start=time.time(); last_tg=time.time(); buf=[]
 
-    if mode=="bos_stability":
-        done,saved,errors,buf,last_tg = run_bos_stability(grand_total,done,saved,errors,buf,start,last_tg)
-    if mode=="bos_monthly":
-        done,saved,errors,buf,last_tg = run_bos_monthly(grand_total,done,saved,errors,buf,start,last_tg)
-    if mode=="bos_monthly_runnerup":
-        done,saved,errors,buf,last_tg = run_bos_monthly(grand_total,done,saved,errors,buf,start,last_tg,
-                                                          configs=BOS_RUNNERUPS, engine_name="bos_pullback_monthly_runnerup")
-    if mode=="ema_stability":
-        done,saved,errors,buf,last_tg = run_ema_stability(grand_total,done,saved,errors,buf,start,last_tg)
-    if mode=="ema_monthly":
-        done,saved,errors,buf,last_tg = run_ema_monthly(grand_total,done,saved,errors,buf,start,last_tg)
-    if mode in ("div","all"):
-        done,saved,errors,buf,last_tg = run_divergence(grand_total,done,saved,errors,buf,start,last_tg)
-    if mode in ("bos","all"):
-        done,saved,errors,buf,last_tg = run_bos(grand_total,done,saved,errors,buf,start,last_tg)
-        done,saved,errors,buf,last_tg = run_bos_stability(grand_total,done,saved,errors,buf,start,last_tg)
-    if mode in ("ema","all"):
-        done,saved,errors,buf,last_tg = run_ema(grand_total,done,saved,errors,buf,start,last_tg)
-
+    for e in engines:
+        if stage=="sweep":
+            done,saved,errors,buf,last_tg = run_sweep(e,grand_total,done,saved,errors,buf,start,last_tg)
+        elif stage=="stability":
+            configs = {"bos":BOS_LOCKED,"ema":EMA_LOCKED,"div":[]}.get(e,[])
+            if configs:
+                done,saved,errors,buf,last_tg = run_stability(e,configs,grand_total,done,saved,errors,buf,start,last_tg)
+        elif stage=="monthly":
+            configs = {"bos":BOS_LOCKED,"ema":EMA_LOCKED,"div":[]}.get(e,[])
+            if configs:
+                done,saved,errors,buf,last_tg = run_monthly(e,configs,grand_total,done,saved,errors,buf,start,last_tg)
 
     if buf: save_rows(buf)
     el=time.time()-start
     set_status("compute","done",grand_total,grand_total,"")
-    tg(f"""✅ <b>Matrix v9 Complete — {engine_label}</b>
-Combos: {grand_total:,} | Saved: {saved:,} | Errors: {errors}
-Time: {el/60:.1f}min
-Download from Runner tab.""")
-    print(f"\nDone. {saved:,} saved in {el/60:.1f}min")
+    tg(f"""✅ <b>Matrix v2.0 Complete — {engine}/{stage}</b>
+Combos: {grand_total:,} | Saved (passed filter): {saved:,} | Errors: {errors}
+Time: {el/60:.1f}min""")
+    print(f"Done. {saved:,} saved in {el/60:.1f}min")
 
 
 def main_prefetch():
     import ccxt
     ex=ccxt.kucoin({"enableRateLimit":True})
-    tg("📥 <b>Prefetch Started — all TFs including 1m</b>")
+    tg("📥 <b>Prefetch Started</b>")
     sh={**HEADERS,"Prefer":"return=minimal,resolution=ignore-duplicates"}
     all_pairs=list(set(BOS_PAIRS)|set(EMA_PAIRS_LIST)|set(DIV_PAIRS))
     all_tfs  =list(set(BOS_TIMEFRAMES)|set(EMA_TIMEFRAMES)|set(DIV_TIMEFRAMES))
     s_ms=int(datetime.strptime(PERIOD_START,"%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
-    e_ms=int(datetime.now(timezone.utc).timestamp()*1000)  # up to now, covers 2026 YTD + L30D
+    e_ms=int(datetime.now(timezone.utc).timestamp()*1000)
     for sym,tf in itertools.product(all_pairs,all_tfs):
         print(f"Fetching {sym} {tf}...")
-        candles=[]; since=s_ms; ec=0
-        while since<e_ms:
-            try:
-                b=ex.fetch_ohlcv(sym,tf,since=since,limit=1000)
-                if not b: ec+=1
-                if ec>=3: break
-                f_=[c for c in b if c[0]<e_ms]; candles+=f_
-                if b[-1][0]>=e_ms: break
-                since=b[-1][0]+1; time.sleep(0.3); ec=0
-            except Exception as e:
-                print(f"Error: {e}"); time.sleep(5)
-        if candles:
-            for i in range(0,len(candles),500):
-                batch=candles[i:i+500]
-                httpx.post(f"{SUPABASE_URL}/rest/v1/candles",
-                           json=[{"symbol":sym,"timeframe":tf,"ts":c[0],
-                                  "open":c[1],"high":c[2],"low":c[3],
-                                  "close":c[4],"volume":c[5] if len(c)>5 else 0}
-                                 for c in batch],
-                           headers=sh,timeout=30)
-            print(f"  {len(candles)} candles saved")
-    tg("✅ <b>Prefetch Done</b>")
+        try:
+            since=s_ms; all_candles=[]
+            while since<e_ms:
+                batch=ex.fetch_ohlcv(sym,tf,since=since,limit=1000)
+                if not batch: break
+                all_candles+=batch
+                since=batch[-1][0]+1
+                if len(batch)<1000: break
+            rows=[{"symbol":sym,"timeframe":tf,"ts":c[0],"open":c[1],"high":c[2],
+                   "low":c[3],"close":c[4],"volume":c[5]} for c in all_candles]
+            for i in range(0,len(rows),500):
+                httpx.post(f"{SUPABASE_URL}/rest/v1/candles",json=rows[i:i+500],headers=sh,timeout=30)
+            print(f"  {len(rows)} candles saved")
+        except Exception as ex2:
+            print(f"  Error: {ex2}")
+    tg("✅ <b>Prefetch Complete</b>")
 
 
 def main():
     import sys
-    arg = sys.argv[1] if len(sys.argv)>1 else "ema"
-    if arg == "prefetch":
+    mode = sys.argv[1] if len(sys.argv)>1 else "bos"
+    if mode=="prefetch":
         main_prefetch()
-    elif arg == "bos":
-        main_compute("bos")
-    elif arg == "all":
-        main_compute("all")
     else:
-        main_compute("ema")  # default
+        stage = sys.argv[2] if len(sys.argv)>2 else "sweep"
+        main_compute(mode, stage)
 
 if __name__=="__main__":
     main()
