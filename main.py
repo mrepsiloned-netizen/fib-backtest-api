@@ -142,6 +142,51 @@ def matrix_results_count(engine: str = None, stage: str = None, passed_only: boo
         return {"success": False, "error": str(e)}
 
 
+@app.get("/matrix-results/test-batch")
+def matrix_results_test_batch():
+    """
+    Diagnostic: writes a BATCH of 300 rows at once (matching the real sweep's
+    batch size) using matrix_runner.py's exact headers, to see if batch writes
+    behave differently than single-row writes.
+    """
+    import random
+    rows = []
+    for i in range(300):
+        rows.append({
+            "pair": "BATCHTEST", "timeframe": "15m", "engine": "diagnostic_batch", "stage": "test",
+            "period_label": None, "period_start": "2025-01-01", "period_end": "2026-01-01",
+            "params": {"i": i, "rr": round(random.uniform(1.0,3.0),2)},
+            "return_pct": round(random.uniform(-10,50),2), "cagr": 1.0, "max_dd": round(random.uniform(0,30),2),
+            "sharpe": round(random.uniform(0.5,2.5),2),
+            "profit_factor": 1.2, "win_rate": 50.0, "trades": 30+i, "wins": 15, "losses": 15,
+            "avg_win": 1.0, "avg_loss": 1.0, "kelly_full": 1.0, "total_fees": 0.1,
+            "passed_filter": True,
+        })
+
+    headers_runner = {
+        "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal,resolution=ignore-duplicates",
+    }
+    write_res = httpx.post(f"{SUPABASE_URL}/rest/v1/matrix_results", json=rows,
+                            headers=headers_runner, timeout=30)
+
+    read_res = httpx.get(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.diagnostic_batch&select=id",
+                          headers={**HEADERS,"Prefer":"count=exact"}, timeout=30)
+    count = read_res.headers.get("content-range","?/0").split("/")[-1]
+
+    try:
+        httpx.delete(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.diagnostic_batch", headers=HEADERS, timeout=30)
+    except: pass
+
+    return {
+        "rows_sent": len(rows),
+        "write_status": write_res.status_code,
+        "write_body": write_res.text[:500],
+        "rows_actually_persisted": count,
+    }
+
+
 @app.get("/matrix-results/test-write")
 def matrix_results_test_write():
     """
