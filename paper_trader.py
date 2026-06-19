@@ -1,5 +1,5 @@
 # ============================================================
-# WADDLE PAPER TRADER v11
+# WADDLE PAPER TRADER v2.0 — clean schema rebuild
 # Dual Engine: BOS Pullback + EMA Cross
 #   BOS Pullback — Pine Script P1-P2-P3 v6.5
 #     5 pairs: DOGE/15m, XLM/5m, TRX/1h, ARB/15m, XRP/1h
@@ -186,7 +186,7 @@ def send_entry_bos(w, signal, acc):
 <b>Stats:</b> {acc['total_trades']} trades · {acc['wins']}W {acc['losses']}L · {wr}% WR
 <b>Total return:</b> {'+' if total_ret>=0 else ''}{total_ret}%
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-📊 Paper trade v11""")
+📊 Paper trade v2.0""")
 
 def send_entry_ema(w, signal, acc):
     balance  = acc["balance"]
@@ -216,7 +216,7 @@ def send_entry_ema(w, signal, acc):
 <b>Stats:</b> {acc['total_trades']} trades · {acc['wins']}W {acc['losses']}L · {wr}% WR
 <b>Total return:</b> {'+' if total_ret>=0 else ''}{total_ret}%
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-📊 Paper trade v11""")
+📊 Paper trade v2.0""")
 
 def send_exit(w, signal, exit_price, won, pnl, acc):
     emoji    = "✅" if won else "❌"
@@ -244,7 +244,7 @@ def send_exit(w, signal, exit_price, won, pnl, acc):
 
 <b>All time:</b> {acc['total_trades']} trades · {acc['wins']}W {acc['losses']}L · {wr}% WR
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-📊 Paper trade v11""")
+📊 Paper trade v2.0""")
 
 def send_daily_summary(open_signals):
     try:
@@ -554,7 +554,7 @@ def detect_signal_ema_cross(candles, ema_fast, ema_slow, rr,
 
 # ── MAIN LOOP ─────────────────────────────────────────────────
 def run():
-    print("🤖 Waddle Paper Trader v11 — Dual Engine starting...")
+    print("🤖 Waddle Paper Trader v2.0 — Dual Engine starting...")
     acc = init_account()
     bos_str = "\n".join([f"• {w['label']}: {w['symbol']} {w['timeframe'].upper()} N={w['pivot_n']} {w['rr']}R {w['entry_mode']} fib={w['fib_level']}"
                           + (f" EMA{w['ema_pair']}" if w.get('ema_pair','off')!='off' else "")
@@ -563,7 +563,7 @@ def run():
     ema_str = "\n".join([f"• {w['label']}: {w['symbol']} {w['timeframe'].upper()} EMA{w['ema_fast']}/{w['ema_slow']} {w['rr']}R "
                           f"[{'+'.join(f for f,v in [('vol',w['use_vol']),('gap',w['use_gap']),('htf',w['use_htf'])] if v) or 'none'}]"
                           for w in EMA_WATCHLIST])
-    tg(f"""🤖 <b>Waddle Paper Trader v11 LIVE</b>
+    tg(f"""🤖 <b>Waddle Paper Trader v2.0 LIVE</b>
 <b>Dual Engine:</b> BOS Pullback (5 configs, 1 per pair — 18mo validated) + EMA Cross (3 configs)
 
 <b>Account:</b> ${acc['balance']:.2f}
