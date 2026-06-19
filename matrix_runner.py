@@ -899,6 +899,30 @@ def count_monthly(engine):
 def main_compute(engine="bos", stage="sweep"):
     engines = ["bos","ema","div"] if engine=="all" else [engine]
 
+    # Diagnostic: confirm env vars are actually populated before we start,
+    # and do a tiny live write test so we know immediately if saves will work.
+    url_masked = (SUPABASE_URL[:30]+"...") if SUPABASE_URL else "EMPTY!"
+    key_present = "yes" if SUPABASE_KEY else "EMPTY!"
+    test_row = make_row("DIAG","1m","startup_check","sweep",None,PERIOD_START,_TODAY,
+                        {"check":True}, {"return_pct":1,"cagr":1,"max_dd":1,"sharpe":1,"pf":1,
+                                         "wr":50,"trades":30,"wins":15,"losses":15,
+                                         "avg_win":1,"avg_loss":1,"kelly":1,"total_fees":0})
+    test_ok = save_rows([test_row])
+    if test_ok:
+        try:
+            httpx.delete(f"{SUPABASE_URL}/rest/v1/matrix_results?engine=eq.startup_check",
+                         headers=HEADERS, timeout=10)
+        except: pass
+
+    tg(f"""🔧 <b>Startup diagnostic</b>
+SUPABASE_URL: {url_masked}
+SUPABASE_KEY present: {key_present}
+Test write succeeded: {test_ok}""")
+
+    if not test_ok:
+        tg("🛑 <b>ABORTING</b> — test write failed, real sweep would also fail to save. Check logs.")
+        return
+
     grand_total = sum(
         {"sweep":count_sweep,"stability":count_stability,"monthly":count_monthly}[stage](e)
         for e in engines
