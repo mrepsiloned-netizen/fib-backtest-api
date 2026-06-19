@@ -125,10 +125,27 @@ def matrix_results(engine: str = None, stage: str = None, passed_only: bool = Tr
         return {"success": False, "error": str(e)}
 
 
+@app.get("/matrix-results/count")
+def matrix_results_count(engine: str = None, stage: str = None, passed_only: bool = False):
+    """Quick diagnostic — just returns a row count, no CSV generation, to verify data exists."""
+    q = "select=id"
+    if engine: q += f"&engine=eq.{engine}"
+    if stage: q += f"&stage=eq.{stage}"
+    if passed_only: q += "&passed_filter=eq.true"
+    try:
+        res = httpx.get(f"{SUPABASE_URL}/rest/v1/matrix_results?{q}",
+                         headers={**HEADERS, "Prefer": "count=exact"}, timeout=30)
+        count = res.headers.get("content-range", "?/0").split("/")[-1]
+        return {"success": res.status_code==200, "status_code": res.status_code,
+                "count": count, "query": q, "body_preview": res.text[:200]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/matrix-results/export")
 def matrix_results_export(engine: str = None, stage: str = None, passed_only: bool = False):
     """Export results as CSV. Set passed_only=true to only get validated combos."""
-    from fastapi.responses import Response
+    from fastapi.responses import Response, JSONResponse
     import io, csv as csv_mod
 
     q = "select=*&order=pair.asc,timeframe.asc"
@@ -137,15 +154,26 @@ def matrix_results_export(engine: str = None, stage: str = None, passed_only: bo
     if passed_only: q += "&passed_filter=eq.true"
 
     all_rows = []; offset = 0
+    last_error = None
     while True:
         page_q = q + f"&limit=1000&offset={offset}"
         res = httpx.get(f"{SUPABASE_URL}/rest/v1/matrix_results?{page_q}", headers=HEADERS, timeout=60)
-        if res.status_code != 200: break
+        if res.status_code != 200:
+            last_error = f"Supabase returned {res.status_code}: {res.text[:500]}"
+            break
         batch = res.json()
         if not batch: break
         all_rows += batch
         if len(batch) < 1000: break
         offset += len(batch)
+
+    if not all_rows:
+        return JSONResponse({
+            "success": False,
+            "message": "No rows found or query failed",
+            "error": last_error,
+            "query_used": q,
+        })
 
     fields = ["pair","timeframe","engine","stage","period_label","period_start","period_end",
               "params","return_pct","cagr","max_dd","sharpe","profit_factor","win_rate",
@@ -175,16 +203,21 @@ def send_matrix_csv(engine: str = None, stage: str = None, passed_only: bool = F
     if stage: q += f"&stage=eq.{stage}"
     if passed_only: q += "&passed_filter=eq.true"
 
-    all_rows = []; offset = 0
+    all_rows = []; offset = 0; last_error = None
     while True:
         page_q = q + f"&limit=1000&offset={offset}"
         res = httpx.get(f"{SUPABASE_URL}/rest/v1/matrix_results?{page_q}", headers=HEADERS, timeout=60)
-        if res.status_code != 200: break
+        if res.status_code != 200:
+            last_error = f"Supabase {res.status_code}: {res.text[:300]}"
+            break
         batch = res.json()
         if not batch: break
         all_rows += batch
         if len(batch) < 1000: break
         offset += len(batch)
+
+    if not all_rows:
+        return {"success": False, "message": "No rows found", "error": last_error, "query_used": q}
 
     fields = ["pair","timeframe","engine","stage","period_label","period_start","period_end",
               "params","return_pct","cagr","max_dd","sharpe","profit_factor","win_rate",
