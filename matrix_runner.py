@@ -82,18 +82,25 @@ def get_candles(symbol, timeframe, ps=None, pe=None):
     return rows
 
 def save_rows(rows):
-    if not rows: return
+    if not rows: return True
     try:
-        httpx.post(f"{SUPABASE_URL}/rest/v1/matrix_results", json=rows,
-                   headers=HEADERS, timeout=30)
+        res = httpx.post(f"{SUPABASE_URL}/rest/v1/matrix_results", json=rows,
+                          headers=HEADERS, timeout=30)
+        if res.status_code not in (200, 201, 204):
+            print(f"save_rows FAILED: {res.status_code} — {res.text[:500]}")
+            tg(f"⚠️ <b>Save failed</b>\nStatus: {res.status_code}\n{res.text[:300]}")
+            return False
+        return True
     except Exception as e:
         print(f"save_rows error: {e}")
+        tg(f"⚠️ <b>Save exception</b>\n{str(e)[:300]}")
+        return False
 
 def make_row(pair, tf, engine, stage, period_label, ps, pe, params, s):
     return {
         "pair": pair, "timeframe": tf, "engine": engine, "stage": stage,
         "period_label": period_label, "period_start": ps, "period_end": pe,
-        "params": json.dumps(params),
+        "params": params,
         "return_pct": s["return_pct"] if s else None,
         "cagr": s["cagr"] if s else None,
         "max_dd": s["max_dd"] if s else None,
