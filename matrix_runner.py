@@ -81,11 +81,17 @@ def get_candles(symbol, timeframe, ps=None, pe=None):
             break
     return rows
 
+_save_call_count = [0]
 def save_rows(rows):
     if not rows: return True
     try:
         res = httpx.post(f"{SUPABASE_URL}/rest/v1/matrix_results", json=rows,
                           headers=HEADERS, timeout=30)
+        _save_call_count[0] += 1
+        if _save_call_count[0] <= 3:
+            tg(f"🔍 <b>save_rows call #{_save_call_count[0]}</b>\n"
+               f"Rows sent: {len(rows)}\nStatus: {res.status_code}\n"
+               f"Response: {res.text[:200] if res.text else '(empty)'}")
         if res.status_code not in (200, 201, 204):
             print(f"save_rows FAILED: {res.status_code} — {res.text[:500]}")
             tg(f"⚠️ <b>Save failed</b>\nStatus: {res.status_code}\n{res.text[:300]}")
